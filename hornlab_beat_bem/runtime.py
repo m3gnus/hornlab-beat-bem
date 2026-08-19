@@ -47,7 +47,12 @@ def default_project(beat_backend: str) -> Path:
 
 
 def discover_julia(explicit: str | None = None) -> str | None:
-    """Resolve the Julia executable: explicit > env var > PATH."""
+    """Resolve Julia: explicit > env var > provisioned runtime > PATH.
+
+    The provisioned runtime (a known-good portable Julia fetched by
+    ``hornlab_beat_bem.provision`` on GPU hosts) outranks whatever happens to
+    be on PATH, but an explicit path or the env var always wins.
+    """
 
     for candidate in (explicit, os.environ.get(JULIA_ENV_VAR)):
         if candidate and candidate.strip():
@@ -57,6 +62,11 @@ def discover_julia(explicit: str | None = None) -> str | None:
             # A configured-but-wrong path is a misconfiguration to surface,
             # not something to silently fall past.
             return None
+    from .provision import provisioned_julia
+
+    provisioned = provisioned_julia()
+    if provisioned is not None:
+        return provisioned
     return shutil.which("julia")
 
 
@@ -139,8 +149,10 @@ def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]
         return {
             "available": False,
             "reason": (
-                "No Julia executable was found. Install Julia >= 1.10 and put "
-                f"it on PATH or set {JULIA_ENV_VAR} to the julia executable."
+                "No Julia executable was found. On a machine with an NVIDIA "
+                "GPU, run: python -m hornlab_beat_bem.provision (downloads "
+                "Julia and the CUDA stack). Otherwise install Julia >= 1.10 "
+                f"and put it on PATH or set {JULIA_ENV_VAR}."
             ),
             "version": version,
             "backend": None,
@@ -168,6 +180,21 @@ def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]
         }
 
     if _nvidia_gpu_present():
+        from .provision import read_state
+
+        provisioning = read_state() or {}
+        if provisioning.get("status") == "in_progress":
+            return {
+                "available": False,
+                "reason": (
+                    "BEAT CUDA runtime provisioning is in progress "
+                    f"(step: {provisioning.get('step', 'unknown')}). The engine "
+                    "becomes available when it finishes."
+                ),
+                "version": version,
+                "backend": None,
+                "julia_executable": julia,
+            }
         functional, detail = _julia_gpu_functional(julia, BEAT_CUDA)
         if functional:
             return {
@@ -177,6 +204,11 @@ def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]
                 "backend": BEAT_CUDA,
                 "julia_executable": julia,
             }
+        if provisioning.get("status") == "failed":
+            detail = (
+                f"provisioning failed earlier: {provisioning.get('error')}. "
+                "Retry with: python -m hornlab_beat_bem.provision --force"
+            )
         return {
             "available": False,
             "reason": f"An NVIDIA GPU is present but the CUDA path is not usable: {detail}",

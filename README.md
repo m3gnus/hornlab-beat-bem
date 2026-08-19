@@ -15,7 +15,8 @@ path for testing.
 ## Requirements
 
 - Python ≥ 3.10, numpy.
-- Julia ≥ 1.10 on `PATH`, or `HORNLAB_BEAT_JULIA=<path to julia executable>`.
+- Julia ≥ 1.10 on `PATH`, or `HORNLAB_BEAT_JULIA=<path to julia executable>`,
+  or the provisioned runtime below.
 - The Julia environment instantiated once per backend:
 
 ```bash
@@ -23,6 +24,29 @@ julia --project=hornlab_beat_bem/julia -e "using Pkg; Pkg.instantiate()"
 ```
 
 (`julia_cuda` / `julia_rocm` likewise, on hosts with that hardware.)
+
+## GPU-gated provisioning
+
+```bash
+python -m hornlab_beat_bem.provision --if-nvidia-gpu
+```
+
+is a strict no-op unless `nvidia-smi` reports an NVIDIA GPU. Only then does it
+resolve Julia (an existing install always wins; otherwise the official
+portable Julia 1.12.6 is downloaded — SHA-256 verified — into
+`%LOCALAPPDATA%/hornlab-beat/runtime`, override with
+`HORNLAB_BEAT_RUNTIME_DIR`), instantiate the bundled `julia_cuda` project, and
+force CUDA artifact resolution ending in a `CUDA.functional()` check, so a
+recorded *ready* state means the first solve computes instead of downloading.
+First run pulls several GB (CUDA.jl ships its own toolkit artifacts; users
+need only the NVIDIA driver). Progress and failures are recorded in
+`state.json` and surface as `beat_engine_status()` reasons; retry with
+`--force`. `discover_julia()` prefers explicit path > `HORNLAB_BEAT_JULIA` >
+provisioned runtime > `PATH`.
+
+wg2's `scripts/bootstrap.py` invokes this gate after every successful
+bootstrap (opt out with `WG2_SKIP_GPU_PROVISION=1`); on CPU-only machines it
+is silent and downloads nothing.
 
 ## Conventions (the part that bites)
 
