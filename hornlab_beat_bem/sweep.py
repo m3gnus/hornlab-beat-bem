@@ -234,7 +234,15 @@ def solve_frequencies(
         index = solved_count
         if index >= total:
             raise RuntimeError("BEAT solver returned more results than requested frequencies")
-        frequency = float(raw["freq_hz"])
+        # The solver echoes the frequency in Float32; the durable axis must be
+        # the requested float64 value so it matches the other engines exactly.
+        frequency = float(frequencies[index])
+        echoed = float(raw["freq_hz"])
+        if not math.isclose(echoed, frequency, rel_tol=1e-6, abs_tol=1e-6):
+            raise RuntimeError(
+                f"BEAT solver returned frequency {echoed} Hz where {frequency} Hz "
+                "was requested; results are out of order"
+            )
         omega = 2.0 * math.pi * frequency
         # 1 m/s velocity basis -> unit normal acceleration (v = a/(-i*omega)).
         acceleration_scale = 1.0 / (-1j * omega)
