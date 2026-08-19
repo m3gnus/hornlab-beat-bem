@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hornlab-beat-bem"
+version = "0.1.0"
+description = "BEAT Engine (boundary-lab) Julia BEM solver backend for HornLab: CPU scaffolding plus CUDA/ROCm GPU paths"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
+dependencies = [
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["hornlab_beat_bem*"]
+
+[tool.setuptools.package-data]
+hornlab_beat_bem = [
+    "julia/*.jl",
+    "julia/*.toml",
+    "julia/src/*.jl",
+    "julia_cuda/*.toml",
+    "julia_rocm/*.toml",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: validation tests that run a real BEM solve through Julia",
+]

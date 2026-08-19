@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+from numpy.typing import NDArray
+
+from .config import SolveConfig
+
+
+@dataclass
+class MeshInfo:
+    n_vertices: int
+    n_triangles: int
+    physical_tag_areas_m2: dict[int, float]
+
+
+@dataclass
+class SolveResult:
+    r"""BEAT Engine solve output in HornLab's shared native-result shape.
+
+    Array dimensions use ``F`` for frequency count, ``P`` for observation
+    plane count, and ``N`` for angles per plane. Complex values use the
+    solver's :math:`e^{-i\omega t}` phase convention (outgoing waves
+    :math:`e^{+ikr}`), the same convention as hornlab-metal-bem and
+    hornlab-bempp-bem, and are reported for **unit normal acceleration** of
+    the source tag (the Julia solver's 1 m/s velocity basis is rescaled by
+    :math:`1/(-i\omega)` before it reaches these fields).
+    """
+
+    frequencies_hz: NDArray[np.float64]
+
+    # (F, P, N) — complex pressure at every observation point
+    pressure_complex: NDArray[np.complex128]
+
+    # (F, P, N) — absolute SPL in dB re 20 µPa
+    spl_db: NDArray[np.float64]
+
+    # (F,) — raw area-weighted average pressure on the source tag under unit
+    # acceleration. Follows hornlab-metal/bempp-bem; not normalized to rho*c.
+    impedance: NDArray[np.complex128]
+
+    observation_angles_deg: NDArray[np.float64]
+    observation_planes: list[str]
+
+    config: SolveConfig
+    mesh_info: MeshInfo
+    timings: dict[str, float] = field(default_factory=dict)
+    solver_log: list[dict] = field(default_factory=list)
+
+    # The BEAT solver samples its optional sphere on a Fibonacci lattice, which
+    # is not the theta-major grid HornLab's balloon/DI mapping requires, so
+    # spherical output is not exposed yet. Kept as fields so downstream
+    # getattr-probes see explicit None rather than AttributeError.
+    sphere_pressure_complex: NDArray[np.complex128] | None = None
+    sphere_theta_deg: NDArray[np.float64] | None = None
+    sphere_phi_deg: NDArray[np.float64] | None = None
+
+    @property
+    def directivity_db(self) -> NDArray[np.float64]:
+        """hornlab_metal_bem-compatible name for spl_db."""
+        return self.spl_db
