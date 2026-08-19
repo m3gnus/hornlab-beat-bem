@@ -26,7 +26,6 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import shutil
 import subprocess
@@ -34,9 +33,11 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Any, Callable
 import urllib.request
 import zipfile
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 from .config import BEAT_CUDA
 from .runtime import CUDA_PROJECT

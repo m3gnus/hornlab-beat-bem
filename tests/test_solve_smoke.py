@@ -1,14 +1,13 @@
 """End-to-end CPU solve through the real Julia runtime (slow)."""
 
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 import hornlab_beat_bem as beat
 from hornlab_beat_bem.sweep import _WARMUP_TETRAHEDRON
-
 
 pytestmark = pytest.mark.slow
 

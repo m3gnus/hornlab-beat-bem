@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import importlib.metadata
 import os
-from pathlib import Path
 import shutil
 import subprocess
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from .config import BEAT_CPU, BEAT_CUDA, BEAT_ROCM

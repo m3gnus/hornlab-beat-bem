@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import threading
-from typing import Any, Callable, Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
 
 from .config import BEAT_CUDA, BEAT_ROCM
 from .runtime import DEFAULT_SOLVER_SCRIPT, default_project
@@ -23,7 +24,7 @@ from .runtime import DEFAULT_SOLVER_SCRIPT, default_project
 StatusCallback = Callable[[str], None]
 
 _WORKERS_LOCK = threading.Lock()
-_WORKERS: dict[tuple[str, str, str, str, str], "BeatWorkerProcess"] = {}
+_WORKERS: dict[tuple[str, str, str, str, str], BeatWorkerProcess] = {}
 
 
 def _resolve_julia_threads(julia_threads: str | int = "auto") -> str:

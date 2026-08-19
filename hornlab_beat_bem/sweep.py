@@ -18,9 +18,10 @@ frame the caller supplied (applied as a rigid mesh translation).
 from __future__ import annotations
 
 import math
-from pathlib import Path
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
