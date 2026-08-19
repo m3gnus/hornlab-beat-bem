@@ -66,6 +66,15 @@ class ObservationConfig:
     angle_count: int = 37
     origin: Literal["mouth", "throat"] = "mouth"
 
+    #: Diagonal-cut rotation from the horizontal toward the vertical plane.
+    inclination_deg: float = 45.0
+
+    #: Frame-relative spherical field grid as (n_theta, n_phi), theta-major,
+    #: theta in [0, sphere_theta_max_deg] inclusive and phi in [0, 360)
+    #: without a wrap column -- the layout HornLab's balloon/DI mapping needs.
+    sphere_grid: tuple[int, int] | None = None
+    sphere_theta_max_deg: float = 180.0
+
     def __post_init__(self) -> None:
         try:
             distance_m = float(self.distance_m)
@@ -108,13 +117,41 @@ class ObservationConfig:
             raise ValueError("planes must be a non-empty list of plane names")
         if len(set(self.planes)) != len(self.planes):
             raise ValueError("planes must not contain duplicates")
-        unknown = set(self.planes) - {"horizontal", "vertical"}
+        unknown = set(self.planes) - {"horizontal", "vertical", "diagonal"}
         if unknown:
             names = ", ".join(sorted(repr(name) for name in unknown))
-            raise ValueError(
-                f"planes contain unsupported name(s): {names}; the BEAT Engine "
-                "solver evaluates fixed horizontal (x-z) and vertical (y-z) cuts"
-            )
+            raise ValueError(f"planes contain unknown name(s): {names}")
+
+        try:
+            inclination_deg = float(self.inclination_deg)
+        except (TypeError, ValueError, OverflowError):
+            inclination_deg = float("nan")
+        if not isfinite(inclination_deg):
+            raise ValueError("inclination_deg must be finite")
+        self.inclination_deg = inclination_deg
+
+        if self.sphere_grid is not None:
+            try:
+                grid = tuple(self.sphere_grid)
+            except TypeError:
+                raise ValueError("sphere_grid must be an iterable (n_theta, n_phi)") from None
+            if len(grid) != 2 or not all(_is_integral_value(value) for value in grid):
+                raise ValueError("sphere_grid must be two integers (n_theta, n_phi)")
+            n_theta, n_phi = int(grid[0]), int(grid[1])
+            if n_theta < 2:
+                raise ValueError("sphere_grid n_theta must be at least 2")
+            if n_phi < 3:
+                raise ValueError("sphere_grid n_phi must be at least 3")
+            if n_theta * n_phi > 100_000:
+                raise ValueError("sphere_grid is too dense (n_theta*n_phi > 100000)")
+            self.sphere_grid = (n_theta, n_phi)
+        try:
+            sphere_theta_max_deg = float(self.sphere_theta_max_deg)
+        except (TypeError, ValueError, OverflowError):
+            sphere_theta_max_deg = float("nan")
+        if not (0.0 < sphere_theta_max_deg <= 180.0):
+            raise ValueError("sphere_theta_max_deg must be in (0, 180]")
+        self.sphere_theta_max_deg = sphere_theta_max_deg
 
     @property
     def step_deg(self) -> float:
@@ -142,7 +179,9 @@ class SolveConfig:
     freq_spacing: Literal["log", "linear"] = "log"
 
     # Boundary condition. Only the acceleration output convention and a single
-    # unit-amplitude normal-motion source tag are supported; see class docs.
+    # unit-amplitude source tag are supported; see class docs. "normal" drives
+    # a uniformly breathing cap; "axial" a rigid piston along the +z axis
+    # (per-face velocity scaled by n_hat . z), mirroring the other backends.
     velocity_sources: dict[int, float] = field(default_factory=lambda: {2: 1.0})
     source_motion: str = "normal"
 
@@ -204,11 +243,8 @@ class SolveConfig:
             raise ValueError("freq_min_hz must not exceed freq_max_hz")
         if self.beat_backend not in BEAT_BACKENDS:
             raise ValueError("beat_backend must be 'cpu', 'cuda', or 'rocm'")
-        if self.source_motion != "normal":
-            raise NotImplementedError(
-                "hornlab-beat-bem only supports source_motion='normal'; the "
-                "BEAT Engine solver has no axial piston projection"
-            )
+        if self.source_motion not in {"normal", "axial"}:
+            raise ValueError("source_motion must be 'normal' or 'axial'")
         if not isinstance(self.velocity_sources, dict) or len(self.velocity_sources) != 1:
             raise NotImplementedError(
                 "hornlab-beat-bem supports exactly one velocity source tag"

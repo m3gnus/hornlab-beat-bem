@@ -218,6 +218,21 @@ def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]
         }
 
     if _rocm_present():
+        from .provision import read_state
+
+        provisioning = read_state() or {}
+        if provisioning.get("status") == "in_progress":
+            return {
+                "available": False,
+                "reason": (
+                    "BEAT ROCm runtime provisioning is in progress "
+                    f"(step: {provisioning.get('step', 'unknown')}). The engine "
+                    "becomes available when it finishes."
+                ),
+                "version": version,
+                "backend": None,
+                "julia_executable": julia,
+            }
         functional, detail = _julia_gpu_functional(julia, BEAT_ROCM)
         if functional:
             return {
@@ -227,6 +242,11 @@ def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]
                 "backend": BEAT_ROCM,
                 "julia_executable": julia,
             }
+        if provisioning.get("status") == "failed":
+            detail = (
+                f"provisioning failed earlier: {provisioning.get('error')}. "
+                "Retry with: python -m hornlab_beat_bem.provision --backend rocm --force"
+            )
         return {
             "available": False,
             "reason": f"An AMD ROCm runtime is present but the path is not usable: {detail}",

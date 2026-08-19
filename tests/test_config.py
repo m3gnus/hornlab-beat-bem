@@ -14,9 +14,27 @@ def test_observation_defaults_are_valid():
     assert config.step_deg == pytest.approx(5.0)
 
 
-def test_observation_rejects_diagonal_plane():
-    with pytest.raises(ValueError, match="diagonal"):
-        ObservationConfig(planes=["horizontal", "diagonal"])
+def test_observation_accepts_diagonal_plane_with_inclination():
+    config = ObservationConfig(
+        planes=["horizontal", "vertical", "diagonal"], inclination_deg=30.0
+    )
+    assert config.inclination_deg == 30.0
+
+
+def test_observation_rejects_unknown_plane():
+    with pytest.raises(ValueError, match="unknown"):
+        ObservationConfig(planes=["horizontal", "sideways"])
+
+
+def test_observation_sphere_grid_validation():
+    config = ObservationConfig(sphere_grid=(37, 72))
+    assert config.sphere_grid == (37, 72)
+    with pytest.raises(ValueError, match="n_theta"):
+        ObservationConfig(sphere_grid=(1, 72))
+    with pytest.raises(ValueError, match="n_phi"):
+        ObservationConfig(sphere_grid=(37, 2))
+    with pytest.raises(ValueError, match="sphere_theta_max_deg"):
+        ObservationConfig(sphere_grid=(37, 72), sphere_theta_max_deg=0.0)
 
 
 def test_observation_requires_zero_degree_sample():
@@ -44,9 +62,10 @@ def test_unrepresentable_symmetry_is_rejected(plane):
         reject_unsupported_native_symmetry(config)
 
 
-def test_solve_config_rejects_axial_source_motion():
-    with pytest.raises(NotImplementedError):
-        SolveConfig(source_motion="axial")
+def test_solve_config_accepts_axial_and_rejects_unknown_motion():
+    assert SolveConfig(source_motion="axial").source_motion == "axial"
+    with pytest.raises(ValueError):
+        SolveConfig(source_motion="sideways")
 
 
 def test_solve_config_rejects_non_unit_amplitude():

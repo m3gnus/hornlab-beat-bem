@@ -343,12 +343,29 @@ function polar_observation_points(config, ::Type{T}) where {T<:AbstractFloat}
         push!(horizontal, SVector{3,T}(distance * sin(angle), T(0.0), distance * cos(angle) + axial_offset))
         push!(vertical, SVector{3,T}(T(0.0), distance * sin(angle), distance * cos(angle) + axial_offset))
     end
+    diagonal = nothing
+    if Bool(get_value(config, "diagonal_enabled", false))
+        inclination = T(pi) * T(get_value(config, "diagonal_inclination_deg", 45.0)) / T(180.0)
+        diagonal = SVector{3,T}[]
+        for angle_deg in angles
+            angle = T(pi) * T(angle_deg) / T(180.0)
+            push!(diagonal, SVector{3,T}(
+                distance * sin(angle) * cos(inclination),
+                distance * sin(angle) * sin(inclination),
+                distance * cos(angle) + axial_offset,
+            ))
+        end
+    end
     on_axis_idx = argmin(abs.(Float64.(angles)))
-    return angles, horizontal, vertical, on_axis_idx
+    return angles, horizontal, vertical, diagonal, on_axis_idx
 end
 
 function spherical_observation(config, ::Type{T}) where {T<:AbstractFloat}
+    grid = get_value(config, "spherical_grid", nothing)
     enabled = Bool(get_value(config, "spherical_sampling_enabled", false))
+    if grid !== nothing
+        return spherical_grid_observation(config, grid, T)
+    end
     if !enabled
         return nothing
     end
@@ -383,6 +400,59 @@ function spherical_observation(config, ::Type{T}) where {T<:AbstractFloat}
             "r_distance_m" => r_distance,
             "theta_polar_rad" => theta,
             "phi_azimuth_rad" => phi,
+        ),
+    )
+end
+
+"""
+Theta-major spherical grid around the observation origin, matching the
+theta/phi layout HornLab's balloon and directivity-index mapping expects:
+theta in [0, theta_max_deg] inclusive, phi in [0, 360) without a wrap column,
+phi varying fastest. Theta is measured from the +z forward axis and phi from
++x (the horizontal cut plane).
+"""
+function spherical_grid_observation(config, grid, ::Type{T}) where {T<:AbstractFloat}
+    theta_count = Int(get_value(grid, "theta_count", 37))
+    phi_count = Int(get_value(grid, "phi_count", 72))
+    theta_max_deg = T(get_value(grid, "theta_max_deg", 180.0))
+    theta_count >= 2 || error("spherical_grid theta_count must be at least 2.")
+    phi_count >= 3 || error("spherical_grid phi_count must be at least 3.")
+    (T(0.0) < theta_max_deg <= T(180.0)) || error("spherical_grid theta_max_deg must be in (0, 180].")
+    distance = T(get_value(config, "distance", 2.0))
+    distance <= 0 && error("distance must be positive.")
+    axial_offset = T(get_value(config, "axial_offset", 0.0))
+
+    point_count = theta_count * phi_count
+    points = Vector{SVector{3,T}}(undef, point_count)
+    theta = Vector{Float32}(undef, point_count)
+    phi = Vector{Float32}(undef, point_count)
+    r_distance = fill(Float32(distance), point_count)
+    index = 1
+    for theta_index in 0:(theta_count - 1)
+        theta_value = T(pi) * theta_max_deg / T(180.0) * T(theta_index) / T(theta_count - 1)
+        sin_theta = sin(theta_value)
+        cos_theta = cos(theta_value)
+        for phi_index in 0:(phi_count - 1)
+            phi_value = T(2pi) * T(phi_index) / T(phi_count)
+            points[index] = SVector{3,T}(
+                distance * sin_theta * cos(phi_value),
+                distance * sin_theta * sin(phi_value),
+                distance * cos_theta + axial_offset,
+            )
+            theta[index] = Float32(theta_value)
+            phi[index] = Float32(phi_value)
+            index += 1
+        end
+    end
+
+    return (
+        points=points,
+        metadata=Dict(
+            "r_distance_m" => r_distance,
+            "theta_polar_rad" => theta,
+            "phi_azimuth_rad" => phi,
+            "grid_theta_count" => theta_count,
+            "grid_phi_count" => phi_count,
         ),
     )
 end
@@ -445,6 +515,7 @@ function pressure_for_drives(
     cpu_solve_system=nothing,
     cuda_solve_identity_cache=nothing,
     rocm_solve_identity_cache=nothing,
+    source_motion::Symbol=:normal,
 )
     ComplexType = eltype(drives)
     q_neumann = zeros(ComplexType, length(mesh.faces))
@@ -453,7 +524,12 @@ function pressure_for_drives(
         drive = drives[radiator_index]
         for element_index in eachindex(mesh.physical_tags)
             if mesh.physical_tags[element_index] == tag && radiator_owns_element(radiator, element_mesh_ids, element_index)
-                q_neumann[element_index] = ComplexType(0, rho * omega) * drive
+                # AXIAL: a rigid piston along the +z observation axis, so the
+                # per-face normal velocity is v * (n_hat . z). NORMAL keeps
+                # the uniformly breathing cap.
+                motion_factor = source_motion == :axial ?
+                    ComplexType(mesh.normals[element_index][3]) : one(ComplexType)
+                q_neumann[element_index] = ComplexType(0, rho * omega) * drive * motion_factor
             end
         end
     end
@@ -543,7 +619,7 @@ function flat_target_corrections(channel_names, horizontal_pressure_rows, angles
     return corrections
 end
 
-function synthesize_channel_basis(channel_names, horizontal_pressure_rows, vertical_pressure_rows, sphere_pressure_rows, channels, freq, angles_deg, reference_angle_deg, flat_target::Bool, ::Type{T}) where {T<:AbstractFloat}
+function synthesize_channel_basis(channel_names, horizontal_pressure_rows, vertical_pressure_rows, sphere_pressure_rows, channels, freq, angles_deg, reference_angle_deg, flat_target::Bool, ::Type{T}; diagonal_pressure_rows=nothing) where {T<:AbstractFloat}
     corrections = flat_target_corrections(channel_names, horizontal_pressure_rows, angles_deg, reference_angle_deg, flat_target, T)
     weights = Complex{T}[
         channel_drive(get(channels, channel_name, Dict(
@@ -575,6 +651,16 @@ function synthesize_channel_basis(channel_names, horizontal_pressure_rows, verti
         end
         sphere_norm = Float32.(pressure_to_spl(sphere_pressure, T) .- reference)
     end
+    diagonal_spl = nothing
+    diagonal_norm = nothing
+    if diagonal_pressure_rows !== nothing
+        diagonal_pressure = zero.(diagonal_pressure_rows[1])
+        for channel_index in eachindex(channel_names)
+            diagonal_pressure .+= diagonal_pressure_rows[channel_index] .* weights[channel_index]
+        end
+        diagonal_spl = pressure_to_spl(diagonal_pressure, T)
+        diagonal_norm = Float32.(diagonal_spl .- reference)
+    end
 
     return (
         horizontal_spl=horizontal_spl,
@@ -582,6 +668,8 @@ function synthesize_channel_basis(channel_names, horizontal_pressure_rows, verti
         horizontal_norm=Float32.(horizontal_spl .- reference),
         vertical_norm=Float32.(vertical_spl .- reference),
         sphere_norm=sphere_norm,
+        diagonal_spl=diagonal_spl,
+        diagonal_norm=diagonal_norm,
         corrections=corrections,
         weights=weights,
     )
@@ -691,12 +779,15 @@ function solve_request_impl(request)
     isempty(frequencies) && error("frequencies_hz must contain at least one frequency.")
     cancel_path = get_value(request, "cancel_path", nothing)
 
+    source_motion = Symbol(lowercase(strip(String(get_value(config, "source_motion", "normal")))))
+    source_motion in (:normal, :axial) || error("Unsupported source_motion: $(source_motion). Expected normal or axial.")
+
     FloatType = Float32
     mesh_inputs = mesh_inputs_from_config(config)
     radiators = radiator_inputs_from_config(config, mesh_inputs)
     channels = channel_inputs_from_config(config)
     validate_radiator_channels(radiators, channels)
-    polar_angles_deg, horizontal_points, vertical_points, on_axis_idx = polar_observation_points(config, FloatType)
+    polar_angles_deg, horizontal_points, vertical_points, diagonal_points, on_axis_idx = polar_observation_points(config, FloatType)
     sphere = spherical_observation(config, FloatType)
     sphere_metadata = sphere === nothing ? nothing : sphere.metadata
 
@@ -880,11 +971,16 @@ function solve_request_impl(request)
         channel_boundary_pressures = Vector{Vector{Complex{FloatType}}}()
         horizontal_pressure_rows = Vector{Vector{Complex{FloatType}}}()
         vertical_pressure_rows = Vector{Vector{Complex{FloatType}}}()
+        diagonal_pressure_rows = diagonal_points === nothing ? nothing : Vector{Vector{Complex{FloatType}}}()
         sphere_pressure_rows = sphere === nothing ? nothing : Vector{Vector{Complex{FloatType}}}()
 
-        combined_points = sphere === nothing ? vcat(horizontal_points, vertical_points) : vcat(horizontal_points, vertical_points, sphere.points)
+        cut_points = diagonal_points === nothing ?
+            vcat(horizontal_points, vertical_points) :
+            vcat(horizontal_points, vertical_points, diagonal_points)
+        combined_points = sphere === nothing ? cut_points : vcat(cut_points, sphere.points)
         horizontal_count = length(horizontal_points)
         vertical_count = length(vertical_points)
+        diagonal_count = diagonal_points === nothing ? 0 : length(diagonal_points)
 
         for channel_name in channel_names
             unit_drives = channel_unit_drives(radiators, channel_name, FloatType)
@@ -905,14 +1001,19 @@ function solve_request_impl(request)
                     cpu_solve_system=cpu_solve_system,
                     cuda_solve_identity_cache=cuda_solve_identity_cache,
                     rocm_solve_identity_cache=rocm_solve_identity_cache,
+                    source_motion=source_motion,
                 )
             end
             t_field += @elapsed begin
                 combined_pressure = field_for_points(combined_points, mesh, pressure, q_neumann, k, selected_field_cache, beat_backend)
                 push!(horizontal_pressure_rows, Complex{FloatType}.(combined_pressure[1:horizontal_count]))
                 push!(vertical_pressure_rows, Complex{FloatType}.(combined_pressure[(horizontal_count + 1):(horizontal_count + vertical_count)]))
+                if diagonal_pressure_rows !== nothing
+                    diagonal_start = horizontal_count + vertical_count + 1
+                    push!(diagonal_pressure_rows, Complex{FloatType}.(combined_pressure[diagonal_start:(diagonal_start + diagonal_count - 1)]))
+                end
                 if sphere !== nothing
-                    sphere_start = horizontal_count + vertical_count + 1
+                    sphere_start = horizontal_count + vertical_count + diagonal_count + 1
                     push!(sphere_pressure_rows, Complex{FloatType}.(combined_pressure[sphere_start:end]))
                 end
                 push!(channel_boundary_pressures, Complex{FloatType}.(pressure))
@@ -939,7 +1040,8 @@ function solve_request_impl(request)
                 polar_angles_deg,
                 flat_target_reference_angle_deg,
                 flat_target,
-                FloatType,
+                FloatType;
+                diagonal_pressure_rows=diagonal_pressure_rows,
             )
             horizontal_spl = synthesis.horizontal_spl
             vertical_spl = synthesis.vertical_spl
@@ -969,6 +1071,9 @@ function solve_request_impl(request)
                 "channel_names" => channel_names,
                 "horizontal_pressure" => complex_rows_to_wire(horizontal_pressure_rows),
                 "vertical_pressure" => complex_rows_to_wire(vertical_pressure_rows),
+                "diagonal_pressure" => diagonal_pressure_rows === nothing ? nothing : complex_rows_to_wire(diagonal_pressure_rows),
+                "diagonal_spl_db" => synthesis.diagonal_spl,
+                "diagonal_spl_norm_db" => synthesis.diagonal_norm,
                 "sphere_pressure" => sphere_pressure_rows === nothing ? nothing : complex_rows_to_wire(sphere_pressure_rows),
                 "timings" => Dict(
                     "assembly_s" => Float32(t_assembly),

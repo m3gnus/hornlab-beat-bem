@@ -115,9 +115,19 @@ def _request_payload(
         "symmetry": beat_symmetry_mode(config.native_symmetry_plane),
         "flat_target_normalization_enabled": False,
         "spherical_sampling_enabled": False,
+        "source_motion": config.source_motion,
         "quadrature_order": int(config.quadrature_order),
         "singular_order": int(config.singular_order),
     }
+    if "diagonal" in observation.planes:
+        solver_config["diagonal_enabled"] = True
+        solver_config["diagonal_inclination_deg"] = float(observation.inclination_deg)
+    if observation.sphere_grid is not None:
+        solver_config["spherical_grid"] = {
+            "theta_count": int(observation.sphere_grid[0]),
+            "phi_count": int(observation.sphere_grid[1]),
+            "theta_max_deg": float(observation.sphere_theta_max_deg),
+        }
     if config.regular_quadrature_mode is not None:
         solver_config["regular_quadrature_mode"] = config.regular_quadrature_mode
     return {
@@ -212,6 +222,38 @@ def solve_frequencies(
 
     planes = list(config.observation.planes)
     total = int(frequencies.size)
+
+    sphere_theta_deg: np.ndarray | None = None
+    sphere_phi_deg: np.ndarray | None = None
+    sphere_pressure: np.ndarray | None = None
+    if config.observation.sphere_grid is not None:
+        sphere_meta = session.metadata.get("sphere_metadata") or {}
+        theta_rad = np.asarray(sphere_meta.get("theta_polar_rad") or [], dtype=np.float64)
+        phi_rad = np.asarray(sphere_meta.get("phi_azimuth_rad") or [], dtype=np.float64)
+        n_theta, n_phi = (int(value) for value in config.observation.sphere_grid)
+        expected_points = n_theta * n_phi
+        if theta_rad.size != expected_points or phi_rad.size != expected_points:
+            raise RuntimeError(
+                "BEAT solver sphere grid does not match the requested layout: "
+                f"{theta_rad.size} points for {expected_points} requested"
+            )
+        # The solver echoes the grid in Float32 radians (180 deg comes back as
+        # 180.000005). Downstream DI integration checks the axes against exact
+        # grid endpoints, so rebuild the requested float64 layout and only use
+        # the echo to verify the solver sampled what was asked for.
+        theta_axis = np.linspace(0.0, float(config.observation.sphere_theta_max_deg), n_theta)
+        phi_axis = np.arange(n_phi) * (360.0 / n_phi)
+        sphere_theta_deg = np.repeat(theta_axis, n_phi)
+        sphere_phi_deg = np.tile(phi_axis, n_theta)
+        if not np.allclose(
+            np.degrees(theta_rad), sphere_theta_deg, atol=1.0e-3
+        ) or not np.allclose(np.degrees(phi_rad), sphere_phi_deg, atol=1.0e-3):
+            raise RuntimeError(
+                "BEAT solver sphere grid angles do not match the requested "
+                "theta-major layout"
+            )
+        sphere_pressure = np.full((total, expected_points), np.nan, dtype=np.complex128)
+
     pressure = np.full((total, len(planes), angles.size), np.nan, dtype=np.complex128)
     spl = np.full((total, len(planes), angles.size), np.nan, dtype=np.float64)
     impedance = np.full(total, np.nan, dtype=np.complex128)
@@ -258,6 +300,8 @@ def solve_frequencies(
             "horizontal": _wire_rows(raw.get("horizontal_pressure"))[0],
             "vertical": _wire_rows(raw.get("vertical_pressure"))[0],
         }
+        if "diagonal" in planes:
+            rows_by_cut["diagonal"] = _wire_rows(raw.get("diagonal_pressure"))[0]
         entry_pressure = np.stack(
             [rows_by_cut[plane] * acceleration_scale for plane in planes]
         )
@@ -284,6 +328,15 @@ def solve_frequencies(
                     _BEAT_IMPEDANCE_FORCE_FACTOR * symmetry_factor * source_area
                 )
                 entry_impedance = complex(mean_pressure_velocity * acceleration_scale)
+
+        if sphere_pressure is not None:
+            sphere_row = _wire_rows(raw.get("sphere_pressure"))[0]
+            if sphere_row.size != sphere_pressure.shape[1]:
+                raise RuntimeError(
+                    "BEAT solver sphere pressure row does not match its grid: "
+                    f"{sphere_row.size} != {sphere_pressure.shape[1]}"
+                )
+            sphere_pressure[index] = sphere_row * acceleration_scale
 
         pressure[index] = entry_pressure
         spl[index] = entry_spl
@@ -328,6 +381,9 @@ def solve_frequencies(
         mesh_info=mesh_info,
         timings=timings,
         solver_log=solver_log,
+        sphere_pressure_complex=None if sphere_pressure is None else sphere_pressure[:count],
+        sphere_theta_deg=sphere_theta_deg,
+        sphere_phi_deg=sphere_phi_deg,
     )
 
 

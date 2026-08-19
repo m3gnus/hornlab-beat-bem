@@ -51,14 +51,51 @@ def test_existing_julia_skips_the_julia_download(runtime_dir, monkeypatch, tmp_p
     monkeypatch.setattr(
         provision,
         "_run_julia_step",
-        lambda julia, code, *, label, status_cb: steps.append(label),
+        lambda julia, code, **kwargs: steps.append(kwargs["label"]),
     )
 
     state = provision.provision_cuda(runtime_dir, status_cb=lambda _: None)
     assert state["status"] == "ready"
     assert state["julia_executable"] == str(fake_julia)
-    assert len(steps) == 2  # instantiate + CUDA probe
+    assert len(steps) == 2  # instantiate + GPU probe
     assert provision.provisioned_julia(runtime_dir) == str(fake_julia)
+
+
+def test_backend_gating_matches_hardware(runtime_dir, monkeypatch, tmp_path):
+    """A ROCm-only host provisions ROCm and skips CUDA, and vice versa."""
+
+    monkeypatch.setattr(runtime, "_nvidia_gpu_present", lambda: False)
+    monkeypatch.setattr(runtime, "_rocm_present", lambda: True)
+    fake_julia = tmp_path / "julia.exe"
+    fake_julia.write_text("", encoding="utf-8")
+    monkeypatch.setattr(runtime, "discover_julia", lambda explicit=None: str(fake_julia))
+
+    assert provision.detect_gpu_backend() == "rocm"
+    cuda_state = provision.provision_gpu(
+        runtime_dir, backend="cuda", status_cb=lambda _: None
+    )
+    assert cuda_state["status"] == "skipped"
+
+    probes: list[str] = []
+    monkeypatch.setattr(
+        provision,
+        "_run_julia_step",
+        lambda julia, code, **kwargs: probes.append(str(kwargs["project"])),
+    )
+    rocm_state = provision.provision_gpu(
+        runtime_dir, backend="rocm", status_cb=lambda _: None
+    )
+    assert rocm_state["status"] == "ready"
+    assert rocm_state["backend"] == "rocm"
+    assert all(path.endswith("julia_rocm") for path in probes)
+
+
+def test_cli_if_gpu_gate_exits_quietly_without_any_gpu(runtime_dir, monkeypatch, capsys):
+    monkeypatch.setattr(runtime, "_nvidia_gpu_present", lambda: False)
+    monkeypatch.setattr(runtime, "_rocm_present", lambda: False)
+    assert provision.main(["--if-gpu"]) == 0
+    assert capsys.readouterr().out == ""
+    assert not runtime_dir.exists()
 
 
 def test_ready_state_short_circuits(runtime_dir, monkeypatch, tmp_path):
@@ -67,7 +104,9 @@ def test_ready_state_short_circuits(runtime_dir, monkeypatch, tmp_path):
     fake_julia.write_text("", encoding="utf-8")
     runtime_dir.mkdir(parents=True)
     (runtime_dir / provision.STATE_FILENAME).write_text(
-        json.dumps({"status": "ready", "julia_executable": str(fake_julia)}),
+        json.dumps(
+            {"status": "ready", "backend": "cuda", "julia_executable": str(fake_julia)}
+        ),
         encoding="utf-8",
     )
 

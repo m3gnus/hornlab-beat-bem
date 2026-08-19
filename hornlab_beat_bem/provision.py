@@ -1,18 +1,18 @@
-"""GPU-gated runtime provisioning: fetch Julia and the CUDA stack on demand.
+"""GPU-gated runtime provisioning: fetch Julia and the GPU stack on demand.
 
-Nothing here downloads anything unless an NVIDIA GPU is actually present:
-``provision_cuda`` (and the ``--if-nvidia-gpu`` CLI gate) checks the hardware
-inventory first and exits as a no-op otherwise, so CPU-only machines never pay
-the ~200 MB Julia + multi-GB CUDA.jl artifact cost.
+Nothing here downloads anything unless matching GPU hardware is actually
+present: ``provision_gpu`` (and the ``--if-gpu`` CLI gate) checks the
+hardware inventory first and exits as a no-op otherwise, so CPU-only machines
+never pay the ~200 MB Julia + multi-GB CUDA.jl/AMDGPU.jl artifact cost.
 
 Steps, each idempotent and recorded in ``<runtime_dir>/state.json``:
 
 1. Resolve a Julia executable -- an existing install (env var/PATH/previous
    provisioning) wins; only when none exists is the official portable Julia
    downloaded, SHA-256 verified, and unpacked under the runtime directory.
-2. ``Pkg.instantiate()`` the bundled ``julia_cuda`` project (downloads
-   CUDA.jl and friends into the user's Julia depot).
-3. Force CUDA artifact resolution and require ``CUDA.functional()``, so a
+2. ``Pkg.instantiate()`` the bundled ``julia_cuda``/``julia_rocm`` project
+   (downloads the accelerator packages into the user's Julia depot).
+3. Force accelerator artifact resolution and require ``functional()``, so a
    recorded "ready" state means the first real solve will not stall on
    downloads or discover a broken driver.
 
@@ -39,8 +39,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .config import BEAT_CUDA
-from .runtime import CUDA_PROJECT
+from .config import BEAT_CUDA, BEAT_ROCM
 
 JULIA_VERSION = "1.12.6"
 _JULIA_BASE = "https://julialang-s3.julialang.org/bin"
@@ -223,10 +222,12 @@ def _run_julia_step(
     julia: str,
     code: str,
     *,
+    project: Path,
+    env_backend: str,
     label: str,
     status_cb: StatusCallback,
 ) -> None:
-    command = [julia, f"--project={CUDA_PROJECT}", "--startup-file=no", "-e", code]
+    command = [julia, f"--project={project}", "--startup-file=no", "-e", code]
     status_cb(label)
     process = subprocess.Popen(
         command,
@@ -235,7 +236,7 @@ def _run_julia_step(
         text=True,
         encoding="utf-8",
         errors="replace",
-        env={**os.environ, "BLAB_BEAT_ENGINE_GPU_BACKEND": BEAT_CUDA},
+        env={**os.environ, "BLAB_BEAT_ENGINE_GPU_BACKEND": env_backend},
     )
     tail: list[str] = []
     assert process.stdout is not None
@@ -250,36 +251,88 @@ def _run_julia_step(
         raise RuntimeError(f"{label} failed (exit {process.returncode}).\n{detail}")
 
 
-def provision_cuda(
-    runtime_dir: Path | None = None,
-    *,
-    status_cb: StatusCallback = print,
-    force: bool = False,
-) -> dict[str, Any]:
-    """Provision the CUDA runtime iff an NVIDIA GPU is present.
+#: Per-backend provisioning facts: hardware gate, Julia project, and module.
+_GPU_BACKENDS: dict[str, dict[str, Any]] = {
+    BEAT_CUDA: {
+        "label": "CUDA",
+        "module": "CUDA",
+        "hardware": "an NVIDIA GPU",
+    },
+    BEAT_ROCM: {
+        "label": "ROCm",
+        "module": "AMDGPU",
+        "hardware": "an AMD ROCm runtime",
+    },
+}
 
-    Returns the resulting state dict; ``status`` is one of ``skipped`` (no
-    GPU -- nothing was downloaded), ``ready``, or ``failed``.
-    """
+
+def detect_gpu_backend() -> str | None:
+    """Which GPU backend this host's hardware inventory suggests, if any."""
 
     from . import runtime
 
+    if runtime._nvidia_gpu_present():
+        return BEAT_CUDA
+    if runtime._rocm_present():
+        return BEAT_ROCM
+    return None
+
+
+def _gpu_hardware_present(backend: str) -> bool:
+    from . import runtime
+
+    if backend == BEAT_CUDA:
+        return runtime._nvidia_gpu_present()
+    if backend == BEAT_ROCM:
+        return runtime._rocm_present()
+    return False
+
+
+def provision_gpu(
+    runtime_dir: Path | None = None,
+    *,
+    backend: str = BEAT_CUDA,
+    status_cb: StatusCallback = print,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Provision a GPU runtime iff the matching hardware is present.
+
+    Returns the resulting state dict; ``status`` is one of ``skipped`` (no
+    matching GPU -- nothing was downloaded), ``ready``, or ``failed``.
+    """
+
+    from . import runtime
+    from .runtime import default_project
+
+    if backend not in _GPU_BACKENDS:
+        raise ValueError(f"backend must be one of {sorted(_GPU_BACKENDS)}")
+    facts = _GPU_BACKENDS[backend]
     directory = (runtime_dir or default_runtime_dir()).expanduser()
 
-    if not runtime._nvidia_gpu_present():
-        status_cb("No NVIDIA GPU detected; skipping BEAT CUDA runtime provisioning.")
-        return {"status": "skipped", "reason": "no NVIDIA GPU detected"}
+    if not _gpu_hardware_present(backend):
+        status_cb(
+            f"No {facts['hardware']} detected; skipping BEAT {facts['label']} "
+            "runtime provisioning."
+        )
+        return {"status": "skipped", "reason": f"no {facts['hardware']} detected"}
 
     previous = read_state(directory)
-    if not force and previous and previous.get("status") == "ready":
+    if (
+        not force
+        and previous
+        and previous.get("status") == "ready"
+        and previous.get("backend") == backend
+    ):
         executable = previous.get("julia_executable")
         if isinstance(executable, str) and Path(executable).exists():
-            status_cb("BEAT CUDA runtime is already provisioned.")
+            status_cb(f"BEAT {facts['label']} runtime is already provisioned.")
             return previous
 
+    project = default_project(backend)
+    module = facts["module"]
     state: dict[str, Any] = {
         "status": "in_progress",
-        "backend": BEAT_CUDA,
+        "backend": backend,
         "step": "resolve_julia",
         "julia_version": JULIA_VERSION,
     }
@@ -291,40 +344,69 @@ def provision_cuda(
         _run_julia_step(
             julia,
             'using Pkg; Pkg.instantiate()',
-            label="Instantiating the Julia CUDA environment (first run downloads several GB)",
+            project=project,
+            env_backend=backend,
+            label=(
+                f"Instantiating the Julia {facts['label']} environment "
+                "(first run downloads several GB)"
+            ),
             status_cb=status_cb,
         )
-        state["step"] = "cuda_probe"
+        state["step"] = "gpu_probe"
         _write_state(directory, state)
-        # versioninfo() forces CUDA artifact resolution, so a "ready" state
-        # means the first solve starts computing instead of downloading.
+        # versioninfo() forces artifact resolution, so a "ready" state means
+        # the first solve starts computing instead of downloading.
         _run_julia_step(
             julia,
-            'import CUDA; CUDA.versioninfo(); exit(CUDA.functional() ? 0 : 1)',
-            label="Resolving CUDA artifacts and probing the device",
+            f'import {module}; {module}.versioninfo(); exit({module}.functional() ? 0 : 1)',
+            project=project,
+            env_backend=backend,
+            label=f"Resolving {facts['label']} artifacts and probing the device",
             status_cb=status_cb,
         )
         state.update(status="ready", step="done", error=None)
         _write_state(directory, state)
         runtime.probe_gpu_functional_cache_clear()
-        status_cb("BEAT CUDA runtime is ready.")
+        status_cb(f"BEAT {facts['label']} runtime is ready.")
         return state
     except Exception as exc:  # noqa: BLE001 - recorded, reported, never silent
         state.update(status="failed", error=str(exc))
         _write_state(directory, state)
-        status_cb(f"BEAT CUDA runtime provisioning failed: {exc}")
+        status_cb(f"BEAT {facts['label']} runtime provisioning failed: {exc}")
         return state
+
+
+def provision_cuda(
+    runtime_dir: Path | None = None,
+    *,
+    status_cb: StatusCallback = print,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Back-compat alias for ``provision_gpu(backend='cuda')``."""
+
+    return provision_gpu(runtime_dir, backend=BEAT_CUDA, status_cb=status_cb, force=force)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Provision the BEAT Engine CUDA runtime (GPU-gated; a "
-        "no-op without an NVIDIA GPU).",
+        description="Provision a BEAT Engine GPU runtime (hardware-gated; a "
+        "no-op without a supported GPU).",
+    )
+    parser.add_argument(
+        "--if-gpu",
+        action="store_true",
+        help="exit 0 quietly when no supported GPU is present (for setup hooks)",
     )
     parser.add_argument(
         "--if-nvidia-gpu",
         action="store_true",
-        help="exit 0 quietly when no NVIDIA GPU is present (for setup hooks)",
+        help="exit 0 quietly when no NVIDIA GPU is present (legacy setup-hook gate)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", BEAT_CUDA, BEAT_ROCM],
+        default="auto",
+        help="which GPU stack to provision; auto follows the hardware inventory",
     )
     parser.add_argument("--force", action="store_true", help="re-provision even when ready")
     parser.add_argument("--dir", type=Path, default=None, help="runtime directory override")
@@ -334,10 +416,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.if_nvidia_gpu and not runtime._nvidia_gpu_present():
         return 0
-    state = provision_cuda(args.dir, force=args.force)
-    if state["status"] == "ready":
+    backend = args.backend
+    if backend == "auto":
+        backend = detect_gpu_backend()
+        if backend is None:
+            if args.if_gpu:
+                return 0
+            print("No supported GPU (NVIDIA CUDA or AMD ROCm) was detected; nothing to provision.")
+            return 0
+    elif args.if_gpu and not _gpu_hardware_present(backend):
         return 0
-    if state["status"] == "skipped":
+    state = provision_gpu(args.dir, backend=backend, force=args.force)
+    if state["status"] in {"ready", "skipped"}:
         return 0
     return 1
 
