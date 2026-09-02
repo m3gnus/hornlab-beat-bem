@@ -188,7 +188,8 @@ than the LU.
 GMRES iterations at tolerance 1e-6 **on the true relative residual**, diagonal
 preconditioning. These are the figures the shipped iteration constant is fitted
 to, quoted from `BeatEngineDenseSolve.jl`'s own calibration docstring rather
-than re-measured here:
+than re-measured here — ladder bench figures, not gate figures, which is a
+distinction that matters more than it looks (see the drive caveat below):
 
 | mesh | N | 500 Hz | 2 kHz | 6 kHz |
 |---|---:|---:|---:|---:|
@@ -251,6 +252,15 @@ Keep the general form in mind if you extend it: **a gate easier than the path
 it guards will pass a change that breaks production**, and this one guards the
 most actively changed code in the package. Check what right-hand side a gate
 builds before trusting what its numbers mean.
+
+**Record the drive beside every iteration count.** A bare count is not a
+measurement here. The two drives do not merely shift the numbers, they can
+invert an ordering: on the bundled fixture the physical drive reads 53/58/55 at
+500/2000/6000 Hz where the random one read 44/51/63, so an argument that this
+fixture is hardest at 6 kHz — which the counts supported under one drive —
+is false under the other, with every individual figure still looking plausible.
+Treat any count written before the gate changed as describing a different
+problem.
 
 ### Calibrate on a new machine
 
