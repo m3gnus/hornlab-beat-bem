@@ -33,6 +33,12 @@ hornlab_beat_bem = [
     "julia_cuda/*.toml",
     "julia_metal/*.toml",
     "julia_rocm/*.toml",
+    # The precompilable engine bundles. Leaving these out of the wheel does
+    # not break anything visibly: solver.jl falls back to including the
+    # sources, so an installed copy without them still solves -- at three
+    # times the cold start, with nothing to say why.
+    "julia_engine/*/*.toml",
+    "julia_engine/*/src/*.jl",
 ]
 
 [tool.pytest.ini_options]
