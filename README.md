@@ -224,24 +224,33 @@ and hornlab-metal-bem's Krylov path fails on the same mesh family, so this is
 the geometry rather than either implementation. What BEAT has that metal-bem
 does not is the fallback, so the answer still comes back correct.
 
-**It is a routing defect, and it is not fixed.** The solve pays for the failed
-Krylov attempt *and* the factorization, roughly 1.8x the cost of forcing
-`BLAB_BEAT_DENSE_SOLVE=lu`. A cost model prices a *converging* GMRES, so a
-mesh where GMRES converges slowly and then stops is precisely the case it
-cannot see. Correct answers, wasted time.
+**A misrouted GMRES is bounded, not unbounded.** The router prices a
+*converging* GMRES, so a mesh where GMRES converges slowly and then stops is
+exactly the case it cannot see. It used to pay for the failed Krylov attempt
+*and* the factorization with nothing to cap it. The figures that motivated the
+bound were taken upstream on a Ryzen 7 5825U, not on the M1 Max everything else
+here is measured on: 3.85x worse than forcing the LU on the worst cell, with
+the true iteration count running 39–549 and *rising* with frequency — the
+opposite ordering to the ATH ladder the shipped constant was fitted on, which
+is the point. The defect is invisible on hardware where the model's quantities
+are flat. A model-chosen GMRES now gets one LU's worth
+of matvecs (`BLAB_BEAT_GMRES_BUDGET`, default 1.0). Exceeding the budget is the
+discovery that the routing was wrong, so the solve falls back having spent at
+most about twice the LU rather than an unbounded multiple. A GMRES the caller
+asked for explicitly is not budgeted.
 
-**A caveat on how convergence is measured here.** These numbers come from the
-production drive. `scripts/validate_gmres_burton_miller.jl` excites with a
-random right-hand side over every DP0 dof, which is materially easier on this
-mesh family — under the gate A1 converges in 68–88 iterations to ~6e-7, which
-says nothing about the solve above. It is a correctness gate for the Krylov
-implementation, not a convergence forecast, and its iteration counts should
-never be read as production behaviour.
+**How convergence is measured here, and a trap that was in this gate.** The
+table above is the production drive. `validate_gmres_burton_miller.jl` used to
+excite with a random right-hand side over every DP0 dof, which is materially
+easier on this mesh family: it reported health on precisely the configuration
+that fails in production. It now drives the same localised tag-2 velocity the
+solver applies, and reports a fallback as a fact rather than forbidding one,
+because on these meshes falling back *is* the designed response.
 
-The general form is worth stating because this gate guards the most actively
-changed code in the package: **a gate that is easier than the path it guards
-will pass a change that breaks production.** If you tighten or extend it, check
-what right-hand side it drives before trusting what it says.
+Keep the general form in mind if you extend it: **a gate easier than the path
+it guards will pass a change that breaks production**, and this one guards the
+most actively changed code in the package. Check what right-hand side a gate
+builds before trusting what its numbers mean.
 
 ### Calibrate on a new machine
 
@@ -258,6 +267,17 @@ It needs no mesh — the primitives are BLAS, not BEM — and prints `export` li
 for `BLAB_BEAT_LU_GFLOPS`, `BLAB_BEAT_MATVEC_ENTRY_SECONDS`,
 `BLAB_BEAT_MATVEC_DOF_SECONDS` and `BLAB_BEAT_TRIANGULAR_GBPS`. Take at least
 three sizes: two points cannot tell a wrong exponent from a wrong constant.
+
+Three things it learned from being run on a machine unlike the one it was
+written on (a Ryzen 7 5825U, where every quantity the M1 Max holds flat
+moves). It warms `lu!`/`mul!`/`ldiv!` before measuring — unwarmed, the sample
+nearest the crossover read 51.8 GFLOP/s against 230.2 warm. It reads the LU
+and triangular constants **at the crossover** rather than averaging or
+maximising over sizes, because the crossover is the only place the two modelled
+costs are close and therefore the only place a constant can change a decision.
+And it clamps the matvec's linear term at zero rather than letting it fit
+negative, which it does wherever effective bandwidth *falls* with N — a
+negative constant is one the solver refuses to start with.
 
 The fifth constant, `BLAB_BEAT_GMRES_MODEL_ITERATIONS`, is the operator's own,
 and it needs re-measuring whenever the formulation, the coupling parameter or
@@ -326,6 +346,7 @@ All are environment variables; the defaults are the shipped configuration.
 |---|---|---|
 | `BLAB_BEAT_DENSE_SOLVE` | `auto` | `lu` or `gmres` forces the choice past the cost model |
 | `BLAB_BEAT_GMRES_TOL` | `1e-6` | tolerance on the true relative residual |
+| `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |

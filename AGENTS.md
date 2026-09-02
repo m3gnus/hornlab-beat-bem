@@ -49,13 +49,15 @@ pytest
 pytest -m slow          # a real Julia solve; needs a Julia executable
 ```
 
-One known environment-dependent failure: the Julia suite's `krylov space
-precision and orthogonality` test asserts that an unreorthogonalised Float32
-Gram-Schmidt is measurably worse than the remedies, and at N=400 on some CPUs
-it does not degrade enough for that assertion to be reachable. It has been seen
-red on Windows at a commit where it is green on an M1 Max. That is a property
-of the host, not of a change under test — check whether it also fails on the
-merge base before attributing it.
+One check is deliberately conditional. The Julia suite and the Krylov gate
+both compare an unreorthogonalised Float32 Gram-Schmidt against the remedies,
+so that the agreement between the remedies is not vacuous. *Whether* it
+degrades is a property of the host's floating point rather than of the code:
+the synthetic system loses 20x on an M1 Max and reportedly not at all on a
+Ryzen 7 5825U. A suite that fails where the code is right is reporting a
+microarchitecture, so that half is a **warning**, not an assertion. The
+agreement between the remedies stays hard. Do not "fix" a warning here by
+tightening it into a failure.
 
 Do not weaken a tolerance to make a gate pass. The fused and symmetry gates
 compare two code paths that differ only in Float32 summation order, so their
