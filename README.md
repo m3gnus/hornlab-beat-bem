@@ -72,6 +72,13 @@ julia --project=hornlab_beat_bem/julia_metal -e "using Pkg; Pkg.instantiate()"
 
 `julia` (CPU), `julia_cuda` and `julia_rocm` likewise.
 
+**Instantiating is also what installs the engine bundle**, and skipping it
+costs a lot more than it looks. Each backend project depends on a package
+under `julia_engine/` that holds the whole engine; without it `solver.jl`
+falls back to compiling the engine from source in every worker process, and
+the only symptom is a cold start three to five times longer. See
+[Cold start](#cold-start).
+
 ### Provisioned runtime
 
 ```bash
@@ -128,6 +135,78 @@ Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
 representable and is rejected by `reject_unsupported_native_symmetry`.
 
 Not supported: surface trace retention, multi-source drive.
+
+## Cold start
+
+A worker must load and compile the engine before it can solve anything. Julia
+caches native code only for **packages**, and until `julia_engine/` existed
+none of this was in one: `solver.jl` pulled ~20,700 lines of engine in with
+`include` and carried ~1,300 lines of driver itself, so every worker process
+compiled all of it again. The engine and the driver now live in a package per
+backend, each carrying a `PrecompileTools` workload that solves one frequency
+on a four-triangle tetrahedron.
+
+**Packaging alone buys almost nothing — the workload is the fix.** Upstream
+measured runtime compilations going 370-378 to 351-354 on packaging alone, and
+to 89-92 with the workload.
+
+Measured here on an M1 Max against the ATH `250917asro68q` quarter export
+(1,209 P1 dofs, `xy` symmetry), arms interleaved, machine load checked at each
+sample (3-8 processes above 5% CPU):
+
+| | include path | bundle |
+|---|---|---|
+| runtime compilations, first solve (CPU) | 344 | **95** |
+| time to first result, CPU | 12.4-14.6 s | **2.7-2.9 s** |
+| runtime compilations, first solve (Metal) | 846 | **613** |
+| time to first result, Metal | 41.4 s | **17.9 s** |
+| second solve, same worker, CPU | 1.18-1.22 s | 1.16-1.21 s |
+| second solve, same worker, Metal | 0.53 s | 0.43 s |
+
+The last two rows are the control: a warm solve is unchanged, which is what
+says this is start-up and not the solver.
+
+The runtime-compilation count is the instrument that matters, because it does
+not move with machine load and a wall clock does. `--trace-compile=stderr` on
+the worker's own entry path reports it.
+
+**Metal's residual is not fixable by any cache.** GPUCompiler has no disk
+cache, so kernel compilation is paid once per process however much is
+precompiled — the 613 that remain are mostly that. Keeping one worker alive
+across solves is therefore load-bearing rather than an optimisation, which is
+what `hornlab_beat_bem.worker` does.
+
+**A missing bundle is silent.** `solver.jl` falls back to including the
+sources, so an installation whose environment was never instantiated, or a
+wheel built without `julia_engine/` in its package data, still solves and
+still gives the right answers — at the old cost, with nothing logged. That is
+why `tests/test_engine_bundles.py` asserts the wiring structurally, and why
+its one slow test counts compilations rather than trusting that the package
+loaded.
+
+### Ahead-of-time codegen is not bit-identical to the JIT
+
+Compiling the kernels ahead of time does not produce the same machine code as
+compiling them on first call, so a bundled worker differs from the include
+path in the last bits. On `250917asro68q`, CPU backend, 500 / 2000 / 6000 Hz:
+pressures agree to 9.7e-7 of peak (about 8 Float32 ulp) and SPL to 5.4e-4 dB
+over a response spanning 59 dB.
+
+**How large that becomes in dB depends on the conditioning of the mesh, not
+on the size of the codegen difference.** On `test_meshes/sample_detailed.msh`
+— where GMRES diverges to a relative residual of 19 and the solve falls back
+to LU — the same comparison gives 0.097 dB and 1.1% in pressure. Float32 LU on
+an ill-conditioned operator amplifies any change of summation order by roughly
+the condition number; nothing about the bundle is different there.
+
+`BLAB_BEAT_ENGINE_BUNDLE=0` forces the include path when a number has to be
+reproduced exactly. It is verified bit-identical: pressures, SPL and impedance
+compare byte-for-byte equal to the pre-bundle package on both meshes above.
+It costs the old start-up.
+
+On the Metal backend the question answers itself — the `native` singular
+correction's atomics already make two runs of the *same* code differ by more
+than this does.
 
 ## Measured performance
 
@@ -361,6 +440,7 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |
+| `BLAB_BEAT_ENGINE_BUNDLE` | `1` | `0` ignores the precompiled bundle and includes the engine from source: bit-identical to the pre-bundle package, at the old cold start |
 | `HORNLAB_BEAT_JULIA` | — | explicit Julia executable |
 | `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available |
 

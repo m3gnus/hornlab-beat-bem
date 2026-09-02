@@ -26,7 +26,8 @@ below**, and everything not listed is a byte-for-byte copy.
 |---|---|---|
 | Original vendoring (2026-08-19) | `42c87812f70b9ae3ab446bcc543b3789941d0509` (2026-08-17) | upstream `dev`, now also on `main` |
 | Sync at first publish (2026-09-02) | `f536d9e6a89c348cb5e071349f788cfe0f078156` | `feat/beat-adaptive-solve` |
-| Current sync (2026-09-02) | `3ebc90aa95743b56dd19cd85ececf190d2672776` | `feat/beat-adaptive-solve` |
+| Sync at 3ebc90a (2026-09-02) | `3ebc90aa95743b56dd19cd85ececf190d2672776` | `feat/beat-adaptive-solve` |
+| Current sync (2026-09-02) | `cd50b3c64771b242d681aaf440a5b786757ba35a` | `feat/beat-cold-start-adaptive` |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`
@@ -68,6 +69,41 @@ The version first published here, `ba72fb0`, predates all four. Anyone reading
 that commit should know it ships the adaptive router **without** the misroute
 bound.
 
+## The cold-start sync
+
+`feat/beat-cold-start` and `feat/beat-adaptive-solve` were both cut from
+`e862240` and this package needs both. Merging them upstream rather than
+merging their effects here is what keeps the rule in `AGENTS.md` intact: the
+vendored sources stay a verbatim copy of **one** commit.
+
+| branch | tip | what it adds |
+|---|---|---|
+| `feat/beat-cold-start` | `1d97e03def3abf2c275d87933bf3d7502ae817a6` | the engine and the worker driver moved into precompilable packages under `julia_engine/`, each with a `PrecompileTools` workload |
+| `feat/beat-cold-start-adaptive` | `cd50b3c64771b242d681aaf440a5b786757ba35a` | the merge of the two branches, plus the one fix below |
+
+The merge itself was clean (`ort`, no conflicts): the two branches overlap in
+`BeatEngineCore.jl` and `beat-engine-core.md` only, and in different places.
+
+### The one commit made upstream for this package
+
+`cd50b3c` changes the precompile workload's request from
+`"source_motion" => "piston"` to `"normal"`, in all four bundles.
+
+Upstream has no `source_motion` key at all, so it ignores the value and the
+workload solves. **This package's `solver.jl` validates it** — `normal` or
+`axial`, one of the three local modifications listed below — so `piston` threw
+on the workload's first line. The workload catches everything, deliberately,
+so that a build never fails over an optimisation; the result was a bundle that
+precompiled a fraction of what it was written to precompile, with nothing
+logged anywhere. Measured through the worker on the ATH `250917asro68q`
+quarter export: 228 runtime compilations on a first solve rather than 95, with
+344 being the no-bundle baseline. `normal` is what a real request from
+`hornlab_beat_bem.sweep` carries, and it is as inert upstream as `piston` was.
+
+`tests/test_engine_bundles.py` now validates every bundle's workload request
+against this package's own `SolveConfig`, so the next such divergence fails a
+test rather than costing two thirds of the win in silence.
+
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind:
@@ -76,7 +112,10 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 |---|---|
 | `hornlab_beat_bem/julia/src/*.jl` (41 files) | `src/blab/solvers/julia_local/src/` |
 | `hornlab_beat_bem/julia/coupled_solver.jl` | `src/blab/solvers/julia_local/coupled_solver.jl` |
+| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | `src/blab/solvers/julia_local/` |
+| `hornlab_beat_bem/julia_engine/BeatEngine{Cpu,Cuda,Rocm,Metal}Bundle/` | `src/blab/solvers/julia_engine/` |
 | `hornlab_beat_bem/julia/{Project,Manifest}.toml` | `src/blab/solvers/julia_local/` |
+| `hornlab_beat_bem/julia_rocm/{Project,Manifest}.toml` | `src/blab/solvers/julia_rocm/` |
 | `hornlab_beat_bem/julia_metal/{Project,Manifest}.toml` | `src/blab/solvers/julia_metal/` |
 | `hornlab_beat_bem/julia/test_meshes/*.msh` | `src/blab/solvers/julia_local/test_meshes/` |
 | `hornlab_beat_bem/julia/test_fixtures/*.msh` | `tests/fixtures/{femvolume,exterior_conforming}.msh` |
@@ -87,18 +126,32 @@ Every numerical result this package produces comes from those files, and they
 are unmodified. That is deliberate: it is what lets the extraction be verified
 by identity rather than by tolerance.
 
-The `julia_cuda/` and `julia_rocm/` project files are unchanged from the
-2026-08-19 vendoring, which is also verbatim.
+The `julia_cuda/` project files carry one local addition, described below.
 
 ## What is modified, and why
 
-### `hornlab_beat_bem/julia/solver.jl`
+### `hornlab_beat_bem/julia/solver.jl` and `BeatEngineDriver.jl`
 
-The one file that had already diverged. It is a three-way merge of upstream
-`42c8781` (base), this repository's `c207139` (ours) and upstream `e862240`
-(theirs — the last commit on the branch that touches this file; `6b27f22` and
-`f536d9e` do not). Everything merged cleanly except one hunk, and three deliberate
-decisions were made:
+The cold-start sync split this file. `solver.jl` is now the worker entry point
+and nothing else — bundle resolution and dispatch, under 80 lines — and is a
+**verbatim** copy of upstream. The body moved to `BeatEngineDriver.jl`, which
+is where this package's three local decisions now live.
+
+`BeatEngineDriver.jl` was produced by a three-way merge, not by re-applying
+patches: base `e862240:solver.jl`, ours `7b6e6eb:solver.jl`, theirs
+`cd50b3c:BeatEngineDriver.jl`. It merged with no conflicts, and the result
+differs from this package's previous `solver.jl` by exactly upstream's split
+(the docstring, dropping the engine `include` and the load-time BLAS call, and
+wrapping the entry point in `main(args)`), so every local decision below is
+carried over unchanged rather than re-derived.
+
+Upstream moved the BLAS thread call into `main` on purpose: precompiled into a
+bundle, load time is the *build* machine's, and the thread count has to be the
+running machine's.
+
+The three decisions were made when this file first diverged, in a three-way
+merge of upstream `42c8781` (base), this repository's `c207139` (ours) and
+upstream `e862240` (theirs). They are unchanged:
 
 1. **One merge conflict, resolved toward upstream.** Upstream restructured the
    per-channel solve to take the fused path when it is available; this
@@ -117,9 +170,30 @@ decisions were made:
    `solve_request` therefore keeps this repository's shape: it calls
    `solve_request_impl` and always runs the accelerator cleanup.
 
-Features that existed only in this repository's `solver.jl` and are preserved
-by the merge: diagonal observation cuts, the theta-major spherical grid for
-balloon/DI mapping, and axial source motion.
+Features that exist only in this repository and are preserved by both merges:
+diagonal observation cuts, the theta-major spherical grid for balloon/DI
+mapping, and axial source motion.
+
+### `hornlab_beat_bem/julia_cuda/{Project,Manifest}.toml`
+
+The one place a bundle is wired up locally. Upstream updates `julia_local`,
+`julia_metal` and `julia_rocm` to depend on their bundles but leaves
+`julia_cuda` alone, because its CUDA image runs
+`Pkg.develop(path=".../BeatEngineCudaBundle")` in the Dockerfile instead. This
+package has no Dockerfile: `hornlab_beat_bem.provision` runs a plain
+`Pkg.instantiate()`, so a CUDA host would have installed no bundle and taken
+the slow path with nothing to say so.
+
+`BeatEngineCudaBundle` is therefore added to `julia_cuda`'s `[deps]` and to its
+manifest, as a path dependency exactly like the three upstream ones. Every
+package the bundle needs was already in that manifest, so no version moved;
+the recorded `project_hash` was recomputed with
+`Pkg.Types.workspace_resolve_hash`, and that function was checked first by
+confirming it reproduces upstream's own hashes for the other three projects.
+
+`tests/test_engine_bundles.py` asserts that every backend project declares its
+bundle and that the relative path resolves, so a future sync that adds the
+CUDA dep upstream will not leave two conflicting sources of truth unnoticed.
 
 ### Fixture and repository-root paths
 
@@ -189,10 +263,19 @@ is upstream's.
 The layout is a flat rename, so a future sync is mechanical:
 
 1. Copy `src/blab/solvers/julia_local/src/*.jl` over `hornlab_beat_bem/julia/src/`
-   and `coupled_solver.jl`, `Project.toml`, `Manifest.toml` alongside. These are
-   verbatim, so a plain copy is correct.
-2. Three-way merge `solver.jl` with `git merge-file`, using the previous sync
-   commit recorded above as the base.
-3. Re-apply the six path constants in the table above.
+   and `coupled_solver.jl`, `solver.jl`, `Project.toml`, `Manifest.toml`
+   alongside; `src/blab/solvers/julia_engine/` over `hornlab_beat_bem/julia_engine/`;
+   and the `{Project,Manifest}.toml` pairs for `julia_metal` and `julia_rocm`.
+   These are verbatim, so a plain copy is correct.
+2. Three-way merge `BeatEngineDriver.jl` with `git merge-file`, using the
+   previous sync commit recorded above as the base.
+3. Re-apply the six path constants in the table above, and the `julia_cuda`
+   bundle dependency.
 4. Update the sync commit in this file, and re-run the verification in
    `README.md`.
+5. **Check that the fast path is still taken**, because losing it is silent.
+   `pytest tests/test_engine_bundles.py` covers the wiring; `pytest -m slow`
+   counts runtime compilations against a live bundle. A re-vendor that copies
+   `julia/` but not `julia_engine/`, or that leaves a backend project without
+   its bundle dependency, produces correct answers at the old cold start and
+   reports nothing.

@@ -18,8 +18,24 @@ here through a re-sync. Verbatim copies are what let the extraction be verified
 by identity rather than by tolerance; the moment one is patched locally, that
 proof is gone and every future sync becomes a merge.
 
-`solver.jl` is the one file that carries local changes, and it is a three-way
-merge on every sync. `VENDORING.md` explains the three decisions in it.
+`BeatEngineDriver.jl` is the one file that carries local changes, and it is a
+three-way merge on every sync. `VENDORING.md` explains the three decisions in
+it. `solver.jl` used to be that file; since the cold-start sync it is a
+verbatim entry point and the body lives in the driver.
+
+## The failure mode to watch for
+
+The engine is precompiled into a package per backend under `julia_engine/`,
+and **losing that is silent**: `solver.jl` falls back to including the sources,
+so a worker with no bundle still solves and still gives the right answers, at
+three to five times the cold start, with nothing logged. A re-vendor that
+copies `julia/` and forgets `julia_engine/`, a backend project that does not
+declare its bundle, a wheel whose package data misses the new directory, or a
+precompile workload the driver rejects all look exactly like success.
+
+So do not verify this by running it and seeing output. Count runtime
+compilations (`julia --trace-compile=stderr`) or measure time to first result
+through the worker; `tests/test_engine_bundles.py` does both.
 
 ## A consumer pins this repository by SHA
 
@@ -47,6 +63,14 @@ julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_fused_
 julia -t auto --project=hornlab_beat_bem/julia  $J/scripts/validate_gmres_burton_miller.jl
 pytest
 pytest -m slow          # a real Julia solve; needs a Julia executable
+```
+
+`pytest -m slow` includes the bundle probe, which skips rather than fails when
+the CPU project has not been instantiated. Instantiate it first, or the check
+that matters most here does not run:
+
+```bash
+julia --project=hornlab_beat_bem/julia -e "using Pkg; Pkg.instantiate()"
 ```
 
 One check is deliberately conditional. The Julia suite and the Krylov gate
