@@ -233,10 +233,15 @@ cannot see. Correct answers, wasted time.
 **A caveat on how convergence is measured here.** These numbers come from the
 production drive. `scripts/validate_gmres_burton_miller.jl` excites with a
 random right-hand side over every DP0 dof, which is materially easier on this
-mesh family — under the gate A1 converges in 68–88 iterations to ~6e-7. The
-gate is a correctness gate for the Krylov implementation, not a convergence
-forecast for a real solve; do not read its iteration counts as production
-behaviour.
+mesh family — under the gate A1 converges in 68–88 iterations to ~6e-7, which
+says nothing about the solve above. It is a correctness gate for the Krylov
+implementation, not a convergence forecast, and its iteration counts should
+never be read as production behaviour.
+
+The general form is worth stating because this gate guards the most actively
+changed code in the package: **a gate that is easier than the path it guards
+will pass a change that breaks production.** If you tighten or extend it, check
+what right-hand side it drives before trusting what it says.
 
 ### Calibrate on a new machine
 
