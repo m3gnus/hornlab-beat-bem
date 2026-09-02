@@ -25,7 +25,8 @@ below**, and everything not listed is a byte-for-byte copy.
 | | commit | branch |
 |---|---|---|
 | Original vendoring (2026-08-19) | `42c87812f70b9ae3ab446bcc543b3789941d0509` (2026-08-17) | upstream `dev`, now also on `main` |
-| Current sync (2026-09-02) | `f536d9e6a89c348cb5e071349f788cfe0f078156` | `feat/beat-adaptive-solve` |
+| Sync at first publish (2026-09-02) | `f536d9e6a89c348cb5e071349f788cfe0f078156` | `feat/beat-adaptive-solve` |
+| Current sync (2026-09-02) | `3ebc90aa95743b56dd19cd85ececf190d2672776` | `feat/beat-adaptive-solve` |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`
@@ -39,15 +40,33 @@ three pieces of work:
 |---|---|---|
 | `feat/beat-metal-backend` | `6025ff1e8a4874ffa8e51ab00fd40bb8aef24e1b` | Apple Metal backend; operators in shared storage, so there is no device-to-host copy; the Burton-Miller right-hand side built without materialising an `N x 2N` operator |
 | `feat/beat-bm-fusion` | `bd01028f24389ce423a44483d5a54b08068dffa7` | the Burton-Miller combination fused into the pair kernel |
-| `feat/beat-adaptive-solve` | `f536d9e6a89c348cb5e071349f788cfe0f078156` | the adaptive dense solve: LU or diagonally preconditioned GMRES, chosen per solve |
+| `feat/beat-adaptive-solve` | `3ebc90aa95743b56dd19cd85ececf190d2672776` | the adaptive dense solve: LU or diagonally preconditioned GMRES, chosen per solve |
 
-The branch tip moved from `e862240` to `f536d9e` while this extraction was
+The branch tip has moved twice during this work, so the sync commit is not the
+one the extraction started from. First from `e862240` to `f536d9e` while it was
 being verified. The two added commits touch only `beat-engine-core.md` and
 `validate_gmres_burton_miller.jl` — no solver source — and both are taken:
 `6b27f22` extends the Krylov gate to symmetry off/x/xy and to the sliver-rim
 meshes, and `f536d9e` records a routing regression on A1r and retires the claim
 that this operator never stagnates. Nothing else in this package differs
 between the two commits.
+
+Then from `f536d9e` to `3ebc90a`, in four commits that touch five files —
+`BeatEngineCore.jl`, `BeatEngineDenseSolve.jl`, `calibrate_dense_solve.jl`,
+`validate_gmres_burton_miller.jl` and `tests/runtests.jl`, and **not**
+`solver.jl`, so this second sync needed no merge at all. All four are taken,
+and the first is a real defect fix rather than documentation:
+
+| commit | what it changes |
+|---|---|
+| `a533a15` | **bounds a misrouted GMRES** at one LU's worth of matvecs, and refits the calibration script to read its constants at the crossover, warm, with the matvec's linear term clamped at zero |
+| `5474cc5` | makes the "unreorthogonalised Float32 is worse" check a warning rather than an assertion, because whether it degrades is a property of the host's floating point |
+| `8aa2539` | **drives the Krylov gate with the physical tag-2 excitation** instead of a random right-hand side, which was materially easier than the path it guards |
+| `3ebc90a` | retires the never-stagnates claim from the solver header and refreshes two stale figures in it |
+
+The version first published here, `ba72fb0`, predates all four. Anyone reading
+that commit should know it ships the adaptive router **without** the misroute
+bound.
 
 ## What is copied verbatim
 
