@@ -4,16 +4,18 @@ using Base.Threads, LinearAlgebra, SparseArrays, StaticArrays
 
 const BEAT_ACCELERATOR_HINT = let
     configured = lowercase(strip(get(ENV, "BLAB_BEAT_ENGINE_GPU_BACKEND", "")))
-    if configured in ("cuda", "rocm")
+    if configured in ("cuda", "rocm", "metal")
         configured
     else
         active_project = Base.active_project()
         project_directory = active_project === nothing ? "" : lowercase(basename(dirname(active_project)))
-        project_directory == "julia_cuda" ? "cuda" : project_directory == "julia_rocm" ? "rocm" : ""
+        project_directory == "julia_cuda" ? "cuda" :
+            project_directory == "julia_rocm" ? "rocm" :
+            project_directory == "julia_metal" ? "metal" : ""
     end
 end
 
-const CUDA_MODULE = if BEAT_ACCELERATOR_HINT == "rocm"
+const CUDA_MODULE = if BEAT_ACCELERATOR_HINT in ("rocm", "metal")
     nothing
 else
     try
@@ -24,12 +26,23 @@ else
     end
 end
 
-const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT == "cuda"
+const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "metal")
     nothing
 else
     try
         @eval import AMDGPU
         AMDGPU
+    catch
+        nothing
+    end
+end
+
+const METAL_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "rocm")
+    nothing
+else
+    try
+        @eval import Metal
+        Metal
     catch
         nothing
     end
@@ -44,8 +57,19 @@ export BoundaryMesh,
     assemble_l2_identity_matrix,
     build_cuda_regular_assembly_cache,
     build_cuda_field_evaluation_cache,
+    release_cuda_field_evaluation_cache!,
+    build_cuda_observation_points,
+    release_cuda_observation_points!,
+    build_cuda_weighted_field_sources,
+    release_cuda_weighted_field_sources!,
+    evaluate_galerkin_spl_cuda,
     build_cuda_image_singular_correction_cache,
+    build_cuda_near_correction_cache,
     build_cuda_burton_miller_identity_cache,
+    assemble_burton_miller_neumann_system_cuda,
+    assemble_burton_miller_rhs_cuda,
+    solve_burton_miller_system_cuda!,
+    release_burton_miller_system_cuda!,
     build_rocm_burton_miller_identity_cache,
     build_rocm_sparse_scatter_cache,
     build_cuda_sparse_scatter_cache,
@@ -67,6 +91,7 @@ export BoundaryMesh,
     build_field_evaluation_cache,
     build_beat_cpu_assembly_cache,
     build_singular_correction_cache,
+    build_near_correction_cache,
     assemble_regular_galerkin_operators_cpu,
     assemble_regular_galerkin_operators_cuda_regular,
     assemble_regular_galerkin_operators_rocm_regular,
@@ -79,6 +104,32 @@ export BoundaryMesh,
     evaluate_galerkin_field_cpu,
     evaluate_galerkin_field_cuda,
     evaluate_galerkin_field_rocm,
+    build_metal_regular_assembly_cache,
+    release_metal_regular_assembly_cache!,
+    build_metal_singular_correction_cache,
+    release_metal_singular_correction_cache!,
+    build_metal_field_evaluation_cache,
+    release_metal_field_evaluation_cache!,
+    build_metal_burton_miller_identity_cache,
+    release_metal_burton_miller_identity_cache!,
+    build_metal_sparse_scatter_cache,
+    release_metal_sparse_scatter_cache!,
+    scatter_metal_sparse_to_dense!,
+    metal_dense_lu!,
+    solve_metal_dense_factorization,
+    metal_host_operators,
+    assemble_burton_miller_neumann_system_cpu,
+    solve_burton_miller_neumann_system_cpu,
+    solve_burton_miller_neumann_system_cpu_with_report,
+    build_metal_fused_identity_cache,
+    release_metal_fused_identity_cache!,
+    assemble_burton_miller_neumann_system_metal,
+    metal_host_burton_miller_system,
+    solve_metal_burton_miller_system,
+    solve_metal_burton_miller_system_with_report,
+    release_metal_burton_miller_system!,
+    assemble_regular_galerkin_operators_metal_regular,
+    evaluate_galerkin_field_metal,
     fibonacci_sphere,
     helmholtz_adjoint_double_layer_kernel,
     helmholtz_double_layer_kernel,
@@ -89,16 +140,32 @@ export BoundaryMesh,
     surface_curls,
     scatter_element_block!,
     burton_miller_neumann_matrices,
+    burton_miller_neumann_lhs,
+    burton_miller_neumann_rhs,
     build_burton_miller_neumann_cpu_system,
     beat_cpu_blas_thread_count,
     configure_beat_cpu_blas_threads!,
     solve_burton_miller_neumann_cpu_system,
     solve_burton_miller_neumann_cpu,
     solve_burton_miller_neumann,
+    beat_dense_solve_method,
+    beat_dense_solve_plan,
+    beat_dense_solve_crossover_dofs,
+    beat_dense_lu_seconds,
+    beat_dense_triangular_seconds,
+    beat_dense_matvec_seconds,
+    beat_gmres_seconds,
+    beat_diagonal_preconditioner,
+    beat_gmres!,
+    beat_gmres_krylov_type,
+    beat_gmres_reorthogonalization,
+    beat_solve_dense_system,
+    describe_dense_solve,
     reflect_curl,
     reflect_normal,
     reflect_point,
     reflect_vertices,
+    rigid_ground_transform,
     p1_symmetry_orbit_weights,
     snap_symmetry_planes,
     snap_symmetry_plane_vertices,
@@ -107,6 +174,7 @@ export BoundaryMesh,
     symmetry_reduction_factor,
     symmetry_transforms,
     triangle_rule,
+    tensor_triangle_rule,
     validate_symmetry_fundamental_domain!
 
 function cuda_module()
@@ -117,6 +185,11 @@ end
 function amdgpu_module()
     AMDGPU_MODULE === nothing && error("ROCm solve requested, but AMDGPU.jl could not be loaded.")
     return AMDGPU_MODULE
+end
+
+function metal_module()
+    METAL_MODULE === nothing && error("Metal solve requested, but Metal.jl could not be loaded.")
+    return METAL_MODULE
 end
 
 struct BoundaryMesh{T<:AbstractFloat}
@@ -150,6 +223,12 @@ struct CudaBurtonMillerIdentityCache{A,B}
 end
 
 struct RocmBurtonMillerIdentityCache{A,B}
+    identity_p1_p1::A
+    identity_p1_dp0::B
+end
+
+# Metal keeps the dense solve on the CPU, so this cache holds host matrices.
+struct MetalBurtonMillerIdentityCache{A,B}
     identity_p1_p1::A
     identity_p1_dp0::B
 end
@@ -255,6 +334,16 @@ function BoundaryMesh(vertices::Vector{SVector{3,T}}, faces::Vector{NTuple{3,Int
     return BoundaryMesh{T}(vertices, faces, physical_tags, centroids, normals, areas, face_vertices)
 end
 
+struct NearCorrectionCache{T<:AbstractFloat}
+    pairs_by_test::Vector{Vector{SingularCorrectionPair{T}}}
+    pairs::Vector{SingularCorrectionPair{T}}
+    correction_rules::Vector{TriangleRule{T}}
+    correction_orders::Vector{Int}
+    trial_transform::SymmetryTransform
+    correction_order::Int
+    pair_count::Int
+end
+
 """
 Combine disconnected boundary-mesh resources into one solver mesh.
 
@@ -316,8 +405,18 @@ build_dp0_space(mesh::BoundaryMesh) = DP0Space(collect(eachindex(mesh.faces)), l
 
 function normalized_symmetry_mode(mode)
     mode_symbol = mode isa Symbol ? mode : Symbol(lowercase(strip(String(mode))))
-    mode_symbol in (:off, :x, :xy) || error("Unsupported symmetry mode: $(mode). Expected off, x, or xy.")
+    mode_symbol in (:off, :x, :xy, :ground) || error(
+        "Unsupported image mode: $(mode). Expected off, x, xy, or ground.",
+    )
     return mode_symbol
+end
+
+rigid_ground_transform() = SymmetryTransform(:rigid_ground, SVector{3,Int}(1, -1, 1), -1)
+
+function symmetry_active_axes(mode_symbol::Symbol)
+    mode_symbol == :x && return (1,)
+    mode_symbol == :xy && return (1, 2)
+    return ()
 end
 
 function symmetry_transforms(mode; include_identity::Bool=true)
@@ -330,6 +429,8 @@ function symmetry_transforms(mode; include_identity::Bool=true)
         push!(transforms, SymmetryTransform(:x, SVector{3,Int}(-1, 1, 1), -1))
         push!(transforms, SymmetryTransform(:y, SVector{3,Int}(1, -1, 1), -1))
         push!(transforms, SymmetryTransform(:xy, SVector{3,Int}(-1, -1, 1), 1))
+    elseif mode_symbol == :ground
+        push!(transforms, rigid_ground_transform())
     end
     return tuple(transforms...)
 end
@@ -379,7 +480,7 @@ function snap_symmetry_plane_vertices(
     tolerance::T=symmetry_plane_tolerance(vertices),
 ) where {T<:AbstractFloat}
     mode_symbol = normalized_symmetry_mode(mode)
-    active_axes = mode_symbol == :off ? () : mode_symbol == :x ? (1,) : (1, 2)
+    active_axes = symmetry_active_axes(mode_symbol)
     return [
         SVector{3,T}(ntuple(
             axis -> axis in active_axes && abs(vertex[axis]) <= tolerance ? zero(T) : vertex[axis],
@@ -405,7 +506,7 @@ function validate_symmetry_fundamental_domain!(
     tolerance::T=symmetry_plane_tolerance(mesh.vertices),
 ) where {T<:AbstractFloat}
     mode_symbol = normalized_symmetry_mode(mode)
-    active_axes = mode_symbol == :off ? () : mode_symbol == :x ? (1,) : (1, 2)
+    active_axes = symmetry_active_axes(mode_symbol)
     for axis in active_axes
         for (vertex_index, vertex) in enumerate(mesh.vertices)
             if vertex[axis] < -tolerance
@@ -427,7 +528,7 @@ function p1_symmetry_orbit_weights(
 ) where {T<:AbstractFloat}
     mode_symbol = normalized_symmetry_mode(mode)
     weights = ones(T, length(mesh.vertices))
-    active_axes = mode_symbol == :off ? () : mode_symbol == :x ? (1,) : (1, 2)
+    active_axes = symmetry_active_axes(mode_symbol)
     for (vertex_index, vertex) in enumerate(mesh.vertices)
         weight = T(1)
         for axis in active_axes
@@ -548,6 +649,25 @@ function triangle_rule(::Type{T}, order::Int=2) where {T<:AbstractFloat}
     )
 end
 
+"""Conical tensor-product Gauss rule for demanding regular triangle integrals."""
+function tensor_triangle_rule(::Type{T}, order::Int) where {T<:AbstractFloat}
+    order > 0 || error("Tensor triangle quadrature order must be positive.")
+    nodes, weights = gauss_rule_1d(T, order)
+    points = SVector{2,T}[]
+    triangle_weights = T[]
+    sizehint!(points, order * order)
+    sizehint!(triangle_weights, order * order)
+    for i in eachindex(nodes)
+        u = nodes[i]
+        jacobian = one(T) - u
+        for j in eachindex(nodes)
+            push!(points, SVector{2,T}(u, jacobian * nodes[j]))
+            push!(triangle_weights, weights[i] * weights[j] * jacobian)
+        end
+    end
+    return TriangleRule(points, triangle_weights)
+end
+
 function gauss_rule_1d(::Type{T}, order::Int) where {T<:AbstractFloat}
     if order == 1
         return [T(0.5)], [T(1.0)]
@@ -565,7 +685,16 @@ function gauss_rule_1d(::Type{T}, order::Int) where {T<:AbstractFloat}
         return [T(0.5) - x2, T(0.5) - x1, T(0.5) + x1, T(0.5) + x2], [w2, w1, w1, w2]
     end
 
-    error("Duffy 1D Gauss order must be between 1 and 4 in this implementation.")
+    if order > 4
+        diagonal = zeros(Float64, order)
+        off_diagonal = [index / sqrt(4.0 * index * index - 1.0) for index in 1:(order - 1)]
+        decomposition = eigen(SymTridiagonal(diagonal, off_diagonal))
+        nodes = T.((decomposition.values .+ 1.0) ./ 2.0)
+        weights = T.(decomposition.vectors[1, :] .^ 2)
+        return collect(nodes), collect(weights)
+    end
+
+    error("Gauss order must be positive.")
 end
 
 function duffy_rule(::Type{T}, order::Int, adjacency::Symbol) where {T<:AbstractFloat}
@@ -914,6 +1043,67 @@ function build_singular_correction_cache(
     )
 end
 
+function build_near_correction_cache(
+    mesh::BoundaryMesh{T},
+    face_pairs,
+    correction_order::Int;
+    trial_transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1),
+) where {T<:AbstractFloat}
+    correction_order > 0 || error("Near-pair correction order must be positive.")
+    pairs_by_test = [SingularCorrectionPair{T}[] for _ in eachindex(mesh.faces)]
+    pairs = SingularCorrectionPair{T}[]
+    correction_orders = sort(unique(Int[
+        length(pair) >= 3 ? Int(pair[3]) : correction_order
+        for pair in face_pairs
+    ]))
+    all(order -> order > 0, correction_orders) || error("Near-pair correction orders must be positive.")
+    rule_index_by_order = Dict(order => index for (index, order) in enumerate(correction_orders))
+    identity_transform = trial_transform.signs == SVector{3,Int}(1, 1, 1)
+    seen = Set{Tuple{Int,Int}}()
+    for raw_pair in face_pairs
+        length(raw_pair) in (2, 3) || error(
+            "Every near-pair entry must contain test and trial face indices, with an optional quadrature order.",
+        )
+        test_index = Int(raw_pair[1])
+        trial_index = Int(raw_pair[2])
+        pair_order = length(raw_pair) >= 3 ? Int(raw_pair[3]) : correction_order
+        checkbounds(Bool, mesh.faces, test_index) || error("Near-pair test face index $(test_index) is outside the mesh.")
+        checkbounds(Bool, mesh.faces, trial_index) || error("Near-pair trial face index $(trial_index) is outside the mesh.")
+        candidate = (test_index, trial_index)
+        candidate in seen && continue
+        push!(seen, candidate)
+        if identity_transform && elements_are_adjacent(mesh.faces[test_index], mesh.faces[trial_index])
+            continue
+        elseif !identity_transform
+            transformed_trial = reflect_vertices(trial_transform, mesh.face_vertices[trial_index])
+            geometric_adjacency_info(
+                mesh.face_vertices[test_index],
+                transformed_trial;
+                tolerance=T(1e-8),
+            ).kind == :regular || continue
+        end
+        trial_normal = reflect_normal(trial_transform, mesh.normals[trial_index])
+        pair = SingularCorrectionPair(
+            test_index,
+            trial_index,
+            rule_index_by_order[pair_order],
+            (T(2) * mesh.areas[test_index]) * (T(2) * mesh.areas[trial_index]),
+            dot(mesh.normals[test_index], trial_normal),
+        )
+        push!(pairs_by_test[test_index], pair)
+        push!(pairs, pair)
+    end
+    return NearCorrectionCache(
+        pairs_by_test,
+        pairs,
+        [tensor_triangle_rule(T, order) for order in correction_orders],
+        correction_orders,
+        trial_transform,
+        isempty(correction_orders) ? correction_order : maximum(correction_orders),
+        length(pairs),
+    )
+end
+
 function image_singular_candidates(mesh::BoundaryMesh{T}, element_indices, transform::SymmetryTransform; tolerance::T=T(1e-8)) where {T<:AbstractFloat}
     indices = collect(element_indices)
     index_set = Set(indices)
@@ -997,7 +1187,12 @@ function assemble_regular_galerkin_operators(
     cpu_cache=nothing,
     device_singular_cache=nothing,
     device_image_singular_cache=nothing,
+    near_correction_cache=nothing,
+    device_near_correction_cache=nothing,
+    image_near_correction_cache=nothing,
+    device_image_near_correction_cache=nothing,
     rocm_assembly_mode=nothing,
+    metal_assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
     if backend == :cpu
@@ -1014,6 +1209,8 @@ function assemble_regular_galerkin_operators(
             timing=timing,
             singular_cache=singular_cache,
             cpu_cache=cpu_cache,
+            near_correction_cache=near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=symmetry_mode,
         )
     end
@@ -1036,6 +1233,10 @@ function assemble_regular_galerkin_operators(
             singular_cache=singular_cache,
             cuda_singular_cache=device_singular_cache,
             cuda_image_singular_cache=device_image_singular_cache,
+            near_correction_cache=near_correction_cache,
+            cuda_near_correction_cache=device_near_correction_cache,
+            image_near_correction_cache=image_near_correction_cache,
+            cuda_image_near_correction_cache=device_image_near_correction_cache,
             symmetry_mode=symmetry_mode,
         )
     end
@@ -1062,7 +1263,29 @@ function assemble_regular_galerkin_operators(
         )
     end
 
-    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, or :rocm.")
+    if backend == :metal
+        accelerator_quadrature || error("Metal regular assembly requires accelerator_quadrature=true.")
+        return assemble_regular_galerkin_operators_metal_regular(
+            mesh,
+            p1_space,
+            dp0_space,
+            k,
+            rule;
+            skip_singular=skip_singular,
+            singular_order=singular_order,
+            element_indices=element_indices,
+            cache=device_cache,
+            return_device=return_device,
+            accelerator_quadrature=true,
+            timing=timing,
+            singular_cache=singular_cache,
+            metal_singular_cache=device_singular_cache,
+            assembly_mode=metal_assembly_mode,
+            symmetry_mode=symmetry_mode,
+        )
+    end
+
+    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, :rocm, or :metal.")
 end
 
 function build_cuda_regular_assembly_cache(args...; kwargs...)
@@ -1077,8 +1300,36 @@ function build_cuda_field_evaluation_cache(args...; kwargs...)
     error("CUDA field-evaluation cache requested, but CUDA.jl is not loaded.")
 end
 
+function build_cuda_observation_points(args...; kwargs...)
+    error("CUDA observation-point generation requested, but CUDA.jl is not loaded.")
+end
+
+function build_cuda_weighted_field_sources(args...; kwargs...)
+    error("CUDA weighted field sources requested, but CUDA.jl is not loaded.")
+end
+
+function evaluate_galerkin_spl_cuda(args...; kwargs...)
+    error("CUDA SPL field evaluation requested, but CUDA.jl is not loaded.")
+end
+
 function build_cuda_burton_miller_identity_cache(args...; kwargs...)
     error("CUDA Burton-Miller identity cache requested, but CUDA.jl is not loaded.")
+end
+
+function assemble_burton_miller_neumann_system_cuda(args...; kwargs...)
+    error("Direct Burton-Miller CUDA assembly requested, but CUDA.jl is not loaded.")
+end
+
+function assemble_burton_miller_rhs_cuda(args...; kwargs...)
+    error("Burton-Miller CUDA RHS assembly requested, but CUDA.jl is not loaded.")
+end
+
+function solve_burton_miller_system_cuda!(args...; kwargs...)
+    error("Direct Burton-Miller CUDA solve requested, but CUDA.jl is not loaded.")
+end
+
+function release_burton_miller_system_cuda!(args...; kwargs...)
+    error("Direct Burton-Miller CUDA release requested, but CUDA.jl is not loaded.")
 end
 
 function build_cuda_sparse_scatter_cache(args...; kwargs...)
@@ -1102,6 +1353,10 @@ end
 function evaluate_galerkin_field_cuda(args...; kwargs...)
     error("CUDA field evaluation requested, but CUDA.jl is not loaded.")
 end
+
+release_cuda_field_evaluation_cache!(cache) = nothing
+release_cuda_observation_points!(cache) = nothing
+release_cuda_weighted_field_sources!(cache) = nothing
 
 function build_rocm_regular_assembly_cache(args...; kwargs...)
     error("ROCm regular-pair assembly cache requested, but AMDGPU.jl is not loaded.")
@@ -1175,6 +1430,36 @@ function solve_rocm_dense_factorization(args...; kwargs...)
     error("ROCm dense solve requested, but AMDGPU.jl is not loaded.")
 end
 
+for name in (
+    :build_metal_regular_assembly_cache,
+    :release_metal_regular_assembly_cache!,
+    :build_metal_singular_correction_cache,
+    :release_metal_singular_correction_cache!,
+    :build_metal_field_evaluation_cache,
+    :release_metal_field_evaluation_cache!,
+    :build_metal_burton_miller_identity_cache,
+    :release_metal_burton_miller_identity_cache!,
+    :build_metal_sparse_scatter_cache,
+    :release_metal_sparse_scatter_cache!,
+    :scatter_metal_sparse_to_dense!,
+    :metal_dense_lu!,
+    :solve_metal_dense_factorization,
+    :metal_host_operators,
+    :build_metal_fused_identity_cache,
+    :release_metal_fused_identity_cache!,
+    :assemble_burton_miller_neumann_system_metal,
+    :metal_host_burton_miller_system,
+    :solve_metal_burton_miller_system,
+    :solve_metal_burton_miller_system_with_report,
+    :release_metal_burton_miller_system!,
+    :assemble_regular_galerkin_operators_metal_regular,
+    :evaluate_galerkin_field_metal,
+)
+    @eval function $(name)(args...; kwargs...)
+        error($(string(name)) * " requested, but Metal.jl is not loaded. Run with the julia_metal project on Apple Silicon.")
+    end
+end
+
 function _cuda_burton_miller_rhs(operators, identity_cache::CudaBurtonMillerIdentityCache, d_q_neumann, coupling::Complex{T}) where {T<:AbstractFloat}
     d_rhs = similar(d_q_neumann, size(operators.single_layer, 1))
     mul!(d_rhs, operators.single_layer, d_q_neumann, -one(Complex{T}), zero(Complex{T}))
@@ -1185,15 +1470,22 @@ end
 
 _cuda_use_matrix_free_burton_miller_rhs(operators) = size(operators.single_layer, 1) > 768
 
-function solve_burton_miller_neumann(operators, identity_cache::CudaBurtonMillerIdentityCache, q_neumann, k::T) where {T<:AbstractFloat}
+function solve_burton_miller_neumann(
+    operators,
+    identity_cache::CudaBurtonMillerIdentityCache,
+    q_neumann,
+    k::T;
+    return_gpu::Bool=false,
+) where {T<:AbstractFloat}
     get(operators, :on_gpu, false) || error("Cached CUDA solve requires GPU-resident operators.")
     cuda = cuda_module()
     cuda.functional() || error("CUDA solve requested, but CUDA.functional() is false.")
     coupling = Complex{T}(0, 1) / k
     d_q_neumann = d_lhs = d_rhs_operator = d_rhs = d_pressure = nothing
     pressure = nothing
+    neumann_on_gpu = q_neumann isa cuda.CuArray
     try
-        d_q_neumann = cuda.CuArray(q_neumann)
+        d_q_neumann = neumann_on_gpu ? q_neumann : cuda.CuArray(q_neumann)
         d_lhs = Complex{T}(0.5) .* identity_cache.identity_p1_p1 .- operators.double_layer .+ coupling .* operators.hypersingular
         if _cuda_use_matrix_free_burton_miller_rhs(operators)
             d_rhs = _cuda_burton_miller_rhs(operators, identity_cache, d_q_neumann, coupling)
@@ -1204,9 +1496,15 @@ function solve_burton_miller_neumann(operators, identity_cache::CudaBurtonMiller
             d_rhs = d_rhs_operator * d_q_neumann
         end
         d_pressure = d_lhs \ d_rhs
-        pressure = Complex{T}.(Array(d_pressure))
+        pressure = return_gpu ? d_pressure : Complex{T}.(Array(d_pressure))
     finally
-        for item in (d_q_neumann, d_lhs, d_rhs_operator, d_rhs, d_pressure)
+        for item in (
+            neumann_on_gpu ? nothing : d_q_neumann,
+            d_lhs,
+            d_rhs_operator,
+            d_rhs,
+            return_gpu ? nothing : d_pressure,
+        )
             item === nothing && continue
             cuda.unsafe_free!(item)
         end
@@ -1227,6 +1525,14 @@ function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0,
             return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k)
         finally
             release_rocm_burton_miller_identity_cache!(identity_cache)
+        end
+    end
+    if gpu_backend == :metal
+        identity_cache = build_metal_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
+        try
+            return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k)
+        finally
+            release_metal_burton_miller_identity_cache!(identity_cache)
         end
     end
 
@@ -1279,6 +1585,7 @@ function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{
     )
 end
 
+include(joinpath(@__DIR__, "BeatEngineDenseSolve.jl"))
 include(joinpath(@__DIR__, "BeatEngineCpu.jl"))
 
 if CUDA_MODULE !== nothing
@@ -1287,6 +1594,10 @@ end
 
 if AMDGPU_MODULE !== nothing
     include(joinpath(@__DIR__, "BeatEngineRocm.jl"))
+end
+
+if METAL_MODULE !== nothing
+    include(joinpath(@__DIR__, "BeatEngineMetal.jl"))
 end
 
 end

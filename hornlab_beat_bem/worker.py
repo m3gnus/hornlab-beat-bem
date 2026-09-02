@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from .config import BEAT_CUDA, BEAT_ROCM
+from .config import BEAT_CUDA, BEAT_METAL, BEAT_ROCM
 from .runtime import DEFAULT_SOLVER_SCRIPT, default_project
 
 StatusCallback = Callable[[str], None]
@@ -50,6 +50,8 @@ def _julia_process_env(julia_threads: str | int, julia_project: Path | None) -> 
             env["BLAB_BEAT_ENGINE_GPU_BACKEND"] = BEAT_CUDA
         elif name == "julia_rocm":
             env["BLAB_BEAT_ENGINE_GPU_BACKEND"] = BEAT_ROCM
+        elif name == "julia_metal":
+            env["BLAB_BEAT_ENGINE_GPU_BACKEND"] = BEAT_METAL
     return env
 
 
@@ -518,6 +520,8 @@ def friendly_julia_error(
         "using cuda",
         "package amdgpu",
         "using amdgpu",
+        "package metal",
+        "using metal",
     )
     if not any(marker in text for marker in markers):
         return message
@@ -526,6 +530,7 @@ def friendly_julia_error(
         "cpu": "BEAT Engine (CPU)",
         "cuda": "BEAT Engine (Nvidia CUDA)",
         "rocm": "BEAT Engine (AMD ROCm)",
+        "metal": "BEAT Engine (Apple Metal)",
     }.get(beat_backend or "", "the selected BEAT Engine backend")
     return (
         f"BEAT Engine could not load the Julia dependencies for {label}.\n\n"

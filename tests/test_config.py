@@ -80,3 +80,22 @@ def test_solve_config_rejects_multiple_sources():
 
 def test_source_tag_reflects_velocity_sources():
     assert SolveConfig(velocity_sources={7: 1.0}).source_tag == 7
+
+
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "rocm", "metal"])
+def test_solve_config_accepts_every_declared_backend(backend):
+    assert SolveConfig(beat_backend=backend).beat_backend == backend
+
+
+def test_solve_config_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="beat_backend"):
+        SolveConfig(beat_backend="opencl")
+
+
+def test_every_declared_backend_has_a_bundled_julia_project():
+    from hornlab_beat_bem import BEAT_BACKENDS
+    from hornlab_beat_bem.runtime import default_project
+
+    for backend in BEAT_BACKENDS:
+        project = default_project(backend)
+        assert (project / "Project.toml").exists(), backend

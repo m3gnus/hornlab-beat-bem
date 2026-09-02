@@ -1,88 +1,102 @@
 # hornlab-beat-bem
 
-BEAT Engine BEM solver backend for HornLab / WG. Wraps the Burton–Miller
-Helmholtz solver from [boundary-lab](https://github.com/m3gnus/boundary-lab)
-(GPL-3.0) — vendored under `hornlab_beat_bem/julia/` — behind the same
-native-result surface as `hornlab-bempp-bem`, so WG's result mapping consumes
-it unmodified.
+The **BEAT Engine** Helmholtz solver, packaged so a program can depend on it
+without vendoring an application. Exterior Burton-Miller BEM and coupled
+FEM-BEM-LEM, in Julia, on CPU, NVIDIA CUDA, AMD ROCm and Apple Metal, behind a
+small Python API.
 
-**Backends.** `cuda` (NVIDIA) and `rocm` (AMD) are the product; `cpu` is
-internal scaffolding used to validate the plumbing and as the CI/regression
-path on GPU-less hosts. `beat_engine_status()` reports *available* only when a
-functional GPU path exists, or when `HORNLAB_BEAT_FORCE_CPU=1` forces the CPU
-path for testing.
+The solver is not original to this repository. It is Boundary Lab's BEAT
+Engine, GPL-3, and this package is a derivative work of it — see
+[Licence and provenance](#licence-and-provenance) and [`VENDORING.md`](VENDORING.md),
+which records the exact upstream commit and every difference from it.
 
-## Requirements
+## What is in here
 
-- Python ≥ 3.10, numpy.
-- Julia ≥ 1.10 on `PATH`, or `HORNLAB_BEAT_JULIA=<path to julia executable>`,
-  or the provisioned runtime below.
-- The Julia environment instantiated once per backend:
+| | |
+|---|---|
+| `hornlab_beat_bem/julia/` | the solver: `src/*.jl` (41 files), the exterior entry point `solver.jl`, the coupled entry point `coupled_solver.jl` |
+| `hornlab_beat_bem/julia/scripts/` | validation gates and the cost-model calibration |
+| `hornlab_beat_bem/julia/tests/` | the Julia test suite (`runtests.jl`) |
+| `hornlab_beat_bem/julia{,_cuda,_rocm,_metal}/` | one Julia project per backend |
+| `hornlab_beat_bem/*.py` | the Python wrapper: config, sweep, worker, capability probe, runtime provisioning |
+| `docs/` | Boundary Lab's BEAT Engine and coupled-solver documentation |
+
+**Formulation.** Galerkin Burton-Miller with P1 pressure and DP0 Neumann
+traces, `eta = i/k` coupling, Float32 throughout. Exterior solves take a fused
+path that forms `0.5 I - D + (i/k) H` and the right-hand side inside the
+assembly kernels; the coupled FEM-BEM-LEM solver needs `S`, `K'`, `D` and `H`
+individually and keeps the four-operator path.
+
+## Backends
+
+| backend | project | assembly | dense solve |
+|---|---|---|---|
+| `cpu` | `julia/` | host, multithreaded | OpenBLAS ILP64, adaptive LU/GMRES |
+| `metal` | `julia_metal/` | Metal.jl, `pair_gather` kernels | host, adaptive LU/GMRES |
+| `cuda` | `julia_cuda/` | CUDA.jl | on device |
+| `rocm` | `julia_rocm/` | AMDGPU.jl | on device |
+
+`beat_engine_status()` reports *available* only when a functional accelerator
+exists — a CUDA device, a ROCm runtime, or Apple Silicon with a working
+Metal.jl. The CPU backend is the reference and CI path and is reported
+available only under `HORNLAB_BEAT_FORCE_CPU=1`; that gate is about which
+backend a *consumer application* should offer, not about whether the CPU path
+works. Call it directly with `beat_backend="cpu"` and it runs.
+
+**Reproducibility.** The regular `pair_gather` kernel is bit-reproducible —
+one owner per matrix entry, fixed summation order, no atomics — and measures
+exactly so: three assembly passes over identical inputs give byte-identical
+operators. The default `native` singular correction is **not**: its scatter is
+an atomic add, and adding it makes the same three passes differ by 7e-8 on the
+single layer and 3e-7 on the hypersingular operator, which reaches about 4e-7
+relative (3e-5 dB) in the radiated field. `BLAB_METAL_SINGULAR_MODE=host`
+restores byte-identical assembly, at the cost of doing the corrections on the
+CPU.
+
+A byte-exact golden file off the CPU backend therefore needs both that variable
+and a single BLAS thread — the multithreaded dense LU is not reproducible
+either.
+
+## Install
 
 ```bash
-julia --project=hornlab_beat_bem/julia -e "using Pkg; Pkg.instantiate()"
+pip install git+https://github.com/m3gnus/hornlab-beat-bem.git@<40-char sha>
 ```
 
-(`julia_cuda` / `julia_rocm` likewise, on hosts with that hardware.)
-
-## GPU-gated provisioning
+Then Julia >= 1.10 on `PATH`, or `HORNLAB_BEAT_JULIA=<path to julia>`, or the
+provisioned runtime below. Instantiate the project for the backend you want:
 
 ```bash
-python -m hornlab_beat_bem.provision --if-nvidia-gpu
+julia --project=hornlab_beat_bem/julia_metal -e "using Pkg; Pkg.instantiate()"
 ```
 
-is a strict no-op unless `nvidia-smi` reports an NVIDIA GPU. Only then does it
-resolve Julia (an existing install always wins; otherwise the official
-portable Julia 1.12.6 is downloaded — SHA-256 verified — into
-`%LOCALAPPDATA%/hornlab-beat/runtime`, override with
-`HORNLAB_BEAT_RUNTIME_DIR`), instantiate the bundled `julia_cuda` project, and
-force CUDA artifact resolution ending in a `CUDA.functional()` check, so a
-recorded *ready* state means the first solve computes instead of downloading.
-First run pulls several GB (CUDA.jl ships its own toolkit artifacts; users
-need only the NVIDIA driver). Progress and failures are recorded in
-`state.json` and surface as `beat_engine_status()` reasons; retry with
-`--force`. `discover_julia()` prefers explicit path > `HORNLAB_BEAT_JULIA` >
-provisioned runtime > `PATH`.
+`julia` (CPU), `julia_cuda` and `julia_rocm` likewise.
 
-wg2's `scripts/bootstrap.py` invokes this gate after every successful
-bootstrap (opt out with `WG2_SKIP_GPU_PROVISION=1`); on CPU-only machines it
-is silent and downloads nothing.
+### Provisioned runtime
 
-## Conventions (the part that bites)
+```bash
+python -m hornlab_beat_bem.provision --if-gpu
+```
 
-The vendored Julia solver:
+is a strict no-op unless a supported GPU is present. Only then does it resolve
+Julia (an existing install always wins; otherwise the official portable Julia
+1.12.6 is downloaded, SHA-256 verified, into a per-user runtime directory —
+override with `HORNLAB_BEAT_RUNTIME_DIR`), instantiate the matching project,
+and force artifact resolution ending in a `functional()` check, so a recorded
+*ready* state means the first solve computes instead of downloading. Windows,
+Linux x86-64 and macOS arm64 have portable downloads configured. Progress and
+failures are recorded in `state.json` and surface as `beat_engine_status()`
+reasons; retry with `--force`. CUDA's first run pulls several GB (CUDA.jl ships
+its own toolkit artifacts; users need only the driver); Metal pulls a small
+package, because the driver is the operating system's.
 
-- uses the `e^{-iωt}` time convention with outgoing waves `e^{+ikr}` — the
-  same as hornlab-metal-bem and hornlab-bempp-bem;
-- drives the source tag with `q = i·ρ·ω·v_n` on a **1 m/s normal-velocity
-  basis**;
-- observes polar cuts around the **global mesh origin** with the forward axis
-  fixed to **+z** (horizontal cut in x–z, vertical in y–z);
-- reports a legacy-scaled impedance pair `[Re(F)/2, −Im(F)/2]` with
-  `F = 10 · sym_factor · Σ(p̄·area) / v`.
-
-`solve_frequencies()` is the convention boundary: every returned array is
-rescaled to the shared HornLab **unit normal acceleration** convention
-(`p_accel = p_vel / (−iω)`), the impedance pair is unwound into the raw
-area-weighted mean source pressure, and an axis-aligned `ObservationFrame`
-override is applied as a rigid mesh translation so the observation origin
-matches the caller's frame. Tilted frames are refused, not approximated.
-
-Symmetry: WG plane `yz` → BEAT `x` (half domain, mesh in x ≥ 0), `yz+xz` →
-BEAT `xy` (quarter, x ≥ 0 ∧ y ≥ 0). WG's y-only `xz` half domain is not
-representable and is rejected by `reject_unsupported_native_symmetry`.
-
-Not supported (yet): diagonal observation cuts, spherical balloon/DI grids
-(the solver samples a Fibonacci lattice, not the theta-major grid WG needs),
-axial source motion, surface trace retention, multi-source drive.
-
-## Quick use
+## Use
 
 ```python
 import hornlab_beat_bem as beat
 
 config = beat.SolveConfig(
-    beat_backend="cpu",                # or "cuda" / "rocm"
+    beat_backend="metal",              # or "cpu" / "cuda" / "rocm"
     native_symmetry_plane="yz+xz",     # quarter mesh
     mesh_scale=0.001,                  # mesh in mm
     observation=beat.ObservationConfig(distance_m=2.0, angle_count=37),
@@ -91,30 +105,261 @@ result = beat.solve_frequencies("horn.msh", [500.0, 1000.0, 2000.0], config)
 beat.shutdown_workers()
 ```
 
-## Validation
+`solve_frequencies()` is the convention boundary. Every returned array is
+rescaled to the shared HornLab **unit normal acceleration** convention
+(`p_accel = p_vel / (-i omega)`), the impedance pair is unwound into the raw
+area-weighted mean source pressure, and an axis-aligned `ObservationFrame`
+override is applied as a rigid mesh translation so the observation origin
+matches the caller's frame. Tilted frames are refused, not approximated.
 
-Validated on the `benchmarks/abec-rerun` ASRO references against ABEC3 and
-against hornlab-bempp-bem on identical meshes, frequencies, and observation
-grids (see the WG workspace validation notes). Slow end-to-end tests:
-`pytest -m slow`.
+The Julia solver underneath:
 
-## WG integration
+- uses the `e^{-i omega t}` time convention with outgoing waves `e^{+ikr}` —
+  the same as hornlab-metal-bem and hornlab-bempp-bem;
+- drives the source tag with `q = i rho omega v_n` on a **1 m/s
+  normal-velocity basis**;
+- observes polar cuts around the **global mesh origin** with the forward axis
+  fixed to **+z** (horizontal cut in x-z, vertical in y-z);
+- reports a legacy-scaled impedance pair `[Re(F)/2, -Im(F)/2]` with
+  `F = 10 * sym_factor * sum(p_bar * area) / v`.
 
-`wg2/server/solver/beat.py` registers this package as the `beat` engine. To
-pin it, push this repo to `github.com/m3gnus/hornlab-beat-bem` and add to
-`wg2/pins.json`:
+Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
+`xy` (quarter, x >= 0 and y >= 0). A y-only `xz` half domain is not
+representable and is rejected by `reject_unsupported_native_symmetry`.
 
-```json
-"hornlab-beat-bem": {
-  "repo": "https://github.com/m3gnus/hornlab-beat-bem.git",
-  "sha": "<40-char commit sha>"
-}
+Not supported: surface trace retention, multi-source drive.
+
+## Measured performance
+
+M1 Max, Float32, the ATH reference ladder (real ATH `ABEC_FreeStanding`
+exports, welded and orientation-repaired), 500 / 2000 / 6000 Hz, one drive,
+exterior Neumann, no symmetry. **Every number below holds over that range and
+that implementation, and nothing here says anything about multiple drives,
+coupled solves, or Windows.**
+
+### Fusing Burton-Miller into the assembly kernel
+
+Forming the Burton-Miller combination inside the pair kernel, before the
+rank-1 expansion, rather than assembling four operators and combining them on
+the host:
+
+| mesh | N | four-operator | fused | assembly | operator memory |
+|---|---:|---:|---:|---:|---:|
+| A1 | 1,974 | 0.221 s | 0.104 s | 2.12x | 187 -> 31 MB |
+| A3 | 3,898 | 0.742 s | 0.304 s | 2.44x | 729 -> 122 MB |
+| A5 | 5,107 | 1.246 s | 0.502 s | 2.48x | 1252 -> 209 MB |
+| A2r | 10,230 | 4.674 s | 1.689 s | 2.77x | 5023 -> 837 MB |
+| A5r | 20,422 | 19.64 s | 7.25 s | 2.71x | 20018 -> 3337 MB |
+
+**2.12-2.77x on assembly and 6.00x less operator memory**, the memory factor
+exact on every mesh tried. Because operator memory is `O(N^2)`, 6x is
+`sqrt(6) ~ 2.45x` more dofs at the same peak.
+
+Two things that sound like they should explain this and do not, both measured:
+halving the stored bytes per pair is worth **1.00-1.02x**, and occupancy does
+not move (`maxTotalThreadsPerThreadgroup` is 384 either way). The win is
+collapsing the rank-1 expansion and halving the live accumulators. Anyone
+proposing "fuse the accumulators to save stores or FLOPs" should read
+`docs/beat-engine-metal.md` first.
+
+The CPU backend gets the same change and less of it: **1.34-1.38x**.
+
+For scale, assembly against hornlab-metal-bem (a one-operator standard
+formulation, so it does strictly less work) on the same meshes is within
++/-20% across 1,974-20,422 dofs, BEAT ahead in the middle of the range and
+metal-bem ahead at both ends.
+
+### Adaptive dense solve
+
+The fused path hands over one `N x N` matrix and an `N x drives` right-hand
+side, and the solver routes per solve by cost model:
+
+    choose GMRES when   drives * t_gmres(N)  <  T_fact(N) + drives * t_tri(N)
+
+Not a dof threshold. The LU amortises one factorization across every drive and
+GMRES has none to share, so the drive crossover moves with N; two independent
+thresholds would send a three-way design to the slower path at exactly the size
+where a dof test says GMRES wins. The refitted model puts the one-drive
+crossover near **3,000 dofs**, inside the 2,000-5,000 range measured
+independently, and predicts the drive crossover at 5,107 dofs as **2.4**, a
+number it was not fitted to. At 5,107 dofs and one drive GMRES is 2.4x faster
+than the LU.
+
+GMRES iterations at tolerance 1e-6 **on the true relative residual**, diagonal
+preconditioning. These are the figures the shipped iteration constant is fitted
+to, quoted from `BeatEngineDenseSolve.jl`'s own calibration docstring rather
+than re-measured here:
+
+| mesh | N | 500 Hz | 2 kHz | 6 kHz |
+|---|---:|---:|---:|---:|
+| A5 | 5,107 | 70 | 51 | 51 |
+| A2r | 10,230 | 119 | 85 | 63 |
+| A5r | 20,422 | — | 79 | — |
+
+Roughly flat in N, a factor of ~2 in frequency, worse at the bottom of the band
+because the uncapped `eta = i/k` coupling degrades conditioning as k goes to
+zero.
+
+Two implementation requirements, both load-bearing rather than stylistic:
+the Krylov space is carried in **Float64** over the Float32 operator, and the
+convergence test is on the **true** residual recomputed against the operator,
+not the preconditioned residual the Givens recursion tracks. An
+unreorthogonalised Float32 Arnoldi recurrence loses orthogonality on this
+operator and reports iteration counts several times too large, which reads
+exactly like bad conditioning; `scripts/validate_gmres_burton_miller.jl` exists
+to stop that recurring, and deliberately includes a variant that fails.
+
+GMRES falls back to the dense LU on non-convergence, reporting the fallback
+rather than raising, and **the fallback is load-bearing rather than a safety
+net**. Measured through the shipped path — the physical tag-2 velocity drive,
+Metal backend, one drive, `auto` routing:
+
+| mesh | N | routed to | iterations | true residual | outcome |
+|---|---:|---|---:|---:|---|
+| A1 | 1,974 | LU | — | — | the model prices the LU below GMRES, so GMRES never runs |
+| A1r | 7,890 | GMRES | 146–206 | 2.1e-6 – 6.5e-6 | **misses the 1e-6 tolerance, falls back to the LU** |
+
+A1r is the sliver-rim mesh — a 2.95 mm shell rim meshed with 6.9 mm elements —
+and hornlab-metal-bem's Krylov path fails on the same mesh family, so this is
+the geometry rather than either implementation. What BEAT has that metal-bem
+does not is the fallback, so the answer still comes back correct.
+
+**It is a routing defect, and it is not fixed.** The solve pays for the failed
+Krylov attempt *and* the factorization, roughly 1.8x the cost of forcing
+`BLAB_BEAT_DENSE_SOLVE=lu`. A cost model prices a *converging* GMRES, so a
+mesh where GMRES converges slowly and then stops is precisely the case it
+cannot see. Correct answers, wasted time.
+
+**A caveat on how convergence is measured here.** These numbers come from the
+production drive. `scripts/validate_gmres_burton_miller.jl` excites with a
+random right-hand side over every DP0 dof, which is materially easier on this
+mesh family — under the gate A1 converges in 68–88 iterations to ~6e-7. The
+gate is a correctness gate for the Krylov implementation, not a convergence
+forecast for a real solve; do not read its iteration counts as production
+behaviour.
+
+### Calibrate on a new machine
+
+The cost model carries four measured constants, and they ship calibrated for an
+M1 Max. What the model actually weighs is a machine's ratio of dense-GEMM
+throughput to memory bandwidth, so **any other machine should refit them**:
+
+```bash
+julia -t auto --project=hornlab_beat_bem/julia_metal \
+  hornlab_beat_bem/julia/scripts/calibrate_dense_solve.jl 2048 5107 10230 20422
 ```
 
-then run `python scripts/gen_requirements.py` and add `"hornlab-beat-bem"` to
-`REQUIRED_DISTRIBUTIONS` in `wg2/scripts/bootstrap.py`.
+It needs no mesh — the primitives are BLAS, not BEM — and prints `export` lines
+for `BLAB_BEAT_LU_GFLOPS`, `BLAB_BEAT_MATVEC_ENTRY_SECONDS`,
+`BLAB_BEAT_MATVEC_DOF_SECONDS` and `BLAB_BEAT_TRIANGULAR_GBPS`. Take at least
+three sizes: two points cannot tell a wrong exponent from a wrong constant.
 
-## License
+The fifth constant, `BLAB_BEAT_GMRES_MODEL_ITERATIONS`, is the operator's own,
+and it needs re-measuring whenever the formulation, the coupling parameter or
+the quadrature changes. Do not assume it travels between hosts either: it ships
+at 70 from this ladder, where the count falls with frequency, and it has been
+measured on other hardware both far outside that range and rising with
+frequency instead. If the router's choices look wrong on your machine, this is
+the constant to check first — and note that a mis-set iteration constant costs
+time rather than accuracy, because a GMRES that is routed to and then fails
+falls back to the LU.
 
-GPL-3.0-or-later (the vendored BEAT Engine solver is GPL-3.0 from
-boundary-lab; WG's AGPL-3.0 combines with it per GPLv3 §13).
+The CUDA and ROCm backends factor on the device and do not route through this
+model.
+
+## Validation
+
+### Against a second solver
+
+On the ATH ladder, against hornlab-metal-bem — a different formulation
+(standard operator with a complex-k shift, not Burton-Miller) and a different
+implementation — four of the five meshes agree to **<= 0.26 dB on-axis and
+<= 0.10 dB in main-lobe shape** at 500 / 2000 / 6000 Hz.
+
+The fifth, A1, disagreed by 0.84 dB, and it is worth knowing why rather than
+treating it as a tolerance. It is not quadrature: q6/s6 instead of q4/s4 moves
+it by 0.008 dB, and adaptive near-field quadrature on the other solver moves it
+not at all. It is discretisation, and it converges away — subdividing A1
+one-to-four, which keeps the element *shapes* and so keeps its slivers, takes
+the 500 Hz on-axis disagreement from 0.842 dB to **0.021 dB**. A1 at 1,974 dofs
+is under-resolved for its own geometry: the 6 el/lambda rule is satisfied, but
+a 2.95 mm shell rim is not resolved by 6.9 mm elements, and the two
+formulations express that error differently. Neither solver is wrong and the
+fix is the mesh.
+
+### Gates in this repository
+
+Every script runs against the bundled fixtures and prints its tolerances.
+
+| script | what it gates |
+|---|---|
+| `validate_metal_exterior.jl` | Metal operators, boundary pressure and radiated field against the CPU build |
+| `validate_metal_symmetry.jl` | the same across symmetry off / x / xy, where a sign slip in the image-singular correction would otherwise be silent |
+| `validate_metal_coupled.jl` | the coupled FEM-BEM-LEM paths, monolithic and condensed, against the pure CPU build |
+| `validate_metal_fused_burton_miller.jl` | the fused system against the four-operator system on the same mesh, frequency and quadrature — Float32 summation order is the only difference, so the tolerance is noise, not physics |
+| `validate_gmres_burton_miller.jl` | the adaptive solve on a real assembled operator across the band: LU agreement, true residual, three independent Krylov variants agreeing on the iteration count, independence from the restart length, and that plain Float32 single Gram-Schmidt is materially worse |
+| `validate_rocm_*.jl` | the ROCm equivalents |
+| `smoke_coupled_solver.jl` | the coupled suite as a standalone smoke test |
+
+```bash
+J=hornlab_beat_bem/julia
+julia --project=hornlab_beat_bem/julia          $J/tests/runtests.jl
+julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_exterior.jl
+julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_symmetry.jl
+julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_coupled.jl
+julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_fused_burton_miller.jl
+julia -t auto --project=hornlab_beat_bem/julia  $J/scripts/validate_gmres_burton_miller.jl
+pytest                 # Python surface
+pytest -m slow         # plus a real Julia solve
+```
+
+## Tuning knobs
+
+All are environment variables; the defaults are the shipped configuration.
+
+| variable | default | effect |
+|---|---|---|
+| `BLAB_BEAT_DENSE_SOLVE` | `auto` | `lu` or `gmres` forces the choice past the cost model |
+| `BLAB_BEAT_GMRES_TOL` | `1e-6` | tolerance on the true relative residual |
+| `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
+| `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
+| `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
+| `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |
+| `HORNLAB_BEAT_JULIA` | — | explicit Julia executable |
+| `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available |
+
+`docs/beat-engine-metal.md` and `docs/beat-engine-core.md` list the rest.
+Those pages are Boundary Lab's, kept verbatim; `VENDORING.md` notes the two
+places where this README's measurements supersede them.
+
+## Licence and provenance
+
+**GPL-3.0-or-later.** The solver is Boundary Lab's BEAT Engine
+(<https://github.com/JWSound/boundary-lab>), GPL-3, copyright the Boundary Lab
+authors; this package is a derivative work and stays GPL-3.
+[`VENDORING.md`](VENDORING.md) records the upstream commit this was taken from
+and every single difference from it — a short list, because the solver core is
+copied byte for byte.
+
+Combining this with an AGPL-3 program is explicitly permitted by GPLv3 §13,
+which applies AGPL's network clause to the combination. No relicensing is
+needed, and none is possible.
+
+## Consumers
+
+Waveguide Generator registers this package as its `beat` engine
+(`server/solver/beat.py`) and pins it by commit SHA. The Python API this
+sync preserves unchanged: `beat_engine_status`, `SolveConfig`,
+`ObservationConfig`, `ObservationFrame`, `reject_unsupported_native_symmetry`,
+`solve_frequencies`, `shutdown_workers`.
+
+Two things a consumer should know before bumping its pin:
+
+- **`beat_engine_status()` now reports *available* on Apple Silicon**, with
+  backend `metal`, where it previously reported no supported GPU. For an
+  application that lists engines by probing, that is a new engine appearing on
+  every Mac. It is additive and user-selectable, but it is a behaviour change
+  and belongs in a reviewed pin bump rather than arriving as a side effect.
+- **`SolveConfig(beat_backend=...)` accepts `"metal"`**, and the rejection
+  message for an unknown backend is now generated from `BEAT_BACKENDS` rather
+  than hardcoded.

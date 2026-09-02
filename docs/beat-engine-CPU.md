@@ -1,0 +1,164 @@
+# BEAT Engine CPU
+
+The BEAT Engine CPU backend is a hardware-agnostic Julia/OpenBLAS solver path. It uses the same BEAT Engine request protocol, mesh handling, Burton-Miller formulation, symmetry model, and result stream described in [BEAT Engine Core](beat-engine-core.md), but performs operator assembly, dense solve, and field evaluation on the host.
+
+The application exposes this path as `BEAT Engine (CPU)` / `beat_cpu`. Coupled
+production solves eliminate FEM interior unknowns with a sparse UMFPACK Schur
+complement before the reduced dense CPU solve. Exterior-only solves continue
+through the ordinary CPU BEM path. The legacy `beat_cpu_condensed` ID is accepted
+as an alias for `beat_cpu` but is no longer a separate selectable backend.
+Its coupled FEM-BEM execution path is described separately in [Coupled
+Solver](coupled-solver.md); the sections below focus on BEM operator and
+field work shared with exterior solves.
+
+## CPU Solve Path
+
+For each frequency, the CPU path:
+
+1. Selects the regular quadrature rule for that frequency.
+2. Assembles dense Galerkin operators on host matrices.
+3. Applies singular and image-singular Duffy corrections directly into those matrices.
+4. Builds the Burton-Miller dense system.
+5. Solves through Julia's dense BLAS/LAPACK path.
+6. Evaluates requested polar and spherical fields on the CPU.
+
+Steps 2 to 4 are the four-operator path. Exterior solves take a fused path
+instead (`BeatEngineCpuBurtonMiller.jl`): the coupling `eta = i/k` is known at
+assembly time, so `0.5 M - D + (i/k) H` and `(-S - (i/k)(K' + 0.5 M)) q` are
+formed per quadrature point pair and only the N x N system matrix and one
+right-hand side per drive are ever allocated, instead of 6N^2 complex entries.
+Assembly is 1.34-1.38x faster on the ATH reference meshes and the operator
+memory drops 6x. Every channel's Neumann column is folded in during the same
+pass, so one assembly still serves the whole channel set at a frequency.
+
+The four-operator path is unchanged and is what coupled FEM-BEM-LEM solves use;
+`BLAB_BEAT_FUSED_BM=0` selects it for exterior solves too. The
+`cpu fused Burton-Miller equals the four-operator path` testset in
+`tests/runtests.jl` gates the two against each other on the same mesh,
+frequency and quadrature over symmetry off, x and xy.
+
+The CPU implementation lives under `hornlab_beat_bem/julia/src/BeatEngineCpu*.jl`.
+
+## CPU Operator Assembly
+
+`BeatEngineCpuAssembly.jl` is the CPU Galerkin operator assembly entry point. It precomputes per-element geometry and per-element quadrature data, then loops over test/trial element pairs.
+
+Regular pair assembly skips adjacent/coincident pairs, which are handled afterward by singular corrections. When threaded assembly is enabled and Julia has more than one thread, element coloring is used to avoid write conflicts while scattering element-block contributions into shared dense matrices.
+
+Symmetry image contributions are assembled on the host by reflecting trial/source element geometry and quadrature data. Reflected image pairs that become singular across a symmetry plane use image-singular correction caches.
+
+## Dynamic Quadrature
+
+The CPU path defaults to wavelength-driven regular quadrature. This is a CPU-only production feature; CUDA currently remains fixed-order as the GPU solver does not meaningfully benefit from dynamic quadrature.
+
+The goal is to reduce low-frequency regular-pair assembly cost without changing singular-pair quadrature. Regular-pair assembly dominates dense BEM workload, and low frequencies do not need the same regular quadrature density as high frequencies on typical Boundary Lab loudspeaker meshes.
+
+The selector computes:
+
+$$
+k h = \frac{2\pi f}{c}\sqrt{A_{\mathrm{stat}}},
+$$
+
+where \(A_{\mathrm{stat}}\) is a mesh element-area statistic. The current default statistic is `p90`, so \(h = \sqrt{A_{p90}}\).
+
+Default CPU thresholds:
+
+- q1 disabled: `wavelength_kh_q1_max = 0.0`
+- q2 when `k*h <= 2.0`
+- q4 above `k*h > 2.0`
+- base order: `quadrature_order = 4`
+- mesh statistic: `wavelength_mesh_stat = "p90"`
+
+The selected order is cached per frequency order. The CPU path reuses per-order regular rules, identity/mass matrices, and field-evaluation caches. Singular quadrature remains controlled by `singular_order` and is not reduced by the wavelength selector.
+
+Result diagnostics include the selected mode, selected order, mesh statistic, element length, and `k*h` value:
+
+- `regular_quadrature_mode`
+- `regular_quadrature_order`
+- `regular_quadrature_base_order`
+- `regular_quadrature_wavelength_mesh_stat`
+- `regular_quadrature_wavelength_element_length_m`
+- `regular_quadrature_wavelength_kh`
+- `regular_quadrature_wavelength_kh_q1_max`
+- `regular_quadrature_wavelength_kh_q2_max`
+
+## Validation Notes
+
+The tuned defaults were validated against fixed q4 on `sample.msh` using output-level checks from `compare_cpu_quadrature.jl`.
+
+The strongest current candidate was:
+
+- q1 disabled
+- q2 while `k*h <= 2.0`
+- q4 above that
+- `p90` mesh-area statistic
+
+On `sample.msh`, this selected q2 through 4 kHz and q4 at 4.5 kHz and above. The full-mesh output comparison measured approximately:
+
+- median operator assembly speedup: `3.26x`
+- max pressure relative L2 error: `0.148%`
+- max field relative L2 error: `0.442%`
+- max SPL RMS delta: `0.116 dB`
+- max SPL p95 delta: `0.265 dB`
+- max SPL max delta: `0.356 dB`
+
+Raw operator relative error can exceed 1% even when solved pressure and field outputs remain well below the intended output-error target. Threshold tuning should therefore prioritize solved/output metrics over operator norms alone.
+
+## CPU Field Evaluation
+
+`BeatEngineCpuField.jl` evaluates the same field integral described in [BEAT Engine Core](beat-engine-core.md). It uses the CPU field-evaluation cache for the selected quadrature order and computes the potential at concatenated horizontal, vertical, and optional spherical observation points.
+
+Field evaluation is usually not the dominant CPU cost compared with dense operator assembly and dense solve.
+
+## CPU Dense Solve
+
+`BeatEngineCpuSolve.jl` forms the Burton-Miller system on host matrices and calls Julia's dense solve path. Runtime depends heavily on BLAS/LAPACK performance and P1 unknown count. Symmetry can reduce solve cost significantly because dense solve complexity scales roughly as \(O(N_p^3)\).
+
+The CPU backend selects the BLAS thread count from the P1 unknown count:
+
+- up to 768 P1 unknowns: 1 BLAS thread
+- 769 to 2,048: up to 4 BLAS threads
+- 2,049 to 4,096: up to 8 BLAS threads
+- above 4,096: all available Julia threads
+
+Set `BLAB_BEAT_CPU_BLAS_THREADS` to `auto` or a positive integer to override
+the policy. Explicit values are capped at the Julia thread count.
+
+## Adaptive Dense Solve
+
+Exterior solves on the fused path choose between the dense LU and a
+diagonally preconditioned GMRES per solve, in
+`hornlab_beat_bem/julia/src/BeatEngineDenseSolve.jl`. See
+[BEAT Engine Core](beat-engine-core.md#adaptive-dense-solve) for the cost
+model, the calibration constants and the environment overrides; the routing
+code is backend-independent and both the CPU and Metal fused paths call it.
+
+## CPU Benchmark And Comparison Scripts
+
+Useful scripts:
+
+- `hornlab_beat_bem/julia/scripts/benchmark_cpu.jl`: CPU timing benchmark, including fixed and wavelength regular quadrature modes.
+- `hornlab_beat_bem/julia/scripts/benchmark_cpu_blas.jl`: synthetic or real-system dense LU thread-scaling benchmark.
+- `hornlab_beat_bem/julia/scripts/compare_cpu_quadrature.jl`: fixed-reference versus candidate comparison artifact generator with operator, pressure, field, and SPL error metrics.
+
+Example comparison:
+
+```powershell
+& '<path to julia.exe>' `
+  hornlab_beat_bem\julia\scripts\compare_cpu_quadrature.jl `
+  --frequencies 20,50,100,200,500,1000,1500,2000,3000,4000,4500,5000 `
+  --subset-faces 0 `
+  --output-points 72 `
+  --wavelength-kh-q1-max 0 `
+  --wavelength-kh-q2-max 2.0 `
+  --json results\cpu_quadrature_compare_output_no_q1_q2_2p0_full.json
+```
+
+## Important Files
+
+- `hornlab_beat_bem/julia/src/BeatEngineCpu.jl`: include hub for the CPU implementation files.
+- `hornlab_beat_bem/julia/src/BeatEngineCpuAssembly.jl`: CPU Galerkin operator assembly entry point.
+- `hornlab_beat_bem/julia/src/BeatEngineCpuField.jl`: CPU field-evaluation path.
+- `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl`: fused CPU Burton-Miller assembly for exterior solves.
+- `hornlab_beat_bem/julia/src/BeatEngineCpuSolve.jl`: CPU Burton-Miller dense solve through Julia's LAPACK/BLAS path.
+- `hornlab_beat_bem/julia/solver.jl`: CPU backend dispatch, wavelength quadrature selection, per-order caches, and result diagnostics.

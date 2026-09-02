@@ -18,6 +18,7 @@ def runtime_dir(tmp_path, monkeypatch):
 
 def test_no_gpu_means_no_download_and_no_state(runtime_dir, monkeypatch):
     monkeypatch.setattr(runtime, "_nvidia_gpu_present", lambda: False)
+    monkeypatch.setattr(runtime, "_apple_gpu_present", lambda: False)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning attempted a download without a GPU")
@@ -66,6 +67,7 @@ def test_backend_gating_matches_hardware(runtime_dir, monkeypatch, tmp_path):
 
     monkeypatch.setattr(runtime, "_nvidia_gpu_present", lambda: False)
     monkeypatch.setattr(runtime, "_rocm_present", lambda: True)
+    monkeypatch.setattr(runtime, "_apple_gpu_present", lambda: False)
     fake_julia = tmp_path / "julia.exe"
     fake_julia.write_text("", encoding="utf-8")
     monkeypatch.setattr(runtime, "discover_julia", lambda explicit=None: str(fake_julia))
@@ -93,6 +95,7 @@ def test_backend_gating_matches_hardware(runtime_dir, monkeypatch, tmp_path):
 def test_cli_if_gpu_gate_exits_quietly_without_any_gpu(runtime_dir, monkeypatch, capsys):
     monkeypatch.setattr(runtime, "_nvidia_gpu_present", lambda: False)
     monkeypatch.setattr(runtime, "_rocm_present", lambda: False)
+    monkeypatch.setattr(runtime, "_apple_gpu_present", lambda: False)
     assert provision.main(["--if-gpu"]) == 0
     assert capsys.readouterr().out == ""
     assert not runtime_dir.exists()
@@ -165,3 +168,47 @@ def test_discover_julia_prefers_env_then_provisioned(monkeypatch, tmp_path):
     env_julia.write_text("", encoding="utf-8")
     monkeypatch.setenv(runtime.JULIA_ENV_VAR, str(env_julia))
     assert runtime.discover_julia() == str(env_julia)
+
+
+def test_metal_host_provisions_metal_and_skips_the_others(runtime_dir, monkeypatch, tmp_path):
+    """Apple Silicon is a GPU host like any other: it provisions julia_metal."""
+
+    monkeypatch.setattr(runtime, "_nvidia_gpu_present", lambda: False)
+    monkeypatch.setattr(runtime, "_rocm_present", lambda: False)
+    monkeypatch.setattr(runtime, "_apple_gpu_present", lambda: True)
+    fake_julia = tmp_path / "julia"
+    fake_julia.write_text("", encoding="utf-8")
+    monkeypatch.setattr(runtime, "discover_julia", lambda explicit=None: str(fake_julia))
+
+    assert provision.detect_gpu_backend() == "metal"
+    assert provision.provision_gpu(
+        runtime_dir, backend="cuda", status_cb=lambda _: None
+    )["status"] == "skipped"
+
+    probes: list[str] = []
+    monkeypatch.setattr(
+        provision,
+        "_run_julia_step",
+        lambda julia, code, **kwargs: probes.append(str(kwargs["project"])),
+    )
+    state = provision.provision_gpu(runtime_dir, backend="metal", status_cb=lambda _: None)
+    assert state["status"] == "ready"
+    assert state["backend"] == "metal"
+    assert all(path.endswith("julia_metal") for path in probes)
+
+
+def test_metal_instantiate_does_not_promise_a_multi_gigabyte_download(runtime_dir, monkeypatch, tmp_path):
+    """Metal.jl carries no vendor toolkit, so the CUDA wording would be a lie."""
+
+    monkeypatch.setattr(runtime, "_apple_gpu_present", lambda: True)
+    fake_julia = tmp_path / "julia"
+    fake_julia.write_text("", encoding="utf-8")
+    monkeypatch.setattr(runtime, "discover_julia", lambda explicit=None: str(fake_julia))
+    labels: list[str] = []
+    monkeypatch.setattr(
+        provision,
+        "_run_julia_step",
+        lambda julia, code, **kwargs: labels.append(str(kwargs["label"])),
+    )
+    provision.provision_gpu(runtime_dir, backend="metal", status_cb=lambda _: None)
+    assert labels and not any("several GB" in label for label in labels)

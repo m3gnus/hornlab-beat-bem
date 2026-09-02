@@ -16,7 +16,8 @@ if TYPE_CHECKING:
 BEAT_CPU = "cpu"
 BEAT_CUDA = "cuda"
 BEAT_ROCM = "rocm"
-BEAT_BACKENDS = (BEAT_CPU, BEAT_CUDA, BEAT_ROCM)
+BEAT_METAL = "metal"
+BEAT_BACKENDS = (BEAT_CPU, BEAT_CUDA, BEAT_ROCM, BEAT_METAL)
 
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
 
@@ -211,7 +212,7 @@ class SolveConfig:
     regular_quadrature_mode: Literal["fixed", "wavelength"] | None = None
 
     # Execution backend
-    beat_backend: Literal["cpu", "cuda", "rocm"] = "cpu"
+    beat_backend: Literal["cpu", "cuda", "rocm", "metal"] = "cpu"
     julia_executable: str | None = None
     julia_project: str | Path | None = None
     julia_threads: str | int = "auto"
@@ -242,7 +243,9 @@ class SolveConfig:
         if self.freq_min_hz > self.freq_max_hz:
             raise ValueError("freq_min_hz must not exceed freq_max_hz")
         if self.beat_backend not in BEAT_BACKENDS:
-            raise ValueError("beat_backend must be 'cpu', 'cuda', or 'rocm'")
+            raise ValueError(
+                "beat_backend must be one of " + ", ".join(repr(name) for name in BEAT_BACKENDS)
+            )
         if self.source_motion not in {"normal", "axial"}:
             raise ValueError("source_motion must be 'normal' or 'axial'")
         if not isinstance(self.velocity_sources, dict) or len(self.velocity_sources) != 1:

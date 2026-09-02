@@ -48,10 +48,11 @@ class SolveResult:
     timings: dict[str, float] = field(default_factory=dict)
     solver_log: list[dict] = field(default_factory=list)
 
-    # The BEAT solver samples its optional sphere on a Fibonacci lattice, which
-    # is not the theta-major grid HornLab's balloon/DI mapping requires, so
-    # spherical output is not exposed yet. Kept as fields so downstream
-    # getattr-probes see explicit None rather than AttributeError.
+    # Populated only when ``ObservationConfig.sphere_grid`` asks for the
+    # theta-major spherical grid that HornLab's balloon/DI mapping needs; the
+    # solver's own Fibonacci-lattice sampling is a different layout and is not
+    # surfaced here. ``None`` otherwise, so downstream getattr-probes see an
+    # explicit None rather than an AttributeError.
     sphere_pressure_complex: NDArray[np.complex128] | None = None
     sphere_theta_deg: NDArray[np.float64] | None = None
     sphere_phi_deg: NDArray[np.float64] | None = None

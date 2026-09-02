@@ -39,7 +39,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .config import BEAT_CUDA, BEAT_ROCM
+from .config import BEAT_CUDA, BEAT_METAL, BEAT_ROCM
 
 JULIA_VERSION = "1.12.6"
 _JULIA_BASE = "https://julialang-s3.julialang.org/bin"
@@ -57,6 +57,11 @@ _JULIA_DOWNLOADS: dict[tuple[str, str], dict[str, str | None]] = {
     ("Linux", "x86_64"): {
         "filename": f"julia-{JULIA_VERSION}-linux-x86_64.tar.gz",
         "url": f"{_JULIA_BASE}/linux/x64/1.12/julia-{JULIA_VERSION}-linux-x86_64.tar.gz",
+        "sha256": None,
+    },
+    ("Darwin", "arm64"): {
+        "filename": f"julia-{JULIA_VERSION}-macaarch64.tar.gz",
+        "url": f"{_JULIA_BASE}/mac/aarch64/1.12/julia-{JULIA_VERSION}-macaarch64.tar.gz",
         "sha256": None,
     },
 }
@@ -263,6 +268,15 @@ _GPU_BACKENDS: dict[str, dict[str, Any]] = {
         "module": "AMDGPU",
         "hardware": "an AMD ROCm runtime",
     },
+    BEAT_METAL: {
+        "label": "Metal",
+        "module": "Metal",
+        "hardware": "an Apple Silicon GPU",
+        # Metal.jl ships no vendor toolkit: the driver is the operating
+        # system's, so instantiating is a small package download rather than
+        # the multi-gigabyte artifact pull CUDA and ROCm need.
+        "instantiate_note": "",
+    },
 }
 
 
@@ -275,6 +289,8 @@ def detect_gpu_backend() -> str | None:
         return BEAT_CUDA
     if runtime._rocm_present():
         return BEAT_ROCM
+    if runtime._apple_gpu_present():
+        return BEAT_METAL
     return None
 
 
@@ -285,6 +301,8 @@ def _gpu_hardware_present(backend: str) -> bool:
         return runtime._nvidia_gpu_present()
     if backend == BEAT_ROCM:
         return runtime._rocm_present()
+    if backend == BEAT_METAL:
+        return runtime._apple_gpu_present()
     return False
 
 
@@ -347,8 +365,8 @@ def provision_gpu(
             project=project,
             env_backend=backend,
             label=(
-                f"Instantiating the Julia {facts['label']} environment "
-                "(first run downloads several GB)"
+                f"Instantiating the Julia {facts['label']} environment"
+                + facts.get("instantiate_note", " (first run downloads several GB)")
             ),
             status_cb=status_cb,
         )
@@ -404,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--backend",
-        choices=["auto", BEAT_CUDA, BEAT_ROCM],
+        choices=["auto", BEAT_CUDA, BEAT_ROCM, BEAT_METAL],
         default="auto",
         help="which GPU stack to provision; auto follows the hardware inventory",
     )
@@ -422,7 +440,10 @@ def main(argv: list[str] | None = None) -> int:
         if backend is None:
             if args.if_gpu:
                 return 0
-            print("No supported GPU (NVIDIA CUDA or AMD ROCm) was detected; nothing to provision.")
+            print(
+                "No supported GPU (NVIDIA CUDA, AMD ROCm, or Apple Silicon "
+                "Metal) was detected; nothing to provision."
+            )
             return 0
     elif args.if_gpu and not _gpu_hardware_present(backend):
         return 0

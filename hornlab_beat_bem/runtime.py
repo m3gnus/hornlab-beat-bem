@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import platform
 import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .config import BEAT_CPU, BEAT_CUDA, BEAT_ROCM
+from .config import BEAT_CPU, BEAT_CUDA, BEAT_METAL, BEAT_ROCM
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_SOLVER_SCRIPT = PACKAGE_DIR / "julia" / "solver.jl"
 CPU_PROJECT = PACKAGE_DIR / "julia"
 CUDA_PROJECT = PACKAGE_DIR / "julia_cuda"
 ROCM_PROJECT = PACKAGE_DIR / "julia_rocm"
+METAL_PROJECT = PACKAGE_DIR / "julia_metal"
 
 #: Full path to a Julia executable; wins over PATH discovery.
 JULIA_ENV_VAR = "HORNLAB_BEAT_JULIA"
@@ -43,6 +45,8 @@ def default_project(beat_backend: str) -> Path:
         return CUDA_PROJECT
     if beat_backend == BEAT_ROCM:
         return ROCM_PROJECT
+    if beat_backend == BEAT_METAL:
+        return METAL_PROJECT
     raise ValueError(f"Unknown BEAT backend: {beat_backend}")
 
 
@@ -86,6 +90,18 @@ def _nvidia_gpu_present() -> bool:
         return False
 
 
+def _apple_gpu_present() -> bool:
+    """Whether this host could have a Metal device at all.
+
+    Metal.jl needs Apple Silicon: the package has no Intel-Mac path, and
+    ``Metal.functional()`` is the authority anyway. This is only the cheap
+    inventory check that decides whether paying for a Julia startup is worth
+    it, exactly as ``nvidia-smi`` is for CUDA.
+    """
+
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
 def _rocm_present() -> bool:
     for env_name in ("BLAB_ROCM_PATH", "ROCM_PATH", "HIP_PATH", "ROCM_HOME"):
         value = os.environ.get(env_name, "").strip()
@@ -105,7 +121,7 @@ def _julia_gpu_functional(julia: str, beat_backend: str) -> tuple[bool, str]:
     cached for the process lifetime.
     """
 
-    module = "CUDA" if beat_backend == BEAT_CUDA else "AMDGPU"
+    module = {BEAT_CUDA: "CUDA", BEAT_ROCM: "AMDGPU", BEAT_METAL: "Metal"}[beat_backend]
     project = default_project(beat_backend)
     if not (project / "Project.toml").exists():
         return False, f"bundled Julia project {project} is missing Project.toml"
@@ -255,13 +271,31 @@ def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]
             "julia_executable": julia,
         }
 
+    if _apple_gpu_present():
+        functional, detail = _julia_gpu_functional(julia, BEAT_METAL)
+        if functional:
+            return {
+                "available": True,
+                "reason": f"Apple Silicon GPU detected and {detail}",
+                "version": version,
+                "backend": BEAT_METAL,
+                "julia_executable": julia,
+            }
+        return {
+            "available": False,
+            "reason": f"This is Apple Silicon but the Metal path is not usable: {detail}",
+            "version": version,
+            "backend": None,
+            "julia_executable": julia,
+        }
+
     return {
         "available": False,
         "reason": (
-            "No supported GPU was detected (neither an NVIDIA CUDA device via "
-            "nvidia-smi nor an AMD ROCm runtime). The BEAT engine is GPU-only; "
-            f"the internal CPU path is enabled by {FORCE_CPU_ENV_VAR}=1 for "
-            "tests and validation."
+            "No supported GPU was detected (no NVIDIA CUDA device via "
+            "nvidia-smi, no AMD ROCm runtime, and not Apple Silicon). The BEAT "
+            "engine is GPU-only; the internal CPU path is enabled by "
+            f"{FORCE_CPU_ENV_VAR}=1 for tests and validation."
         ),
         "version": version,
         "backend": None,

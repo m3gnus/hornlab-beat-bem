@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hornlab-beat-bem"
 version = "0.1.0"
-description = "BEAT Engine (boundary-lab) Julia BEM solver backend for HornLab: CPU scaffolding plus CUDA/ROCm GPU paths"
+description = "BEAT Engine (boundary-lab) Julia BEM solver: exterior Burton-Miller and coupled FEM-BEM-LEM, on CPU, CUDA, ROCm and Apple Metal"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
 classifiers = [
@@ -26,7 +26,12 @@ hornlab_beat_bem = [
     "julia/*.jl",
     "julia/*.toml",
     "julia/src/*.jl",
+    "julia/scripts/*.jl",
+    "julia/tests/*.jl",
+    "julia/test_meshes/*.msh",
+    "julia/test_fixtures/*.msh",
     "julia_cuda/*.toml",
+    "julia_metal/*.toml",
     "julia_rocm/*.toml",
 ]
 
