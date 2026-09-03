@@ -100,6 +100,23 @@ jobs:
       - name: Instantiate the Julia CPU project
         run: julia --project=hornlab_beat_bem/julia -e 'using Pkg; Pkg.instantiate()'
 
+      # Print the host before the suite. This is not boilerplate: parts of this
+      # suite are microarchitecture-sensitive by design -- the conditional
+      # Krylov check is documented as such, and `coupled_condensed_tests.jl`
+      # asserts bitwise equality between two CPU assembly paths, which holds
+      # only where LLVM gives both the same vectorised summation order. When a
+      # run disagrees with another run on identical code, `Sys.CPU_NAME` is the
+      # first thing worth knowing and it is not recoverable after the fact.
+      - name: Report the host
+        run: |
+          julia --project=hornlab_beat_bem/julia -e '
+            using LinearAlgebra
+            println("cpu_name    ", Sys.CPU_NAME)
+            println("cpu_threads ", Sys.CPU_THREADS)
+            println("julia       ", VERSION)
+            println("threads     ", Threads.nthreads())
+            println("blas        ", BLAS.get_num_threads(), " ", BLAS.get_config())'
+
       # The driver wraps runtests.jl in one aggregate testset for a total, and
       # enforces a floor so a suite that stops running is not mistaken for one
       # that agrees. Two testsets are gated on accelerator hardware and are
