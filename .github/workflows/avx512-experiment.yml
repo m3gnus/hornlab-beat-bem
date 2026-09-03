@@ -1,10 +1,16 @@
 name: AVX-512 mask experiment
 
 # A temporary experiment, not a gate. It exists to settle the mechanism behind the
-# condensed-assembly intermittent documented in AGENTS.md: four bitwise-equality
-# assertions in `coupled_condensed_tests.jl` that fail by one Float32 ULP, only on
-# `ubuntu-latest`, and so far only on AVX-512 hosts. Delete this file once the
-# question is answered -- it is evidence-gathering machinery with a finite life.
+# condensed-assembly failure documented in AGENTS.md: four bitwise-equality
+# assertions in `coupled_condensed_tests.jl` that fail on `ubuntu-latest` and never
+# on `macos-latest`. Delete this file once the question is answered -- it is
+# evidence-gathering machinery with a finite life.
+#
+# It has answered it. Across 30 draws the failure tracks the host's AVX-512
+# feature flags exactly: present, it fails every time and the mask turns it green
+# on that same machine; absent, it never fails. AGENTS.md carries the finding and
+# the contract question it raises; this file is kept only so the result can be
+# re-drawn on demand.
 #
 # The design is paired, within host. Each draw runs the Julia CPU suite twice on
 # the same runner from the same checkout: once unmasked, once with AVX-512 masked
