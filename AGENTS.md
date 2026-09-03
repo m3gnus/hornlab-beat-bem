@@ -136,6 +136,37 @@ the reason the design says it would.
 `validate_metal_coupled.jl` and the ROCm scripts are not in CI: the first has
 not had a green hosted run yet, and the second needs an AMD host.
 
+### A known intermittent on ubuntu-latest -- do not "fix" it by loosening it
+
+The second CI run ever, on a commit that changed only this file, failed four
+assertions in `julia/tests/coupled_condensed_tests.jl` on `ubuntu-latest`.
+Runs one and three passed on the same code, and `macos-latest` passed all
+three. The failures are the `symmetry == :off` branch of the forked-versus-
+shared comparison, which asserts **bitwise** equality on the stated ground that
+"with no images the fused sweep reduces to the base sweep". The observed
+disagreement was one Float32 ULP: `3.354732f-9` against `3.3547323f-9`.
+
+Two facts narrow it. `Threads.nthreads()` is 1 on the runners, so the
+`Threads.@threads` loops in `BeatEngineCpuAssembly.jl` and
+`BeatEngineCondensedAssembly.jl` are disabled and thread scheduling is not the
+cause. OpenBLAS, however, is multithreaded there (2 on ubuntu, 3 on macOS),
+and GitHub's `ubuntu-latest` pool is heterogeneous -- run three reported
+`znver3`. So the two live candidates are a different host CPU giving the two
+code paths different vectorised summation orders, and multithreaded BLAS. The
+`Report the host` step exists to settle this: the next occurrence should be
+compared against a passing run's `cpu_name`.
+
+This is pre-existing and not owned here. `coupled_condensed_tests.jl` is
+vendored (see `VENDORING.md`; only the fixture root differs from upstream), so
+a fix belongs in `boundary-lab` and arrives through a re-sync. **Do not relax
+that `==` to an `≈` in this repository**, and do not relax it upstream without
+first establishing which of the two mechanisms it is -- the assertion is
+deliberate, its comment explains why both the strict and the loose halves are
+there, and turning it loose would discard the only check that the fused sweep
+really does reduce to the base sweep. If it turns out to be a genuine
+microarchitecture dependency, the honest repair is to say so where the
+assertion is made, exactly as the conditional Krylov check does.
+
 ## Benchmarking
 
 Timing on a shared machine is worthless without exclusivity. Check for other
