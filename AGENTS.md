@@ -149,12 +149,16 @@ disagreement was one Float32 ULP: `3.354732f-9` against `3.3547323f-9`.
 Two facts narrow it. `Threads.nthreads()` is 1 on the runners, so the
 `Threads.@threads` loops in `BeatEngineCpuAssembly.jl` and
 `BeatEngineCondensedAssembly.jl` are disabled and thread scheduling is not the
-cause. OpenBLAS, however, is multithreaded there (2 on ubuntu, 3 on macOS),
-and GitHub's `ubuntu-latest` pool is heterogeneous -- run three reported
-`znver3`. So the two live candidates are a different host CPU giving the two
-code paths different vectorised summation orders, and multithreaded BLAS. The
-`Report the host` step exists to settle this: the next occurrence should be
-compared against a passing run's `cpu_name`.
+cause. OpenBLAS, however, is multithreaded there (2 on ubuntu, 3 on macOS).
+So the two live candidates are a different host CPU giving the two code paths
+different vectorised summation orders, and multithreaded BLAS.
+
+The pool's heterogeneity is observed rather than assumed: the two runs since
+the host step was added reported `znver3` and `znver4`, so `ubuntu-latest`
+demonstrably moves between CPU generations from one run to the next. Both of
+those passed, and run two's CPU is unrecoverable because the step did not
+exist yet. That is what the step is for: compare the next failing run's
+`cpu_name` against `znver3`/`znver4`, which are known good.
 
 This is pre-existing and not owned here. `coupled_condensed_tests.jl` is
 vendored (see `VENDORING.md`; only the fixture root differs from upstream), so
