@@ -13,11 +13,13 @@ name: AVX-512 mask experiment
 # unmasked run were necessarily different machines from a heterogeneous pool and
 # any difference could be attributed to the draw rather than the flag.
 #
-# Repeats are the point: the intermittent is roughly five failures in six on an
-# AVX-512 host, so a single green masked run says almost nothing, and one that is
-# green while its own unmasked partner on the same silicon went red says a great
-# deal. The matrix draws hosts; `ubuntu-latest` is a pool of `znver3` (no AVX-512),
-# `znver4`, `graniterapids`, `sapphirerapids` and `icelake-server`.
+# Repeats are for drawing hosts, not for averaging out noise. The first run of
+# this experiment (14 draws) found the failure is not random at all: on a host
+# whose `/proc/cpuinfo` advertises AVX-512 it fails every time, with the same 201
+# and 205 differing entries, and on a host without it, never. What looked
+# intermittent was the pool draw. `ubuntu-latest` serves `znver3`, `znver4`,
+# `graniterapids` and `sapphirerapids`, and -- the detail that hid this -- some
+# `znver4` hosts do not expose AVX-512 to the guest at all.
 #
 # `push` on this branch is the trigger because a topic branch with no pull request
 # is not gated by anything and would otherwise never run. That is also why this is
@@ -54,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        draw: [1, 2, 3, 4, 5, 6, 7, 8]
 
     steps:
       - uses: actions/checkout@v4
@@ -90,8 +92,10 @@ jobs:
           fi
 
       # Establish that the flag does something before trusting what happens under
-      # it. On an AVX-512 host the expected signature is zmm registers present
-      # unmasked and absent masked; on `znver3` both are zero, which is the correct
+      # it. On `znver4` the signature is 512-bit registers, present unmasked and
+      # absent masked; on Intel hosts LLVM prefers 256-bit vectors and the
+      # signature is EVEX-only registers and mask registers instead. On a host
+      # without AVX-512 every count is zero in both arms, which is the correct
       # null rather than a broken mask.
       - name: Assay the code generation
         id: assay
@@ -100,14 +104,14 @@ jobs:
           julia -C "$AVX512_MASK" --project=hornlab_beat_bem/julia .github/scripts/avx512_codegen_assay.jl > assay-masked.log 2>&1
           echo "--- unmasked ---"; cat assay-unmasked.log
           echo "--- masked ---";   cat assay-masked.log
-          zmm_unmasked=$(awk '/assay_zmm/ {print $2}' assay-unmasked.log)
-          zmm_masked=$(awk '/assay_zmm/ {print $2}' assay-masked.log)
-          echo "zmm_unmasked=${zmm_unmasked:-unknown}" >> "$GITHUB_OUTPUT"
-          echo "zmm_masked=${zmm_masked:-unknown}" >> "$GITHUB_OUTPUT"
-          # A masked arm that still emits 512-bit registers would invalidate this
+          sig_unmasked=$(awk '/assay_avx512_total/ {print $2}' assay-unmasked.log)
+          sig_masked=$(awk '/assay_avx512_total/ {print $2}' assay-masked.log)
+          echo "sig_unmasked=${sig_unmasked:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "sig_masked=${sig_masked:-unknown}" >> "$GITHUB_OUTPUT"
+          # A masked arm still carrying AVX-512 signatures would invalidate this
           # draw, so say so loudly rather than reporting its suite result.
-          if [ "${zmm_masked:-unknown}" != "0" ]; then
-            echo "::error::The mask did not take: masked codegen still emits zmm ($zmm_masked)."
+          if [ "${sig_masked:-unknown}" != "0" ]; then
+            echo "::error::The mask did not take: masked codegen still carries AVX-512 ($sig_masked)."
             exit 1
           fi
 
@@ -128,7 +132,7 @@ jobs:
             .github/scripts/run_julia_suite.jl --min-passes=300 > unmasked-suite.log 2>&1
           status=$?
           set -e
-          condensed=$(grep -c -E 'coupled_condensed_tests\.jl:(592|618)' unmasked-suite.log || true)
+          condensed=$(grep -c -E 'Test Failed at.*coupled_condensed_tests\.jl:(592|618)' unmasked-suite.log || true)
           echo "exit=$status" >> "$GITHUB_OUTPUT"
           echo "condensed=$condensed" >> "$GITHUB_OUTPUT"
           echo "exit status $status, $condensed condensed-assembly failures"
@@ -142,7 +146,7 @@ jobs:
             .github/scripts/run_julia_suite.jl --min-passes=300 > masked-suite.log 2>&1
           status=$?
           set -e
-          condensed=$(grep -c -E 'coupled_condensed_tests\.jl:(592|618)' masked-suite.log || true)
+          condensed=$(grep -c -E 'Test Failed at.*coupled_condensed_tests\.jl:(592|618)' masked-suite.log || true)
           echo "exit=$status" >> "$GITHUB_OUTPUT"
           echo "condensed=$condensed" >> "$GITHUB_OUTPUT"
           echo "exit status $status, $condensed condensed-assembly failures"
@@ -171,7 +175,7 @@ jobs:
           line="RESULT draw=${{ matrix.draw }}"
           line="$line cpu=${{ steps.host.outputs.cpu_name }}"
           line="$line avx512=${{ steps.host.outputs.avx512 }}"
-          line="$line zmm=${{ steps.assay.outputs.zmm_unmasked }}/${{ steps.assay.outputs.zmm_masked }}"
+          line="$line avx512sig=${{ steps.assay.outputs.sig_unmasked }}/${{ steps.assay.outputs.sig_masked }}"
           line="$line unmasked=$(arm '${{ steps.unmasked.outputs.exit }}')/${{ steps.unmasked.outputs.condensed }}"
           line="$line masked=$(arm '${{ steps.masked.outputs.exit }}')/${{ steps.masked.outputs.condensed }}"
           echo "$line"

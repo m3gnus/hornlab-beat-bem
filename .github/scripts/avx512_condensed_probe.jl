@@ -44,10 +44,20 @@ end
 
 ulp_gap(a::Float32, b::Float32) = abs(float_key(a) - float_key(b))
 
-"""Compare two operator matrices entry by entry, in ULPs of their parts."""
+"""Compare two operator matrices entry by entry, in ULPs of their parts.
+
+Also reports the two relative measures the contract question turns on. `norm_rel`
+is what Julia's `≈` actually tests on arrays -- `norm(a - b) <= rtol * max(norm(a),
+norm(b))` -- so it says directly whether the sibling branches' `rtol = 1.0f-5`
+would hold here and with how much room. `entry_rel` is the worst *entrywise*
+relative gap, which is much larger, because the entries that disagree are tiny
+ones where a few ULPs are a big fraction of a small number and a negligible
+fraction of the operator.
+"""
 function compare(forked::AbstractMatrix, shared::AbstractMatrix)
     differing = 0
     worst = 0
+    entry_rel = 0.0
     first_index = nothing
     for index in eachindex(forked, shared)
         left = forked[index]
@@ -58,11 +68,17 @@ function compare(forked::AbstractMatrix, shared::AbstractMatrix)
         if gap > worst
             worst = gap
         end
+        scale = max(abs(left), abs(right))
+        if scale > 0
+            entry_rel = max(entry_rel, abs(left - right) / scale)
+        end
         if first_index === nothing
             first_index = index
         end
     end
-    return (; differing, worst, first_index, total=length(forked))
+    norm_rel = differing == 0 ? 0.0 :
+               norm(forked - shared) / max(norm(forked), norm(shared))
+    return (; differing, worst, entry_rel, norm_rel, first_index, total=length(forked))
 end
 
 function report(label, forked, shared)
@@ -71,7 +87,8 @@ function report(label, forked, shared)
         location = result.first_index === nothing ? "-" :
                    string(Tuple(CartesianIndices(getproperty(forked, operator))[result.first_index]))
         println("probe $label $operator differing=$(result.differing)/$(result.total) " *
-                "max_ulp=$(result.worst) first=$location")
+                "max_ulp=$(result.worst) norm_rel=$(result.norm_rel) " *
+                "entry_rel=$(result.entry_rel) first=$location")
     end
 end
 
