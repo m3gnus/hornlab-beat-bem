@@ -146,81 +146,152 @@ the reason the design says it would.
 `validate_metal_coupled.jl` and the ROCm scripts are not in CI: the first has
 not had a green hosted run yet, and the second needs an AMD host.
 
-### A known intermittent on ubuntu-latest -- do not "fix" it by loosening it
+### The condensed-assembly disagreement on AVX-512 hosts
 
-Four assertions in `julia/tests/coupled_condensed_tests.jl` fail
-intermittently on `ubuntu-latest`, and have never failed on `macos-latest`.
-The failures are the `symmetry == :off` branch of the forked-versus-shared
-comparison, which asserts **bitwise** equality on the stated ground that "with
-no images the fused sweep reduces to the base sweep". The observed
-disagreement is one Float32 ULP: `3.354732f-9` against `3.3547323f-9`. A
-failing job reports 416 passed, 4 failed, 1 broken.
+Four assertions in `julia/tests/coupled_condensed_tests.jl` -- lines 592 and
+618, the `symmetry == :off` branch of the forked-versus-shared comparison --
+fail on `ubuntu-latest` and never on `macos-latest`. They assert **bitwise**
+equality on the stated ground that "with no images the fused sweep reduces to
+the base sweep". A failing job reports 416 passed, 4 failed, 1 broken.
 
-Sightings so far, `ubuntu-latest` only:
+**This was recorded here as an intermittent. It is not one.** Settled
+2026-09-03 by a paired experiment on branch `chore/avx512-mask-experiment`
+(`.github/workflows/avx512-experiment.yml`). Each draw ran the Julia CPU suite
+twice on the *same* runner from the same checkout: once normally, once with
+AVX-512 masked out of the JIT target (`julia -C native,-avx512f,...`). Two arms
+on one host is what the CI history could never give, because there every
+comparison was also a different machine.
 
-| Run | Commit changed | `cpu_name` | Result |
+| Host, by `/proc/cpuinfo` flags | Draws | Unmasked | Masked |
 |---|---|---|---|
-| CI run 1 | -- | not recorded | pass |
-| CI run 2 | AGENTS.md only | not recorded | **fail** |
-| CI run 3 | workflow only | `znver3` | pass |
-| CI run 4 | AGENTS.md only | `znver4` | pass |
-| PR #6 | AGENTS.md only | `znver3` | pass |
-| PR #7 run 33758796520 | a new script CI did not yet invoke | `znver4` | **fail** |
-| PR #4 run 33766122696 att.1 | rebase only (docs base moved) | `graniterapids` | **fail** |
-| PR #4 att.2 (re-run) | nothing | `sapphirerapids` | **fail** |
-| PR #4 att.3 (re-run) | nothing | `znver4` | **fail** |
-| PR #4 att.4 (re-run) | nothing | `znver3` | pass |
-| main 5500f6a run 33766048335 att.1 | AGENTS.md only (PR #6 merge) | `icelake-server` | **fail** |
-| main 5500f6a att.2 (re-run) | nothing | `znver3` | pass |
+| AVX-512 present | 10 | **fail, every one** | pass, every one |
+| AVX-512 absent | 36 | pass, every one | pass, every one |
 
-Two of those changed no Julia code whatsoever, and the sixth added a script
-the workflow did not call. So the suite disagrees with itself across runs of
-identical code.
+46 draws, no exception either way. The ten cover all four families the older
+sightings named -- `graniterapids`, `sapphirerapids`, `icelake-server` and
+`znver4` -- plus a `znver5` that no sighting had seen; the thirty-six are
+`znver3` and the AVX-512-less `znver4` below.
 
-**2026-09-03, after five more sightings: every failure to date is on an
-AVX-512 host, and `znver3` — the only host without AVX-512 — has never
-failed.** `graniterapids`, `sapphirerapids`, `icelake-server` and `znver4`
-all carry AVX-512; `znver4` has one pass, so the ISA level looks *necessary
-but not sufficient*, which keeps the negative result below intact and fits
-the second candidate there (allocation-dependent loop-tail vectorisation)
-rather than the OpenBLAS one — BLAS thread count was identical across green
-and red runs, and elementwise quadrature should not call BLAS at all. The
-workflow now prints the host's AVX-512 feature flag next to `cpu_name` so
-this correlation is recorded per run rather than inferred from model names.
-The candidate fix — the `symmetry == :off` branch's bitwise `==` premise,
-where sibling branches already use `rtol=1.0f-5` — is a test-contract
-decision and deliberately not taken unilaterally; whoever takes it should
-confirm the mechanism first (a run with AVX-512 masked off going green would
-settle it).
+On an AVX-512 host it fails **every time**, with the same 201 and 205 differing
+entries every time. What looked intermittent was the pool draw.
 
-`Threads.nthreads()` is 1 on the runners, so the `Threads.@threads` loops in
-`BeatEngineCpuAssembly.jl` and `BeatEngineCondensedAssembly.jl` are disabled
-and thread scheduling is not the cause. The suite also passes locally at
-`-t 4` on Apple Silicon.
+**The trap that hid this is `Sys.CPU_NAME`.** The earlier record concluded the
+ISA level was "necessary but not sufficient" because `znver4` appeared once as
+a pass and twice as a fail. It is sufficient: some `znver4` hosts in the pool
+do not expose AVX-512 to the guest at all. Across these draws `znver4` came up
+3 times with the flags and 14 times without, and failed on exactly the 3. One
+CPU model, opposite outcomes, separated perfectly by the feature flags -- so
+key on the flags, which the workflow prints, never on the model name.
 
-**The obvious hypothesis has been tested and does not hold.** `ubuntu-latest`
-is genuinely a heterogeneous pool -- these runs saw both `znver3` and `znver4`
--- so the natural explanation was that one host vectorises the two sweeps into
-different summation orders. But `znver4` appears once as a pass and once as a
-fail, and `znver3` has only ever passed. The same CPU model therefore both
-agrees and disagrees, which rules out `Sys.CPU_NAME` as a sufficient
-explanation and points at something that varies *within* a host between runs.
-Multithreaded OpenBLAS (2 threads on ubuntu, 3 on macOS) is the leading
-remaining candidate; allocation-dependent vectorisation of a loop tail is
-another. Keep recording `cpu_name` anyway -- a finer-grained difference than
-the LLVM target name is still possible -- but do not go on attributing this to
-the pool.
+What diverges, identically on every AVX-512 host:
 
-This is pre-existing and not owned here. `coupled_condensed_tests.jl` is
-vendored (see `VENDORING.md`; only the fixture root differs from upstream), so
-a fix belongs in `boundary-lab` and arrives through a re-sync. **Do not relax
-that `==` to an `≈` in this repository**, and do not relax it upstream without
-first establishing the mechanism -- the assertion is
-deliberate, its comment explains why both the strict and the loose halves are
-there, and turning it loose would discard the only check that the fused sweep
-really does reduce to the base sweep. If it turns out to be a genuine
-microarchitecture dependency, the honest repair is to say so where the
-assertion is made, exactly as the conditional Krylov check does.
+- `double_layer`, 201 of its 526 computed entries, worst gap 256 ULP;
+- `adjoint_double_layer`, 205 of 552, worst gap 148 ULP;
+- `single_layer` and `hypersingular`, never;
+- forked-against-forked (line 626), never.
+
+Two corrections to what was recorded before. The disagreement is **not** one
+ULP -- that was the first differing entry; the worst is 256. And it is not a
+rare corner: the fixture assembles only 24 elements, so those 201 entries are
+38% of the operator's non-zero content, not 201 in 1.9 million.
+
+**Why those two operators and not the other two.** `double_layer` and
+`adjoint_double_layer` are the two formed from `dot(r_vec, normal)`, which
+near-cancels for nearly coplanar element pairs. Over the 69 million quadrature
+pairs this fixture visits, that sum has a summation condition number above 100
+for 0.59% of them, and 4.8e35 at worst. The other two descend from
+`dot(r_vec, r_vec)` by way of `weighted_green` -- a sum of squares, whose
+condition number is exactly 1.0 for every pair, because non-negative terms
+cannot cancel. The two operators that can amplify a changed rounding are
+exactly the two that do; the two that provably cannot, never do.
+
+**Why it is a compilation difference, not an arithmetic one.** Line 626
+compares two invocations of the *same* compiled function and has never failed;
+the four that fail compare two *different* compiled functions.
+`_beat_cpu_regular_pair_blocks` and `_condensed_accumulate_pair_blocks!` hold
+textually identical quadrature loops, so at `:off` their arithmetic is the same
+-- but they are separate bodies optimised in separate contexts, and nothing in
+the source pins LLVM to the same floating-point association in both. On aarch64
+it happens to pick the same one: dumping both bodies there gives identical
+inner-loop instruction mixes (fmadd 2/2, fmul 39/39, fadd 17/17), differing only
+in where results are stored. That is why macOS has never failed, and it is a
+property of the target rather than of the code.
+
+Two controls, both in the runs' artifacts. The mask removes AVX-512 and nothing
+else -- 256-bit and 128-bit vectorisation are unchanged under it (`ymm` 40,
+`xmm` 32 in both arms) -- so this is not "vectorisation off, therefore
+agreement". And the mask demonstrably applied: on `znver4` the assay counts 43
+zmm registers unmasked and 0 masked. On Intel hosts it counts none in either
+arm, because LLVM sets `prefer-vector-width=256` for `graniterapids` and
+`sapphirerapids` and AVX-512 arrives there as EVEX-encoded 256-bit operations
+rather than 512-bit registers -- which is why the assay also counts EVEX-only
+registers and mask registers.
+
+`.github/scripts/avx512_condensed_probe.jl` reproduces it standalone on an
+AVX-512 host in about 25 seconds, in a process that has run nothing else. So it
+needs no particular allocation history, and the earlier "allocation-dependent
+loop-tail vectorisation" candidate was narrower than it needed to be: two
+separately compiled bodies is enough.
+
+**Windows is untested on the arm that matters, and one null does not change
+that.** Every draw above is Linux; macOS is exempt only because it is aarch64.
+Nothing in the mechanism is Linux-specific -- it is LLVM's codegen for an x86
+AVX-512 target -- so the prediction is that a Windows host whose CPU exposes
+AVX-512 fails identically. That prediction is **not** confirmed. It was checked
+on 2026-09-03 on the workspace Windows box, which turned out to be a Ryzen 7
+5825U: `znver3`, `avx512f false` by `IsProcessorFeaturePresent`. The probe
+reported zero differences and the suite gave 424 passed, 0 failed, 1 broken --
+the same counts as macOS, exit 0.
+
+That is a correct null and it discriminates nothing, because the host has no
+AVX-512 to mask. Do not read it as "Windows passes, so it is not the ISA". The
+one fact it does add is that the failure is not merely "x86 on a non-Apple OS":
+this host is x86, non-Apple, and green. The masked control was deliberately
+**not** run there -- on a CPU without AVX-512 the mask is a no-op, and a second
+null would look like a control arm without being one.
+
+Closing this needs a Windows host reporting `avx512f true` -- Intel Ice Lake or
+later, or Zen 4/5 with AVX-512 not hidden by the hypervisor. Until then, a
+Windows developer on an AVX-512 workstation should expect these four assertions
+red on correct code, and should read this section before "fixing" them.
+
+**The contract decision is open and belongs to Magnus.** The mechanism above is
+the evidence the earlier note asked for before anyone touched the assertion; it
+is not permission to touch it. `coupled_condensed_tests.jl` is vendored (see
+`VENDORING.md`), so a change lands upstream in `boundary-lab` and arrives by
+re-sync -- **do not relax the `==` in this repository.** What the finding
+changes is which options are honest:
+
+- **Keep `==`.** It is red on every AVX-512 draw, for something that is not a
+  defect, and a gate that cries wolf is one people learn to merge past. §7 of
+  the workspace policy also makes a red trunk outrank feature work.
+- **Relax `:off` to `rtol = 1.0f-5`, matching the sibling branches.** It passes
+  comfortably: `≈` on arrays is a *norm* test -- `norm(a - b) <= rtol *
+  max(norm(a), norm(b))` -- and the measured relative gap is 2.18e-8 for
+  `double_layer` and 1.60e-8 for `adjoint_double_layer`, some 460x inside the
+  bound. The objection is not headroom, it is what the test asserts: a norm is
+  insensitive to a few badly wrong entries inside a large norm, which is exactly
+  the failure mode a fused assembly is most likely to introduce.
+- **Bound the entries instead** (recommended). Assert entrywise agreement to an
+  absolute floor set by the operator's own largest entry. At `1.0f-5 *
+  maximum(abs, shared)` that is 2.0e-12 for `double_layer` against a worst
+  measured gap of 3.55e-15 -- about 565x -- and unlike the norm it is a
+  guarantee about every entry. It also stops tightening as the entries get
+  small, which is what makes the present test fail on near-cancelling terms that
+  carry no information.
+
+  Do **not** reach for an entrywise *relative* tolerance instead: the worst
+  entrywise relative gap measured is 1.57e-5, so a per-entry `rtol = 1.0f-5`
+  fails. That is the same near-cancellation the mechanism turns on -- a tiny
+  entry can be many ULPs wrong and still carry no error worth the name -- and it
+  is why the floor has to be absolute and tied to the operator's scale.
+
+  All figures here are measured by `avx512_condensed_probe.jl` on a
+  `sapphirerapids` draw, not derived.
+- **Make the premise true by construction** -- have both paths call one
+  `@noinline` body, so `==` holds because there is one compilation. Named for
+  completeness; it costs the hot loop the independent optimisation the fork
+  exists to allow.
 
 ## Benchmarking
 
