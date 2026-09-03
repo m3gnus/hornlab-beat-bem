@@ -26,9 +26,12 @@ from typing import Any
 import numpy as np
 
 from .config import (
+    GROUND_PLANE_TOLERANCE_M,
     ObservationFrame,
     SolveConfig,
-    beat_symmetry_mode,
+    beat_image_mode,
+    ground_plane_enabled,
+    reject_unsupported_ground_plane,
     reject_unsupported_native_symmetry,
 )
 from .mesh import read_gmsh22_info
@@ -40,7 +43,14 @@ from .worker import BeatSolveSession, get_worker
 #: factor before dividing by the drive; undone when reconstructing pressure.
 _BEAT_IMPEDANCE_FORCE_FACTOR = 10.0
 
-_SYMMETRY_FACTOR = {"off": 1, "x": 2, "xy": 4}
+#: How many real radiators the reduced mesh stands for. `"ground"` is 1, not
+#: 2, because a rigid half space's image is fictitious -- see
+#: `impedance_for_radiators` in `julia/BeatEngineDriver.jl`, which no longer
+#: multiplies the integrated force by the transform count for that mode. The
+#: two constants are one fix in two files and must move together; a 2 here
+#: with a 1 there (or the reverse) is a 6.02 dB error in reported impedance
+#: with an entirely correct pressure field.
+_SYMMETRY_FACTOR = {"off": 1, "x": 2, "xy": 4, "ground": 1}
 
 _FRAME_AXIS_TOLERANCE = 1.0e-3
 
@@ -83,6 +93,48 @@ def _validated_frame_translation(frame: ObservationFrame | None) -> tuple[float,
     return (float(-origin[0]), float(-origin[1]), float(-origin[2]))
 
 
+def _ground_placed_translation(
+    frame_translation: tuple[float, float, float],
+    config: SolveConfig,
+) -> tuple[float, float, float]:
+    """Compose the frame translation with the ground plane's model placement.
+
+    ``ground_plane.height_m`` is the height of the model origin above the
+    plane, and the plane passes through the solver origin, so the mesh is
+    lifted by ``+height_m`` along the ground axis.
+
+    The two translations fight along that axis, and silently. BEAT computes
+    its polar cuts around the solver's coordinate origin, so the frame
+    translation exists to put ``frame.origin`` there -- and along the ground
+    axis, doing that moves the body relative to the floor. A frame origin off
+    the plane would therefore land the body at a height nobody asked for, with
+    a perfectly plausible-looking result. So the ground placement owns its
+    axis, and a frame that also wants to move along it is refused rather than
+    overridden.
+
+    In WG's frame (z the horn axis, y vertical) the observation origin is the
+    throat or mouth on the horn axis, so its y component is already zero and
+    this refusal does not fire for the ordinary case.
+    """
+
+    if not ground_plane_enabled(config):
+        return frame_translation
+
+    ground = config.ground_plane
+    axis = ground.axis_index
+    if abs(frame_translation[axis]) > GROUND_PLANE_TOLERANCE_M:
+        raise NotImplementedError(
+            "A ground plane and an observation frame cannot both place the "
+            f"mesh along axis {ground.axis!r}: BEAT measures its polar cuts "
+            "around the solver origin, which lies in the plane, so the frame "
+            f"origin's {ground.axis} component must be zero. Got "
+            f"{-frame_translation[axis]:.6g} m."
+        )
+    placed = list(frame_translation)
+    placed[axis] = float(ground.height_m)
+    return (placed[0], placed[1], placed[2])
+
+
 def _request_payload(
     mesh_path: str | Path,
     frequencies: np.ndarray,
@@ -112,13 +164,19 @@ def _request_payload(
         "tag_throat": config.source_tag,
         "rho": float(config.air_density),
         "sound_speed": float(config.sound_speed),
-        "symmetry": beat_symmetry_mode(config.native_symmetry_plane),
+        "symmetry": beat_image_mode(config),
         "flat_target_normalization_enabled": False,
         "spherical_sampling_enabled": False,
         "source_motion": config.source_motion,
         "quadrature_order": int(config.quadrature_order),
         "singular_order": int(config.singular_order),
     }
+    if ground_plane_enabled(config):
+        # The half-space containment guard lives in the Julia driver, because
+        # only it sees the mesh after loading, scaling and translation.
+        solver_config["ground_plane_min_clearance_m"] = float(
+            config.ground_plane.min_clearance_m
+        )
     if "diagonal" in observation.planes:
         solver_config["diagonal_enabled"] = True
         solver_config["diagonal_inclination_deg"] = float(observation.inclination_deg)
@@ -193,6 +251,7 @@ def solve_frequencies(
     """
 
     reject_unsupported_native_symmetry(config)
+    reject_unsupported_ground_plane(config)
     frequencies = np.asarray(list(frequencies_hz), dtype=np.float64)
     if frequencies.size == 0:
         raise ValueError("frequencies_hz must contain at least one frequency")
@@ -217,10 +276,12 @@ def solve_frequencies(
         raise ValueError(
             f"mesh {mesh_path} has no triangles with source tag {config.source_tag}"
         )
-    symmetry_mode = beat_symmetry_mode(config.native_symmetry_plane)
+    symmetry_mode = beat_image_mode(config)
     symmetry_factor = _SYMMETRY_FACTOR[symmetry_mode]
 
-    translation = _validated_frame_translation(config.frame_override)
+    translation = _ground_placed_translation(
+        _validated_frame_translation(config.frame_override), config
+    )
     payload = _request_payload(mesh_path, frequencies, config, translation)
 
     started = time.time()

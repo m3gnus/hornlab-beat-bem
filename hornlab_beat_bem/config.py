@@ -20,12 +20,93 @@ BEAT_METAL = "metal"
 BEAT_BACKENDS = (BEAT_CPU, BEAT_CUDA, BEAT_ROCM, BEAT_METAL)
 
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
+GroundPlaneAxis = Literal["x", "y", "z"]
 
 #: WG native-symmetry plane -> BEAT Engine symmetry mode. BEAT mirrors across
 #: x=0 (``x``) or across both x=0 and y=0 (``xy``); it has no y-only mirror, so
 #: WG's ``xz`` half-domain (quadrants "12") is not representable without an
 #: axis swap that would also swap the observation cuts.
 _SYMMETRY_PLANE_TO_BEAT_MODE = {None: "off", "yz": "x", "yz+xz": "xy"}
+
+#: Ground-plane axis -> BEAT Engine symmetry mode. Separate from
+#: ``_SYMMETRY_PLANE_TO_BEAT_MODE`` on purpose: a mirror plane and a rigid
+#: half space are different physics that happen to share the solver's one
+#: ``symmetry`` field, and conflating them is how the 6 dB impedance defect
+#: got in. See ``beat_image_mode`` for the one place they are combined.
+#:
+#: BEAT's ``:ground`` is ``rigid_ground_transform()``, signs (1, -1, 1): the
+#: Y=0 plane and nothing else. That is exactly WG's default axis ``"y"``, the
+#: floor, so the common case needs no adaptation -- and the other two axes
+#: must be refused rather than substituted.
+_GROUND_AXIS_TO_BEAT_MODE: dict[str, str] = {"y": "ground"}
+
+#: Capability advertisement for WG's engine probe (``EngineInfo``). A flat
+#: boolean would claim a wall on any axis; this says which axes exist.
+GROUND_PLANE_AXES: tuple[str, ...] = ("y",)
+
+#: Index into a 3-vector for each ground-plane axis, so a caller can place the
+#: model without re-deriving the convention. Only ``"y"`` is solvable here;
+#: the full mapping exists so the refusal can name what it refused.
+GROUND_PLANE_AXIS_INDEX: dict[str, int] = {"x": 0, "y": 1, "z": 2}
+
+#: Sign tolerance on the half-space containment check, matching the fixed
+#: 1e-6 m Boundary Lab's ``deploy_solve.py`` enforces on the same geometry
+#: rather than a model-scale relative tolerance.
+GROUND_PLANE_TOLERANCE_M = 1.0e-6
+
+_GROUND_AXIS_DESCRIPTION = {
+    "x": "a side wall beside the horn",
+    "y": "the floor",
+    "z": "a rigid wall behind the throat",
+}
+
+
+@dataclass(frozen=True)
+class GroundPlane:
+    """One rigid, infinite, perfectly reflecting boundary through the origin.
+
+    Matches WG's ``SolveOptions.ground_plane`` wire shape. The plane is named
+    by the **axis it bounds**, never by an axis-pair token, because that token
+    means three different things across this workspace: boundary-lab ``"xy"``
+    is a quarter model, hornlab-bempp-bem ``"xy"`` is the z=0 plane, and BEAT
+    ``"xy"`` is x-and-y mirrors. Nothing here passes a plane token through by
+    name; ``_GROUND_AXIS_TO_BEAT_MODE`` is the only translation.
+
+    The fluid occupies ``axis >= 0``. ``height_m`` is the height of the model
+    origin above the plane, so the mesh is translated by ``+height_m`` along
+    the axis and the containment check is ``min(coord) + height_m >= 0``.
+    Equality is allowed and means the model rests on the plane.
+
+    ``enabled`` is the on/off signal: a disabled ground plane still carries an
+    axis, so the presence of this object is not enablement.
+    """
+
+    enabled: bool = False
+    axis: GroundPlaneAxis = "y"
+    height_m: float = 0.0
+    #: Optional demanded gap between body and plane. Zero permits contact
+    #: along an edge or vertex, which the Duffy correction handles.
+    min_clearance_m: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("ground_plane.enabled must be a bool")
+        if self.axis not in GROUND_PLANE_AXIS_INDEX:
+            raise ValueError("ground_plane.axis must be 'x', 'y', or 'z'")
+        for name in ("height_m", "min_clearance_m"):
+            try:
+                value = float(getattr(self, name))
+            except (TypeError, ValueError, OverflowError):
+                value = float("nan")
+            if not isfinite(value):
+                raise ValueError(f"ground_plane.{name} must be finite")
+            object.__setattr__(self, name, value)
+        if self.min_clearance_m < 0.0:
+            raise ValueError("ground_plane.min_clearance_m must be non-negative")
+
+    @property
+    def axis_index(self) -> int:
+        return GROUND_PLANE_AXIS_INDEX[self.axis]
 
 
 def _is_integral_value(value: object) -> bool:
@@ -197,6 +278,15 @@ class SolveConfig:
     #: ``xy`` are rejected by ``reject_unsupported_native_symmetry``.
     native_symmetry_plane: NativeSymmetryPlane | None = None
 
+    #: Rigid half space. A SEPARATE axis of configuration from
+    #: ``native_symmetry_plane``, with separate machinery: one reduces a
+    #: mirror-symmetric body to a fundamental domain whose images are real,
+    #: the other stands a whole body next to a boundary whose image is a
+    #: fiction. The solver carries a single image-transform set, so the two
+    #: cannot both be on -- ``reject_unsupported_ground_plane`` says so
+    #: explicitly rather than letting one quietly win.
+    ground_plane: GroundPlane | None = None
+
     # Mesh scale applied on load (1.0 = mesh already in metres).
     mesh_scale: float = 1.0
 
@@ -303,6 +393,10 @@ class SolveConfig:
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
             )
+        if isinstance(self.ground_plane, dict):
+            self.ground_plane = GroundPlane(**self.ground_plane)
+        if not isinstance(self.ground_plane, (GroundPlane, type(None))):
+            raise ValueError("ground_plane must be a GroundPlane, a dict, or None")
         if not _is_integral_value(self.quadrature_order) or int(self.quadrature_order) < 1:
             raise ValueError("quadrature_order must be a positive integer")
         if not _is_integral_value(self.singular_order) or not 1 <= int(self.singular_order) <= 12:
@@ -386,3 +480,72 @@ def reject_unsupported_native_symmetry(config: SolveConfig) -> None:
             f"quarter domains; {config.native_symmetry_plane!r} is not "
             "representable by the BEAT Engine solver"
         )
+
+
+def ground_plane_enabled(config: SolveConfig) -> bool:
+    """Whether this solve actually stands the body next to a rigid boundary."""
+
+    return config.ground_plane is not None and config.ground_plane.enabled
+
+
+def reject_unsupported_ground_plane(config: SolveConfig) -> None:
+    """Refuse a ground plane the BEAT Engine cannot express, before any solve.
+
+    Two refusals, both typed and both deliberate rather than defensive:
+
+    **Axis.** BEAT's rigid half space is ``rigid_ground_transform()``, signs
+    (1, -1, 1) -- the Y=0 plane and nothing else. WG's frame has z as the horn
+    axis and y as vertical, so axis ``"y"`` is the floor and is supported;
+    axis ``"x"`` is a side wall and axis ``"z"`` a rigid wall behind the
+    throat, and neither exists here. hornlab-bempp-bem does all three, so this
+    refusal fires in production -- substituting the floor for a wall would
+    answer confidently about the wrong room.
+
+    **Composition with native symmetry.** A ground plane on axis y destroys
+    the xz symmetry plane outright: the model is lifted clear of y=0, so it no
+    longer touches the mirror. WG degrades a quarter domain to ``half_yz`` for
+    exactly this reason. But the remaining yz half is not representable either
+    -- the solver's ``symmetry`` field selects ONE image-transform set, and
+    there is no ground-plus-x-mirror mode -- so a grounded solve here runs the
+    full domain. That is a real cost (roughly 4x a quarter solve), and it is
+    reported rather than silently absorbed.
+    """
+
+    if config.ground_plane is None or not config.ground_plane.enabled:
+        return
+
+    axis = config.ground_plane.axis
+    if axis not in _GROUND_AXIS_TO_BEAT_MODE:
+        description = _GROUND_AXIS_DESCRIPTION.get(axis, "that plane")
+        raise NotImplementedError(
+            "BEAT's rigid half space mirrors across y = 0 only; for a side "
+            "wall (x) or a rear wall (z), use BEMPP. "
+            f"ground_plane.axis={axis!r} is {description}, and "
+            f"hornlab-beat-bem supports {GROUND_PLANE_AXES!r}"
+        )
+
+    if config.native_symmetry_plane is not None:
+        raise NotImplementedError(
+            "hornlab-beat-bem cannot combine a ground plane with native "
+            f"symmetry: ground_plane.axis={axis!r} lifts the model clear of "
+            "y=0, which destroys the 'xz' mirror, and the BEAT Engine carries "
+            "a single image-transform set, so the surviving "
+            f"{config.native_symmetry_plane!r} mirror cannot be applied "
+            "alongside the ground image either. Solve the full domain with "
+            "native_symmetry_plane=None, or drop the ground plane."
+        )
+
+
+def beat_image_mode(config: SolveConfig) -> str:
+    """The single ``symmetry`` value the solver request carries.
+
+    The one place the two separate configuration axes -- mirror symmetry and
+    rigid half space -- collapse onto the solver's one field. Call
+    :func:`reject_unsupported_native_symmetry` and
+    :func:`reject_unsupported_ground_plane` first; this assumes a combination
+    that has already been found representable.
+    """
+
+    if ground_plane_enabled(config):
+        return _GROUND_AXIS_TO_BEAT_MODE[config.ground_plane.axis]
+    return beat_symmetry_mode(config.native_symmetry_plane)

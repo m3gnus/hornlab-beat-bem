@@ -56,6 +56,7 @@ Apple Silicon, the ROCm scripts need an AMD host.
 ```bash
 J=hornlab_beat_bem/julia
 julia --project=hornlab_beat_bem/julia          $J/tests/runtests.jl
+julia -t auto --project=hornlab_beat_bem/julia  $J/scripts/validate_analytic_exterior.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_exterior.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_symmetry.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_coupled.jl
@@ -96,6 +97,15 @@ because you were about to tighten it, that is the run to look at first.
 Do not weaken a tolerance to make a gate pass. The fused and symmetry gates
 compare two code paths that differ only in Float32 summation order, so their
 tolerances are noise floors and a real regression will not sit just above one.
+
+`validate_analytic_exterior.jl` is the exception to that shape, and the reason
+it exists: it scores against a **closed form**, not against another BEAT path.
+Its correct-case tolerances are discretisation error, which converges cleanly
+as O(h^2), so if it starts failing the answer is a finer fixture or a real
+defect — never a wider bound. Its controls must keep FAILING: a change that
+makes one pass has broken the gate even when every assertion is green. Note
+particularly that the controls are asserted on phase, because a globally
+conjugated kernel is invisible in level; do not "simplify" them onto SPL.
 
 ## Continuous integration
 

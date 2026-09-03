@@ -128,18 +128,85 @@ The Julia solver underneath:
 - observes polar cuts around the **global mesh origin** with the forward axis
   fixed to **+z** (horizontal cut in x-z, vertical in y-z);
 - reports a legacy-scaled impedance pair `[Re(F)/2, -Im(F)/2]` with
-  `F = 10 * sym_factor * sum(p_bar * area) / v`.
+  `F = 10 * sym_factor * sum(p_bar * area) / v`, where `sym_factor` counts
+  **real** radiators — so it is 1, 2 or 4 for a mirror-reduced mesh and 1 for
+  a ground plane, whose image is a fiction.
 
 Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
 `xy` (quarter, x >= 0 and y >= 0). A y-only `xz` half domain is not
 representable and is rejected by `reject_unsupported_native_symmetry`.
+
+### Rigid half space
+
+```python
+config = beat.SolveConfig(
+    ground_plane={"enabled": True, "axis": "y", "height_m": 1.0},
+)
+```
+
+One rigid, infinite, perfectly reflecting boundary through the origin, solved
+by the image method. **The plane is named by the axis it bounds, never by an
+axis-pair token**, because that token means three different things across this
+workspace: boundary-lab `"xy"` is a quarter model, hornlab-bempp-bem `"xy"` is
+the z=0 plane, and BEAT `"xy"` is x-and-y mirrors. Nothing is passed through by
+name here; `_GROUND_AXIS_TO_BEAT_MODE` in `config.py` is the only translation.
+
+The fluid occupies `axis >= 0`. `height_m` is the height of the model origin
+above the plane, so the mesh is translated by `+height_m` along the axis and
+the containment check is `min(coord) + height_m >= 0`; equality is allowed and
+means the model rests on the plane. `enabled` is the on/off signal — a disabled
+ground plane still carries an axis, so the field's presence is not enablement.
+
+**Axis `"y"` only.** BEAT's half space is `rigid_ground_transform()`, signs
+(1, -1, 1): the Y=0 plane and nothing else. In WG's frame (z the horn axis, y
+vertical) that is the floor, the ordinary case. Axis `"x"` is a side wall and
+`"z"` a rigid wall behind the throat, and both are refused by name rather than
+substituted — hornlab-bempp-bem does all three. `GROUND_PLANE_AXES` advertises
+`("y",)` so a capability probe can say which axes exist instead of a boolean.
+
+**It is not a symmetry plane, and does not compose with one.** The two are
+separate configuration axes with separate machinery, because they are different
+physics that happen to share the solver's one `symmetry` field:
+
+| | `native_symmetry_plane` | `ground_plane` |
+|---|---|---|
+| the mesh is | half or a quarter of a mirror-symmetric body | the whole body |
+| must reach the plane | yes, its rim lies on the cut | no, it may float clear |
+| a face lying in the plane | rejected | rejected |
+| the image is | part of the real radiator | fictitious |
+| reported impedance | multiplied by the copy count | counted once |
+
+A ground plane on axis y also *destroys* the xz mirror outright, since the
+model is lifted clear of y=0 and no longer touches it. WG degrades a quarter
+domain to a `yz` half for that reason — but BEAT carries a single
+image-transform set, so even the surviving half cannot ride alongside the
+ground image. A grounded solve here therefore runs the full domain, at roughly
+4x the cost of a quarter, and `reject_unsupported_ground_plane` says so rather
+than quietly picking one.
+
+The containment guard lives in the Julia driver
+(`validate_ground_plane_domain!`), because only it sees the mesh after loading,
+scaling and translation. It is ported from hornlab-metal-bem and rejects a body
+straddling the plane, any face lying flat in it — such a face is coincident
+with its own image and the boundary integral is singular there — and a gap
+below `min_clearance_m`. `validate_symmetry_fundamental_domain!` cannot do this
+job: `symmetry_active_axes(:ground)` is empty, so it is a no-op for this mode
+and a straddling body would otherwise solve in silence.
+
+The numbers are gated against a closed form, not against another BEAT path:
+case 3 of `validate_analytic_exterior.jl` scores the half-space **field**
+against the exact source-plus-image solution, and case 4 scores the reported
+**impedance**, which fails independently — the defect above left the field
+entirely correct. See [Validation](#validation).
 
 Supported: diagonal observation cuts, spherical balloon/DI grids (theta-major,
 so WG's DI integration and 3D balloon both work), axial source motion, and
 surface trace retention (`SolveConfig.surface_traces`, off by default).
 
 Not supported: multi-source drive -- exactly one velocity source tag at unit
-amplitude -- and WG's y-only `xz` half domain, per the symmetry note above.
+amplitude -- WG's y-only `xz` half domain, per the symmetry note above, a
+ground plane on any axis but `y`, and a ground plane combined with native
+symmetry.
 
 ### The one local patch to the vendored engine
 
@@ -426,14 +493,67 @@ a 2.95 mm shell rim is not resolved by 6.9 mm elements, and the two
 formulations express that error differently. Neither solver is wrong and the
 fix is the mesh.
 
+### Every other gate here is equivalence-based, and the one thing that cannot catch
+
+Every other exterior gate in this repository compares two BEAT code paths:
+Metal against CPU, a `:ground` half space against an explicitly mirrored full
+space, LU against GMRES. Each of those shares a kernel with what it checks, and
+a shared kernel is what such a comparison cannot see through. Conjugate the
+Green's function globally — `exp(+ikr)` becomes `exp(-ikr)`, the time
+convention silently inverted — and **both sides of every one of those
+equalities conjugate together**. That is measured, not argued: `runtests.jl`'s
+`rigid y0 half-space Green function` check reports a relative error of
+**1.203e-15 at +k and 1.203e-15 at -k**, bit-identical, and
+`validate_analytic_exterior.jl` prints that pair on every run so the blind spot
+stays visible.
+
+That script is the answer — a reference the kernel under test did not produce.
+Four cases and two controls, CPU backend, Float64:
+
+| case | what fixes the answer |
+|---|---|
+| 1 pulsating sphere, free field | closed form; includes the icosphere's faceting error, reported separately |
+| 2 interior monopole, free field | Neumann data of a point monopole at the centre, so the faceted surface is the exact boundary and geometry error is zero |
+| 3 rigid-image monopole over y=0, `symmetry_mode=:ground` | driven with the Neumann data of source-plus-image, which is the exact solution of the half-space Neumann problem |
+| 4 the ground image counts once | scores the reported **impedance**, a different failure surface from the field — see the ground-plane section |
+
+Measured at the defaults, identically on ubuntu-latest and macos-latest:
+0.0223 / 0.0188 / 0.0203 dB worst level and 0.233 / 0.077 / 0.094 deg worst
+phase for cases 1–3, and +0.0004 dB of impedance movement for case 4.
+
+**The controls are asserted on phase, and that is a measured decision, not a
+stylistic one.** For a real-velocity drive the Neumann data are purely
+imaginary, so `conj(q) = -q`; every operator conjugates under `k -> -k`, and
+the radiated field satisfies `field(-k) = -conj(field(+k))` exactly. Measured
+on the case-1 drive, the conjugated solve's worst level error is
+`0.022304990113225294` dB and the correct solve's is
+`0.022304990113225294` dB — **bitwise identical**, field difference
+`0.000e+00` — while its phase is out by 90.7 degrees. A gate scoring SPL alone
+does not merely pass a solver radiating incoming waves; it awards it a score
+indistinguishable from a correct one, and no amount of tightening the level
+tolerance can fix that.
+
+That identity is conditional on the drive, and the condition is the production
+case rather than a special one: a real normal velocity is what WG drives with,
+so the bitwise-invisible regime is the one that ships. Under case 2's
+general-phase drive the identity breaks and the two differ in the fifth
+significant figure (0.018798 against 0.018793 dB) — still far inside the pass
+tolerance, so the conclusion holds either way.
+
+The controls are also not asserted on a relative-error percentage, because that
+tracks ka rather than the presence of the defect: 21.7% at 400 Hz, 142.5% at
+1000 Hz, 136.2% at 2000 Hz, so a floor calibrated at one frequency silently
+stops controlling at another.
+
 ### Gates in this repository
 
 Every script runs against the bundled fixtures and prints its tolerances.
 
 | script | what it gates |
 |---|---|
+| `validate_analytic_exterior.jl` | the radiated field and the reported impedance against a **closed form** rather than another BEAT path, with two controls that must fail — see below |
 | `validate_metal_exterior.jl` | Metal operators, boundary pressure and radiated field against the CPU build |
-| `validate_metal_symmetry.jl` | the same across symmetry off / x / xy, where a sign slip in the image-singular correction would otherwise be silent |
+| `validate_metal_symmetry.jl` | the same across symmetry off / x / xy / ground, where a sign slip in the image-singular correction would otherwise be silent. The ground case runs twice: lifted clear of the plane, and resting on it, which is what puts real and image elements in coincident and adjacent pairs (389 image singular pairs against 0 for the lifted case) |
 | `validate_metal_coupled.jl` | the coupled FEM-BEM-LEM paths, monolithic and condensed, against the pure CPU build |
 | `validate_metal_fused_burton_miller.jl` | the fused system against the four-operator system on the same mesh, frequency and quadrature — Float32 summation order is the only difference, so the tolerance is noise, not physics |
 | `validate_gmres_burton_miller.jl` | the adaptive solve on a real assembled operator across the band: LU agreement, true residual, three independent Krylov variants agreeing on the iteration count, independence from the restart length, and that plain Float32 single Gram-Schmidt is materially worse |
@@ -443,6 +563,7 @@ Every script runs against the bundled fixtures and prints its tolerances.
 ```bash
 J=hornlab_beat_bem/julia
 julia --project=hornlab_beat_bem/julia          $J/tests/runtests.jl
+julia -t auto --project=hornlab_beat_bem/julia  $J/scripts/validate_analytic_exterior.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_exterior.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_symmetry.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_coupled.jl
