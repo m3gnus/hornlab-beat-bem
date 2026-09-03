@@ -1,12 +1,14 @@
 """Fail the build when a runner that should have Julia silently does not.
 
-Three test files in ``tests/`` -- ``test_solve_smoke.py``,
-``test_near_correction.py`` and ``test_engine_bundles.py`` -- take a ``julia``
-fixture that calls ``pytest.skip`` when ``discover_julia()`` returns ``None``.
-That guard is right for a developer without the runtime installed. In CI it is
-not: it turns a missing Julia into three skips and a green badge over a suite
-that never ran a single BEM solve. Measured on this repository, ``pytest -m
-slow`` with no Julia on PATH reports ``3 skipped`` and exits 0.
+Four test files in ``tests/`` -- ``test_solve_smoke.py``,
+``test_near_correction.py``, ``test_engine_bundles.py`` and
+``test_ground_plane.py`` -- take a ``julia`` fixture that calls ``pytest.skip``
+when ``discover_julia()`` returns ``None``. That guard is right for a developer
+without the runtime installed. In CI it is not: it turns a missing Julia into
+skips and a green badge over a suite that never ran a single BEM solve.
+Measured on this repository, ``pytest`` with no Julia discoverable reports
+``90 passed, 8 skipped`` and exits 0 -- three files and three skips when this
+script was written, so do not read the number as fixed.
 
 So resolve Julia the way the package itself does, prove the executable runs,
 and print what was found. CI calls this before pytest so a lost runtime reads
