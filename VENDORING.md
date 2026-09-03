@@ -130,6 +130,16 @@ The `julia_cuda/` project files carry one local addition, described below.
 
 ## What is modified, and why
 
+### Two runtime defaults, set from `hornlab_beat_bem/worker.py`
+
+Not source differences — the vendored solver is unchanged — but they mean this
+package's out-of-the-box behaviour is not upstream's, so they are listed here
+too. `BLAB_METAL_PIPELINE` defaults to `0` rather than `1`, and
+`julia_threads="auto"` resolves to the performance-core count rather than
+`os.cpu_count()`. Both are `setdefault`-style: an explicit environment variable
+or an explicit `julia_threads` wins, and both were measured rather than
+assumed. See the README's "Sweep threads and sweep pipelining".
+
 ### `hornlab_beat_bem/julia/solver.jl` and `BeatEngineDriver.jl`
 
 The cold-start sync split this file. `solver.jl` is now the worker entry point
@@ -228,7 +238,7 @@ application in places — `blab` CLI commands, `.blab.json` projects, solver
 selection in application preferences. Those describe upstream, not this package.
 
 **Where these docs are superseded.** They are upstream's, kept verbatim rather
-than corrected, so two statements in them are narrower than they read and the
+than corrected, so three statements in them are narrower than they read and the
 README carries the measured version:
 
 - `beat-engine-metal.md`'s summary bullet "the default `pair_gather` kernels
@@ -242,6 +252,16 @@ README carries the measured version:
 - `beat-engine-core.md` at `f536d9e` already records the A1r routing
   regression, so it is current; earlier copies of it claimed the operator
   never stagnates, which is retired.
+- `beat-engine-metal.md` describes the sweep pipelining as the shipped
+  behaviour. It is upstream's default and **not this package's**: `worker.py`
+  sets `BLAB_METAL_PIPELINE=0` unless the environment already names a value,
+  because the overlap is measurably slower here (M1 Max, asro68 quarter,
+  12 frequencies, five interleaved rounds: 2.105 s sequential against 2.313 s
+  pipelined, and 2.792 s against 3.050 s at the old thread default). The
+  mechanism is that Metal.jl's command queues are task-local, so the spawned
+  assembly task builds a new queue every frequency. The solver source is
+  untouched; setting `BLAB_METAL_PIPELINE=1` restores upstream's behaviour
+  exactly, and the two paths agree to 3e-4 dB.
 
 ## What is deliberately not vendored
 

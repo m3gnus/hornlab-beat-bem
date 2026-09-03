@@ -252,6 +252,9 @@ class SolveConfig:
     beat_backend: Literal["cpu", "cuda", "rocm", "metal"] = "cpu"
     julia_executable: str | None = None
     julia_project: str | Path | None = None
+    #: "auto" resolves to the performance-core count, not os.cpu_count(); the
+    #: Metal path hands this straight to BLAS, and a factorization thread on an
+    #: efficiency core holds up the rest. An explicit count is used as given.
     julia_threads: str | int = "auto"
     julia_sysimage: str | Path | None = None
     persistent_worker: bool = True

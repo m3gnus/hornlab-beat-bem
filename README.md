@@ -465,13 +465,56 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |
+| `BLAB_METAL_PIPELINE` | `0` here, `1` upstream | `1` overlaps the next frequency's GPU assembly with this one's CPU solve. Measured slower; see below |
 | `BLAB_BEAT_ENGINE_BUNDLE` | `1` | `0` ignores the precompiled bundle and includes the engine from source: bit-identical to the pre-bundle package, at the old cold start |
 | `HORNLAB_BEAT_JULIA` | — | explicit Julia executable |
 | `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available |
 
 `docs/beat-engine-metal.md` and `docs/beat-engine-core.md` list the rest.
-Those pages are Boundary Lab's, kept verbatim; `VENDORING.md` notes the two
+Those pages are Boundary Lab's, kept verbatim; `VENDORING.md` notes the
 places where this README's measurements supersede them.
+
+### Sweep threads and sweep pipelining
+
+Two defaults differ from upstream's. Both are set from `worker.py`, so the
+vendored solver is unmodified and either can be put back with one environment
+variable.
+
+Measured on an M1 Max (8 performance + 2 efficiency cores) against the ATH
+`asro68` quarter model — 1,209 P1 dofs, Metal backend, fused Burton-Miller —
+sweeping 12 frequencies from 300 Hz to 12 kHz on a warm worker. Five
+interleaved rounds, minimum reported, medians in brackets:
+
+| | `JULIA_NUM_THREADS=8` | `=10` (`os.cpu_count()`) |
+|---|---|---|
+| `BLAB_METAL_PIPELINE=0` | **2.105 s** (2.138) | 2.792 s (2.926) |
+| `BLAB_METAL_PIPELINE=1` | 2.313 s (2.334) | 3.050 s (3.115) |
+
+The two effects are independent and compose: 1.09-1.10x from the pipelining,
+1.32-1.33x from the thread count, **1.45x** from the pair. All four arms agree
+to 3e-4 dB, which is the assembly's own run-to-run noise floor — the native
+singular correction scatters with atomics.
+
+**`julia_threads="auto"` counts performance cores, not all cores.** The Metal
+path sets BLAS to `Threads.nthreads()`, so `os.cpu_count()` put 2 of 10
+factorization threads on the efficiency cores and the other 8 waited for them.
+On a symmetric part this resolves to the same number as before.
+
+**`BLAB_METAL_PIPELINE` defaults off.** Assembling frequency i+1 on a spawned
+task while the CPU solves frequency i costs about 10% rather than saving
+anything, because Metal.jl's command queues are task-local and the spawned task
+builds a new one every frequency. This was first measured as a larger penalty
+at the old 10-thread default, which suggested it was an artifact of
+oversubscribing the performance cores; the table above rules that out, since it
+costs the same 1.09x at 8 threads.
+
+Nor is there much to win by fixing it rather than switching it off. Instrumented
+separately on this model, the sweep is **6.10 s of GPU assembly and field
+evaluation against a 1.51 s CPU solve** — the solve is 20% of the work, so a
+*perfect* scheduler reaches ~6.1 s against 7.74 s, about **1.10x**, and neither
+arm has an idle core to reclaim. An engine that overlaps frequencies and is
+further ahead than that is ahead on assembly speed; the overlap is a consequence
+of having a large CPU share to hide behind, not a separate thing to copy.
 
 ## Licence and provenance
 
