@@ -2,21 +2,21 @@
 #
 # `coupled_condensed_tests.jl` lines 592 and 618 assert bitwise equality between
 # the forked condensed assembly and the shared CPU assembly at `symmetry == :off`,
-# and fail intermittently on AVX-512 hosts by one Float32 ULP. A pass/fail is a
-# thin signal for an intermittent: it cannot say which of the four operators
-# disagreed, how many entries did, or by how much. This reproduces the same
-# comparison and reports those numbers.
+# and fail on AVX-512 hosts. A pass/fail is a thin signal: it cannot say which of
+# the four operators disagreed, how many entries did, or by how much. This
+# reproduces the same comparison and reports those numbers.
 #
 # It deliberately does not assert. The suite is the experiment's measurement --
 # run it the way CI runs it -- and this is the diagnostic beside it, so it must
 # not fail a job that is collecting a control arm. Exit status is always 0.
 #
-# Note the probe may well agree where the suite disagrees. The leading hypothesis
-# is allocation-dependent code generation, and a process that runs this
-# comparison alone reaches it with a different heap and a different set of
-# already-compiled methods than one that has run thirty testsets first. A quiet
-# probe is therefore not evidence of a quiet suite; it is evidence about this
-# process.
+# This was written expecting it might stay quiet where the suite disagreed, on
+# the theory that the divergence needed a particular allocation history. It does
+# not: on an AVX-512 host it reproduces on its own, in about 25 seconds, in a
+# process that has run nothing else, with the same 201 and 205 differing entries
+# the suite sees. That is why the reported numbers can be trusted as the
+# suite's, and it makes this a standalone reproducer rather than only a
+# diagnostic.
 
 # Include order mirrors `runtests.jl`: the core module, then `BeatEngineCoupled`
 # (which `coupled_solver_tests.jl` brings in one file earlier and which
@@ -58,6 +58,7 @@ function compare(forked::AbstractMatrix, shared::AbstractMatrix)
     differing = 0
     worst = 0
     entry_rel = 0.0
+    max_abs = 0.0
     first_index = nothing
     for index in eachindex(forked, shared)
         left = forked[index]
@@ -68,6 +69,7 @@ function compare(forked::AbstractMatrix, shared::AbstractMatrix)
         if gap > worst
             worst = gap
         end
+        max_abs = max(max_abs, Float64(abs(left - right)))
         scale = max(abs(left), abs(right))
         if scale > 0
             entry_rel = max(entry_rel, abs(left - right) / scale)
@@ -78,7 +80,13 @@ function compare(forked::AbstractMatrix, shared::AbstractMatrix)
     end
     norm_rel = differing == 0 ? 0.0 :
                norm(forked - shared) / max(norm(forked), norm(shared))
-    return (; differing, worst, entry_rel, norm_rel, first_index, total=length(forked))
+    # `operator_scale` is what an absolute entrywise floor would be set against:
+    # a tolerance tied to the operator's own largest entry, rather than to each
+    # differing entry's magnitude, is the one measure that neither a norm test nor
+    # a per-entry relative test gives.
+    operator_scale = Float64(maximum(abs, shared))
+    return (; differing, worst, entry_rel, norm_rel, max_abs, operator_scale,
+              first_index, total=length(forked))
 end
 
 function report(label, forked, shared)
@@ -88,7 +96,8 @@ function report(label, forked, shared)
                    string(Tuple(CartesianIndices(getproperty(forked, operator))[result.first_index]))
         println("probe $label $operator differing=$(result.differing)/$(result.total) " *
                 "max_ulp=$(result.worst) norm_rel=$(result.norm_rel) " *
-                "entry_rel=$(result.entry_rel) first=$location")
+                "entry_rel=$(result.entry_rel) max_abs=$(result.max_abs) " *
+                "operator_scale=$(result.operator_scale) first=$location")
     end
 end
 
