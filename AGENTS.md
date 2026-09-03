@@ -223,6 +223,28 @@ needs no particular allocation history, and the earlier "allocation-dependent
 loop-tail vectorisation" candidate was narrower than it needed to be: two
 separately compiled bodies is enough.
 
+**Windows is untested on the arm that matters, and one null does not change
+that.** Every draw above is Linux; macOS is exempt only because it is aarch64.
+Nothing in the mechanism is Linux-specific -- it is LLVM's codegen for an x86
+AVX-512 target -- so the prediction is that a Windows host whose CPU exposes
+AVX-512 fails identically. That prediction is **not** confirmed. It was checked
+on 2026-09-03 on the workspace Windows box, which turned out to be a Ryzen 7
+5825U: `znver3`, `avx512f false` by `IsProcessorFeaturePresent`. The probe
+reported zero differences and the suite gave 424 passed, 0 failed, 1 broken --
+the same counts as macOS, exit 0.
+
+That is a correct null and it discriminates nothing, because the host has no
+AVX-512 to mask. Do not read it as "Windows passes, so it is not the ISA". The
+one fact it does add is that the failure is not merely "x86 on a non-Apple OS":
+this host is x86, non-Apple, and green. The masked control was deliberately
+**not** run there -- on a CPU without AVX-512 the mask is a no-op, and a second
+null would look like a control arm without being one.
+
+Closing this needs a Windows host reporting `avx512f true` -- Intel Ice Lake or
+later, or Zen 4/5 with AVX-512 not hidden by the hypervisor. Until then, a
+Windows developer on an AVX-512 workstation should expect these four assertions
+red on correct code, and should read this section before "fixing" them.
+
 **The contract decision is open and belongs to Magnus.** The mechanism above is
 the evidence the earlier note asked for before anyone touched the assertion; it
 is not permission to touch it. `coupled_condensed_tests.jl` is vendored (see
