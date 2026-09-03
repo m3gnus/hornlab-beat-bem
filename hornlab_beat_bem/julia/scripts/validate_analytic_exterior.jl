@@ -33,6 +33,16 @@ So this script fixes the *absolute* answer, against closed forms:
           with `symmetry_mode=:ground`. That pair is the exact solution of the
           half-space Neumann problem, so this is closed-form, not equivalence.
 
+  Case 4  the ground image is not a second radiator. Cases 1-3 all score the
+          radiated FIELD; this one scores the reported IMPEDANCE, which is a
+          different failure surface reached through different code -- the
+          driver's force scaling, the `[Re(F)/2, -Im(F)/2]` wire packing, and
+          `sweep.py`'s `_SYMMETRY_FACTOR`. A rigid image is fictitious, so it
+          must be counted once; counting it as a transform, the way a mirror
+          symmetry legitimately is, doubles the integrated force and reports
+          6.02 dB too much impedance over a field that is entirely correct.
+          Case 3 cannot see that, because the field is right.
+
 and then two deliberate controls that MUST fail:
 
   Control A  a globally conjugated kernel. Realised exactly, without touching
@@ -51,13 +61,25 @@ and then two deliberate controls that MUST fail:
              BEAT's image sign were wrong, BEAT would match this reference and
              miss the rigid one, and the Case 3 assertion would fail.
 
-Both controls are asserted on PHASE. That is a measured decision: a globally
-conjugated kernel is very nearly invisible in level. In free field at the
-defaults the conjugated solve sits 0.019 dB from the closed form -- inside this
-gate's own pass tolerance -- and is out by 90.7 degrees of phase. So an
-analytic gate that compared SPL magnitude alone would pass a conjugated kernel
-too, and would be only marginally better than the equivalence tests it
-replaces. See the comment above the control assertions for why a fixed
+Both controls are asserted on PHASE, and no level tolerance can substitute.
+For a real-velocity drive the Neumann data are purely imaginary, so
+conj(q) = -q, every operator conjugates under k -> -k, and the radiated field
+satisfies field(-k) = -conj(field(+k)) exactly. Measured on the Case 1 drive:
+the conjugated solve's worst level error is 0.022304990113225294 dB and the
+correct solve's is 0.022304990113225294 dB -- bitwise identical, with a field
+difference of 0.000e+00. A magnitude-only gate does not merely pass a
+conjugated kernel, it awards it a score indistinguishable from a correct one,
+and tightening the level tolerance can never fix that.
+
+The identity is conditional on that drive, and the condition is the production
+case rather than a special case: a real normal velocity is what WG drives with,
+so the bitwise-invisible regime is the one that ships. With a general-phase
+drive conj(q) = -q fails, the identity breaks, and the two differ in the fifth
+significant figure -- which is why Case 2's conjugated and correct level errors
+are close (0.018798 against 0.018793 dB) rather than equal. Close is still far
+inside the pass tolerance, so the conclusion is unchanged either way.
+
+See the comment above the control assertions for why a fixed
 relative-error percentage is unsafe as well.
 
 Conventions, read out of the vendored source rather than assumed:
@@ -115,6 +137,9 @@ using StaticArrays
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
+# Case 4 calls the driver's own `impedance_for_radiators` rather than a
+# reimplementation of it, so what it scores is what a solve actually reports.
+include(joinpath(@__DIR__, "..", "BeatEngineDriver.jl"))
 
 const FloatType = Float64
 const SOUND_SPEED = FloatType(343.0)
@@ -542,6 +567,73 @@ function validate_analytic_exterior()
     println("Case 3  rigid-image monopole over y = 0, symmetry_mode=:ground")
     case3 = report("  beat vs closed form", ground.field, ground_reference)
 
+    # -- Case 4: the ground image is not a second radiator ------------------
+    #
+    # Everything above scores the radiated field. This scores the reported
+    # impedance, which fails independently: `impedance_for_radiators` scaled
+    # the integrated surface force by `symmetry_reduction_factor(mode)`, a
+    # count of image TRANSFORMS. That is the right multiplier when the images
+    # are real radiators -- under `:x` and `:xy` the mesh is half or a quarter
+    # of a mirror-symmetric body and the missing halves radiate -- but a rigid
+    # ground image is a fiction standing in for a boundary. Counting it
+    # reported a factor 2, 20*log10(2) = 6.02 dB, too much impedance over a
+    # field Case 3 would have passed.
+    #
+    # The body sits far enough above the plane that its own image barely loads
+    # it, so the physical move is a fraction of a dB and anything larger is the
+    # defect. The control re-applies the transform count to the same
+    # measurement, so the gate's teeth are measured rather than assumed.
+    impedance_height = env_float("BLAB_ANALYTIC_IMPEDANCE_HEIGHT_M", 20 * sphere_radius)
+    impedance_mesh = icosphere(
+        sphere_radius, subdivisions;
+        centre=SVector{3,FloatType}(0, impedance_height, 0), tag=2,
+    )
+    impedance_q = fill(
+        Complex{FloatType}(0, AIR_DENSITY * omega) * velocity,
+        length(impedance_mesh.faces),
+    )
+    impedance_mesh_ids = ones(Int, length(impedance_mesh.faces))
+    impedance_radiators = [Dict("tag" => 2, "mesh_id" => 1, "name" => "pulsating")]
+    impedance_drives = Complex{FloatType}[velocity]
+    probe = [SVector{3,FloatType}(observation_radius, impedance_height, 0)]
+
+    reported_impedance(symmetry_mode::Symbol) = begin
+        solved = beat_exterior_field(
+            impedance_mesh, impedance_q, k, probe;
+            symmetry_mode=symmetry_mode,
+            regular_order=regular_order, singular_order=singular_order,
+        )
+        pair = impedance_for_radiators(
+            impedance_mesh, impedance_mesh_ids, solved.pressure,
+            impedance_radiators, impedance_drives, FloatType;
+            symmetry_mode=symmetry_mode,
+        )[1]
+        # Undo the wire packing `sweep.py` undoes: [Re(F)/2, -Im(F)/2].
+        2 * FloatType(pair[1]) - 2im * FloatType(pair[2])
+    end
+
+    println()
+    println("Case 4  the ground image counts as one radiator, not two")
+    @printf(
+        "  body at y=%.3f m, %.0f radii above the plane, image separation %.2f wavelengths
+",
+        impedance_height, impedance_height / sphere_radius,
+        2 * impedance_height * frequency / SOUND_SPEED,
+    )
+    free_impedance = reported_impedance(:off)
+    ground_impedance = reported_impedance(:ground)
+    impedance_move_db = 20 * log10(abs(ground_impedance) / abs(free_impedance))
+    transform_count = FloatType(symmetry_reduction_factor(:ground))
+    defect_move_db = 20 * log10(transform_count * abs(ground_impedance) / abs(free_impedance))
+    @printf("  reported impedance, ground vs free: %+.4f dB
+", impedance_move_db)
+    @printf(
+        "  control, force scaled by symmetry_reduction_factor(:ground)=%d: %+.4f dB, MUST FAIL
+",
+        Int(transform_count), defect_move_db,
+    )
+    flush(stdout)
+
     # -- Control A: globally conjugated kernel -----------------------------
     println()
     println("Control A  globally conjugated kernel (k -> -k), MUST FAIL")
@@ -627,6 +719,30 @@ function validate_analytic_exterior()
 
     equivalence_conjugated <= 10 * max(equivalence_forward, eps(FloatType)) ||
         error("The image-equivalence check no longer passes at -k; Control A's premise needs re-deriving.")
+
+    # Case 4's bound is on the reported number, not the field. It is loose
+    # against the defect it guards (6.02 dB) and tight against the physics
+    # (a body this far from the plane is barely loaded by its own image), so
+    # the gap between them is the whole margin and there is no reason to widen
+    # it. The control asserts the gate would have caught the defect, because a
+    # bound wide enough to pass the fix could also be wide enough to pass the
+    # bug.
+    tolerance_impedance_db = FloatType(1.0)
+    @printf(
+        "tolerance impedance move <=%.2f dB, control >%.2f dB
+",
+        tolerance_impedance_db, tolerance_impedance_db,
+    )
+    abs(impedance_move_db) <= tolerance_impedance_db || error(
+        "Case 4: reported impedance moved $(impedance_move_db) dB between ground-off " *
+        "and ground-on for a body $(impedance_height / sphere_radius) radii above the " *
+        "plane. A fictitious image is being counted as a second radiator."
+    )
+    abs(defect_move_db) > tolerance_impedance_db || error(
+        "Case 4 control did not fail: scaling the force by the transform count moved " *
+        "the reported impedance only $(defect_move_db) dB, so this gate could not have " *
+        "caught the defect it exists for."
+    )
 
     println("ANALYTIC_EXTERIOR_VALIDATION_OK")
 end

@@ -79,10 +79,84 @@ function validate_crossover_config(owner_name::String, crossover)
     end
 end
 
+# `symmetry` selects one image-transform set, and the solver carries exactly
+# one. Three of its four values are mirror symmetries of a REDUCED mesh, whose
+# images are part of the real radiator; `ground` is a rigid half space, whose
+# single image is fictitious and whose mesh is the WHOLE body. They are
+# different contracts sharing one field, so everything downstream that asks
+# "how many copies of the radiator are there?" -- `impedance_for_radiators`
+# most of all -- has to distinguish them rather than counting transforms.
+#
+# `ground` mirrors across Y=0 only (`rigid_ground_transform`), so a wall on
+# another axis is not expressible here; the Python wrapper refuses those by
+# axis rather than substituting one.
 function symmetry_mode_from_config(config)
     mode = lowercase(strip(String(get_value(config, "symmetry", "off"))))
-    mode in ("off", "x", "xy") || error("Unsupported symmetry mode: $(mode). Expected off, x, or xy.")
+    mode in ("off", "x", "xy", "ground") ||
+        error("Unsupported symmetry mode: $(mode). Expected off, x, xy, or ground.")
     return mode
+end
+
+# The mesh guard `validate_symmetry_fundamental_domain!` cannot supply: its
+# active axes are empty for `:ground`, so without this a body straddling the
+# plane assembles and solves in silence, against a domain that does not exist.
+#
+# Ported from hornlab-metal-bem (`metal/geometry.py`,
+# `validate_native_ground_plane`). The contract differs from the symmetry one
+# in both directions: the body is NOT required to reach the plane -- it may
+# float clear -- but it IS required to lie wholly on the fluid side, and no
+# face may lie flat in the plane, because such a face coincides with its own
+# image and the boundary integral is singular there.
+#
+# The tolerance is Boundary Lab's fixed 1e-6 m rather than a model-scale
+# relative one, matching what `deploy_solve.py` enforces on the same geometry.
+function validate_ground_plane_domain!(
+    mesh,
+    mode;
+    min_clearance_m::Real=0.0,
+    tolerance::Real=1.0e-6,
+)
+    Symbol(mode) == :ground || return nothing
+    isempty(mesh.faces) && error("symmetry=ground requires a mesh with faces.")
+
+    axis = 2                       # rigid_ground_transform() is (1, -1, 1)
+    minimum_y = Inf
+    for face in mesh.faces, vertex_index in face
+        minimum_y = min(minimum_y, Float64(mesh.vertices[vertex_index][axis]))
+    end
+    if minimum_y < -tolerance
+        error(
+            "symmetry=ground is a rigid half-space boundary at Y=0: the whole " *
+            "mesh must lie at Y >= 0, but its minimum Y is $(minimum_y) m. " *
+            "Translate the body above the plane; the solver will not clip it."
+        )
+    end
+
+    for (face_index, face) in enumerate(mesh.faces)
+        flat = true
+        for vertex_index in face
+            if abs(Float64(mesh.vertices[vertex_index][axis])) > tolerance
+                flat = false
+                break
+            end
+        end
+        if flat
+            error(
+                "symmetry=ground treats Y=0 as an image plane, not a physical " *
+                "boundary; triangle $(face_index) lies flat on it and would " *
+                "coincide with its own image. Delete the ground-contact faces, " *
+                "or lift the body clear of the plane."
+            )
+        end
+    end
+
+    if min_clearance_m > 0.0 && minimum_y < min_clearance_m
+        error(
+            "symmetry=ground requires at least $(min_clearance_m) m of " *
+            "clearance, but the mesh reaches Y=$(minimum_y) m."
+        )
+    end
+    return nothing
 end
 
 function beat_backend_from_request(request)
@@ -893,8 +967,25 @@ function radiator_drives_from_channel_basis(radiators, channels, freq, correctio
     ]
 end
 
+# `symmetry_reduction_factor` counts image TRANSFORMS, which is the right
+# multiplier only when every image is a real radiator. Under `:x` and `:xy` it
+# is: the mesh is a half or a quarter of a mirror-symmetric body, and the
+# missing halves radiate. Under `:ground` it is not: the mesh is the whole
+# body, and its one image is a fiction that stands in for a rigid boundary.
+# Counting that image would report twice the integrated force -- a factor 2 on
+# a complex force, so 20*log10(2) = 6.02 dB on the reported impedance -- for a
+# solve whose pressure field is entirely correct. hornlab-metal-bem documents
+# the same trap under "Rigid Half Space": radiated surface power is
+# "multiplied by the copy count" for a symmetry plane and "counted once" for a
+# ground plane.
+#
+# `hornlab_beat_bem/sweep.py` divides the wire force by the matching
+# `_SYMMETRY_FACTOR`, so the two constants have to move together; `"ground": 1`
+# there is the other half of this fix.
 function impedance_for_radiators(mesh, element_mesh_ids, pressure, radiators, drives, ::Type{T}; symmetry_mode::Symbol=:off) where {T<:AbstractFloat}
-    force_scale = eltype(pressure)(symmetry_reduction_factor(symmetry_mode))
+    force_scale = eltype(pressure)(
+        symmetry_mode == :ground ? 1 : symmetry_reduction_factor(symmetry_mode)
+    )
     impedance = Vector{Vector{Float32}}()
     for (radiator_index, radiator) in enumerate(radiators)
         drive = drives[radiator_index]
@@ -1030,6 +1121,10 @@ function solve_request_impl(request)
     mesh, element_mesh_ids = load_combined_mesh(mesh_inputs, FloatType)
     mesh = snap_symmetry_planes(mesh, Symbol(symmetry_mode))
     validate_symmetry_fundamental_domain!(mesh, Symbol(symmetry_mode))
+    validate_ground_plane_domain!(
+        mesh, Symbol(symmetry_mode);
+        min_clearance_m=Float64(get_value(config, "ground_plane_min_clearance_m", 0.0)),
+    )
     validate_radiator_elements(mesh, element_mesh_ids, radiators)
     p1_space = build_p1_space(mesh)
     dp0_space = build_dp0_space(mesh)

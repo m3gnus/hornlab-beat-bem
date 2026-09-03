@@ -143,7 +143,6 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 |---|---|
 | `hornlab_beat_bem/julia/src/*.jl` (41 files) | `src/blab/solvers/julia_local/src/` |
 | `hornlab_beat_bem/julia/coupled_solver.jl` | `src/blab/solvers/julia_local/coupled_solver.jl` |
-| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | `src/blab/solvers/julia_local/` |
 | `hornlab_beat_bem/julia_engine/BeatEngine{Cpu,Cuda,Rocm,Metal}Bundle/` | `src/blab/solvers/julia_engine/` |
 | `hornlab_beat_bem/julia/{Project,Manifest}.toml` | `src/blab/solvers/julia_local/` |
 | `hornlab_beat_bem/julia_rocm/{Project,Manifest}.toml` | `src/blab/solvers/julia_rocm/` |
@@ -151,7 +150,7 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 | `hornlab_beat_bem/julia/test_meshes/*.msh` | `src/blab/solvers/julia_local/test_meshes/` |
 | `hornlab_beat_bem/julia/test_fixtures/*.msh` | `tests/fixtures/{femvolume,exterior_conforming}.msh` |
 | `hornlab_beat_bem/julia/tests/runtests.jl` | `src/blab/solvers/julia_local/tests/` |
-| `hornlab_beat_bem/julia/scripts/*.jl`, except the four listed below | `src/blab/solvers/julia_local/scripts/` |
+| `hornlab_beat_bem/julia/scripts/*.jl`, except the five listed below and `validate_analytic_exterior.jl`, which is new here | `src/blab/solvers/julia_local/scripts/` |
 
 Six of those files are taken from the two 2026-09-03 branches above rather than
 from the `3ebc90a` sync commit; they are verbatim copies of *those* commits.
@@ -159,6 +158,11 @@ from the `3ebc90a` sync commit; they are verbatim copies of *those* commits.
 Every numerical result this package produces comes from those files, and they
 are unmodified. That is deliberate: it is what lets the extraction be verified
 by identity rather than by tolerance.
+
+`BeatEngineDriver.jl` is deliberately absent from that list. It is upstream's
+file, produced by a three-way merge and overwhelmingly upstream's code, but it
+is the one place this package's local decisions live and it is not byte-for-byte
+identical to any upstream commit. The section below enumerates every difference.
 
 The `julia_cuda/` project files carry one local addition, described below.
 
@@ -193,9 +197,10 @@ Upstream moved the BLAS thread call into `main` on purpose: precompiled into a
 bundle, load time is the *build* machine's, and the thread count has to be the
 running machine's.
 
-The three decisions were made when this file first diverged, in a three-way
-merge of upstream `42c8781` (base), this repository's `c207139` (ours) and
-upstream `e862240` (theirs). They are unchanged:
+The first three decisions were made when this file first diverged, in a
+three-way merge of upstream `42c8781` (base), this repository's `c207139`
+(ours) and upstream `e862240` (theirs). They are unchanged; a fourth was added
+on 2026-09-03:
 
 1. **One merge conflict, resolved toward upstream.** Upstream restructured the
    per-channel solve to take the fused path when it is available; this
@@ -213,6 +218,33 @@ upstream `e862240` (theirs). They are unchanged:
    application's own solve schemas; it is application scope, not solver scope.
    `solve_request` therefore keeps this repository's shape: it calls
    `solve_request_impl` and always runs the accelerator cleanup.
+4. **The rigid half space is reachable, guarded, and counted once.** Three
+   changes, all local, added 2026-09-03:
+   - `symmetry_mode_from_config` accepts `"ground"`. The engine in `src/` has
+     implemented `rigid_ground_transform()` all along and `tests/runtests.jl`
+     gates it, but the driver's request parser accepted only `off`/`x`/`xy`,
+     so no request could reach it.
+   - `impedance_for_radiators` no longer scales the integrated force by
+     `symmetry_reduction_factor(mode)` when the mode is `:ground`. That
+     function counts image *transforms*, which is the right multiplier only
+     when the images are real radiators; a ground image is fictitious, so the
+     reported impedance came back a factor 2 — 6.02 dB — high over a pressure
+     field that was entirely correct. **This is a behaviour change against
+     upstream**: a Boundary Lab `:ground` solve reports the doubled figure.
+     Measured end to end at 300 and 500 Hz with the body 1 m above the plane,
+     the fix moves reported impedance by 0.008 and 0.119 dB where the
+     unfixed path moved it by 6.03 and 6.14 dB.
+   - `validate_ground_plane_domain!` is new, and has no upstream counterpart.
+     `symmetry_active_axes(:ground)` is empty, so
+     `validate_symmetry_fundamental_domain!` is a no-op for this mode and a
+     body straddling the plane would assemble against a domain that does not
+     exist. It is ported from hornlab-metal-bem
+     (`metal/geometry.py`, `validate_native_ground_plane`) and enforces the
+     same three things: the whole mesh at Y >= 0, no face lying flat in the
+     plane, and an optional minimum clearance. The tolerance is Boundary Lab's
+     own fixed 1e-6 m, as `deploy_solve.py` uses on the same geometry.
+
+   Nothing in `src/` is touched by any of this.
 
 Features that exist only in this repository and are preserved by both merges:
 diagonal observation cuts, the theta-major spherical grid for balloon/DI
@@ -243,7 +275,7 @@ CUDA dep upstream will not leave two conflicting sources of truth unnoticed.
 
 Upstream resolves shared fixtures five directory levels up, at the Boundary Lab
 repository root. Those meshes live inside the package here, so one path
-constant was repointed in each of six files. Nothing else in these files
+constant was repointed in each of six files. Nothing else in those six files
 changed.
 
 | file | change |
@@ -254,6 +286,15 @@ changed.
 | `julia/scripts/validate_rocm_coupled.jl` | fixture root -> `../test_fixtures` |
 | `julia/scripts/compare_coupled_precision.jl` | default FEM/BEM mesh -> `../test_fixtures` |
 | `julia/scripts/benchmark_cpu.jl` | `repo_root` depth 5 -> 3, to match this layout |
+
+`julia/scripts/validate_metal_symmetry.jl` additionally differs in substance,
+not only in a path: it gained the `:ground` cases on 2026-09-03, in both of
+that mode's geometries (lifted clear of the plane, and resting on it). Upstream
+covers off / x / xy only. The Metal-vs-CPU tolerances are unchanged.
+
+`julia/scripts/validate_analytic_exterior.jl` has no upstream counterpart at
+all. It is original to this repository, and it is the only gate here that
+scores against a closed form rather than against a second BEAT code path.
 
 ### Documentation
 

@@ -1,15 +1,44 @@
 using LinearAlgebra
+using StaticArrays
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
 
 relative_error(actual, reference) = norm(actual - reference) / max(norm(reference), eps(real(eltype(reference))))
 
-function validate_fixture(mesh_name::String, symmetry_mode::Symbol)
+"""Lift every vertex by `offset` along Y, for the rigid half-space fixtures.
+
+`:ground` is the one mode whose mesh is not a fundamental domain, so it is the
+one mode with no fixture on disk: `sample_half.msh` straddles Y=0 and would be
+half inside the floor. Lifting it is the whole adaptation needed, and it also
+makes the fixture the shape the mode is actually for -- a body standing clear
+of a boundary rather than a mesh cut by a mirror.
+"""
+function lift_above_ground(mesh::BoundaryMesh{T}, offset::T) where {T<:AbstractFloat}
+    vertices = [SVector{3,T}(v[1], v[2] + offset, v[3]) for v in mesh.vertices]
+    return BoundaryMesh(vertices, mesh.faces, mesh.physical_tags)
+end
+
+function validate_fixture(mesh_name::String, symmetry_mode::Symbol; ground_lift::Float32=0.0f0)
     mesh_path = joinpath(@__DIR__, "..", "test_meshes", mesh_name)
     mesh = load_gmsh22_with_tags(mesh_path, Float32(0.001))
-    mesh = snap_symmetry_planes(mesh, symmetry_mode)
-    validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
+    if symmetry_mode == :ground
+        # No snapping and no fundamental-domain check: `:ground` has no active
+        # symmetry axis, so both are no-ops for it by construction. What the
+        # mode does require is that the body lie wholly at Y >= 0, which the
+        # driver enforces on the real path (`validate_ground_plane_domain!`)
+        # and which is asserted here so a fixture cannot drift below the plane
+        # and quietly turn this into a different test.
+        mesh = lift_above_ground(mesh, ground_lift)
+        minimum_y = minimum(v[2] for v in mesh.vertices)
+        minimum_y >= -1.0f-6 || error(
+            "Ground fixture $(mesh_name) reaches Y=$(minimum_y) m; the rigid " *
+            "half space requires the whole mesh at Y >= 0."
+        )
+    else
+        mesh = snap_symmetry_planes(mesh, symmetry_mode)
+        validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
+    end
     p1 = build_p1_space(mesh)
     dp0 = build_dp0_space(mesh)
     regular_order = parse(Int, get(ENV, "BLAB_VALIDATE_REGULAR_ORDER", "1"))
@@ -78,6 +107,7 @@ function validate_fixture(mesh_name::String, symmetry_mode::Symbol)
         println((
             mesh=mesh_name,
             symmetry=symmetry_mode,
+            min_y=minimum(v[2] for v in mesh.vertices),
             singular_mode=singular_mode,
             faces=length(mesh.faces),
             image_singular_pairs=metal_operators.image_singular_pairs,
@@ -105,6 +135,13 @@ function validate_metal_symmetry()
     println("device=$(metal.device().name)")
     validate_fixture("sample_half.msh", :x)
     validate_fixture("sample_quarter.msh", :xy)
+    # `:ground` in both of its geometries. Lifted clear of the plane is the
+    # ordinary case; resting on it is the one that matters, because a body
+    # touching Y=0 makes real and image elements coincident and adjacent, and
+    # that is the image singular-correction path -- the part of the assembly
+    # most likely to differ between Metal and BEAT CPU.
+    validate_fixture("sample_half.msh", :ground; ground_lift=0.15f0)
+    validate_fixture("sample_quarter.msh", :ground)
     println("METAL_SYMMETRY_VALIDATION_OK")
 end
 
