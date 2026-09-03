@@ -289,10 +289,15 @@ README carries the measured version:
 - `beat-engine-metal.md` describes the sweep pipelining as the shipped
   behaviour. It is upstream's default and **not this package's**: `worker.py`
   sets `BLAB_METAL_PIPELINE=0` unless the environment already names a value,
-  because the overlap is measurably slower here (M1 Max, asro68 quarter,
-  12 frequencies, five interleaved rounds: 2.105 s sequential against 2.313 s
-  pipelined, and 2.792 s against 3.050 s at the old thread default). The
-  mechanism is that Metal.jl's command queues are task-local, so the spawned
+  because the overlap is measurably slower on the small symmetry-reduced meshes
+  this package is built to serve. The sign reverses with mesh size — 0.89x on
+  the 1,209-dof quarter but **1.51x faster** on the 4,552-dof full model, over
+  40 frequencies, four interleaved rounds — so `0` is a default chosen for the
+  expected workload and not a finding that the overlap never pays. See the
+  README's "Sweep threads and sweep pipelining". The small-mesh measurement is
+  M1 Max, asro68 quarter, 12 frequencies, five interleaved rounds: 2.105 s
+  sequential against 2.313 s pipelined, and 2.792 s against 3.050 s at the old
+  thread default. The mechanism is that Metal.jl's command queues are task-local, so the spawned
   assembly task builds a new queue every frequency. The solver source is
   untouched; setting `BLAB_METAL_PIPELINE=1` restores upstream's behaviour
   exactly, and the two paths agree to 3e-4 dB.
