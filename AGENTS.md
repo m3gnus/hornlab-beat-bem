@@ -74,6 +74,51 @@ that matters most here does not run:
 julia --project=hornlab_beat_bem/julia -e "using Pkg; Pkg.instantiate()"
 ```
 
+### On a host with no GPU, set `HORNLAB_BEAT_JULIA`
+
+`discover_julia()` resolves one order -- explicit argument, then
+`HORNLAB_BEAT_JULIA`, then the provisioned runtime, then `PATH`. The third tier
+is **not a search**: `provisioned_julia()` reads `state.json` out of the runtime
+directory and returns the single path a previous provisioning run recorded.
+Provisioning is GPU-gated on purpose -- `provision_gpu()` returns `skipped` and
+writes nothing when no matching GPU is present, so a machine that will never
+run an accelerator never pays for the Julia download or the multi-gigabyte
+CUDA/ROCm artifacts behind it.
+
+So on a GPU-less host that tier is dead by construction and the chain is really
+env-var-or-`PATH`. A Julia installed anywhere else is invisible to it, because
+nothing searches: unpacking one by hand next to the checkout does not make it
+discoverable, and neither does any other layout the package was never told
+about. **This is not platform-specific.** The same three conditions return the
+same `None` on Windows, Linux and macOS; it was first hit on a GPU-less Windows
+guest, and reproduces identically on macOS with an empty runtime directory and
+no `julia` on `PATH`.
+
+That costs more here than it would elsewhere, because **a skip is a failure in
+this repository**. Four test files take a `julia` fixture that skips when
+discovery returns `None`, and `check_pytest_report.py` rejects any skip at all
+(see *Continuous integration*). Without the variable, `pytest` reports 90
+passed and 8 skipped and exits 0 locally, and the same run fails the checker in
+CI -- and the only thing naming the cause is the skip message. So set the
+variable, and use CI's own check to confirm it before the suite rather than
+after:
+
+```bash
+export HORNLAB_BEAT_JULIA=<path to julia>       # PowerShell: $env:HORNLAB_BEAT_JULIA
+python .github/scripts/assert_julia_runtime.py  # one legible error, not eight quiet skips
+```
+
+CI never meets this: `julia-actions/setup-julia` puts Julia on `PATH`, which is
+why the tier being dead has never shown up as a red run.
+
+This is a documented requirement rather than a defect, and the alternatives
+were weighed and declined. A CPU-only provisioning mode would invert the
+promise `provision.py` opens with, and would download a second Julia onto a
+host that already had one. Giving discovery a workspace-relative search root
+would make a pip-installed package execute whatever binary happens to sit
+under the directory it was launched from -- discovery would depend on the
+working directory, which is precisely what the current four tiers avoid.
+
 One check is deliberately conditional. The Julia suite and the Krylov gate
 both compare an unreorthogonalised Float32 Gram-Schmidt against the remedies,
 so that the agreement between the remedies is not vacuous. *Whether* it
@@ -119,11 +164,14 @@ Two things are asserted that an exit code does not cover, because until
 2026-09-03 this repository had no CI at all while a consumer pinned it by SHA
 and sessions described its branches as gated:
 
-- **Julia has to be present.** Three Python test files take a `julia` fixture
+- **Julia has to be present.** Four Python test files take a `julia` fixture
   that skips when `discover_julia()` returns `None`, so without the runtime the
-  suite reports 60 passed, 3 skipped and exits 0 -- green over a run that never
-  solved anything. `.github/scripts/assert_julia_runtime.py` fails first
-  instead, and `check_pytest_report.py` then rejects any skip at all. There is
+  suite reports 90 passed, 8 skipped and exits 0 -- green over a run that never
+  solved anything. (It was three files and three skips when this was written;
+  the count moves as solve tests are added, which is the point -- it is not a
+  fixed small set that could be watched by hand.)
+  `.github/scripts/assert_julia_runtime.py` fails first instead, and
+  `check_pytest_report.py` then rejects any skip at all. There is
   no platform `skipif` anywhere in `tests/`, so zero skips is a real invariant
   rather than an aspiration; a new skip should be argued for there.
 - **The suites have to be non-empty.** Both checkers enforce a floor and print
