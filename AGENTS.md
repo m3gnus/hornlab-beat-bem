@@ -138,29 +138,52 @@ not had a green hosted run yet, and the second needs an AMD host.
 
 ### A known intermittent on ubuntu-latest -- do not "fix" it by loosening it
 
-The second CI run ever, on a commit that changed only this file, failed four
-assertions in `julia/tests/coupled_condensed_tests.jl` on `ubuntu-latest`.
-Runs one and three passed on the same code, and `macos-latest` passed all
-three. The failures are the `symmetry == :off` branch of the forked-versus-
-shared comparison, which asserts **bitwise** equality on the stated ground that
-"with no images the fused sweep reduces to the base sweep". The observed
-disagreement was one Float32 ULP: `3.354732f-9` against `3.3547323f-9`.
+Four assertions in `julia/tests/coupled_condensed_tests.jl` fail
+intermittently on `ubuntu-latest`, and have never failed on `macos-latest`.
+The failures are the `symmetry == :off` branch of the forked-versus-shared
+comparison, which asserts **bitwise** equality on the stated ground that "with
+no images the fused sweep reduces to the base sweep". The observed
+disagreement is one Float32 ULP: `3.354732f-9` against `3.3547323f-9`. A
+failing job reports 416 passed, 4 failed, 1 broken.
 
-Two facts narrow it. `Threads.nthreads()` is 1 on the runners, so the
-`Threads.@threads` loops in `BeatEngineCpuAssembly.jl` and
-`BeatEngineCondensedAssembly.jl` are disabled and thread scheduling is not the
-cause. OpenBLAS, however, is multithreaded there (2 on ubuntu, 3 on macOS),
-and GitHub's `ubuntu-latest` pool is heterogeneous -- run three reported
-`znver3`. So the two live candidates are a different host CPU giving the two
-code paths different vectorised summation orders, and multithreaded BLAS. The
-`Report the host` step exists to settle this: the next occurrence should be
-compared against a passing run's `cpu_name`.
+Sightings so far, `ubuntu-latest` only:
+
+| Run | Commit changed | `cpu_name` | Result |
+|---|---|---|---|
+| CI run 1 | -- | not recorded | pass |
+| CI run 2 | AGENTS.md only | not recorded | **fail** |
+| CI run 3 | workflow only | `znver3` | pass |
+| CI run 4 | AGENTS.md only | `znver4` | pass |
+| PR #6 | AGENTS.md only | `znver3` | pass |
+| PR #7 run 33758796520 | a new script CI did not yet invoke | `znver4` | **fail** |
+
+Two of those changed no Julia code whatsoever, and the sixth added a script
+the workflow did not call. So the suite disagrees with itself across runs of
+identical code.
+
+`Threads.nthreads()` is 1 on the runners, so the `Threads.@threads` loops in
+`BeatEngineCpuAssembly.jl` and `BeatEngineCondensedAssembly.jl` are disabled
+and thread scheduling is not the cause. The suite also passes locally at
+`-t 4` on Apple Silicon.
+
+**The obvious hypothesis has been tested and does not hold.** `ubuntu-latest`
+is genuinely a heterogeneous pool -- these runs saw both `znver3` and `znver4`
+-- so the natural explanation was that one host vectorises the two sweeps into
+different summation orders. But `znver4` appears once as a pass and once as a
+fail, and `znver3` has only ever passed. The same CPU model therefore both
+agrees and disagrees, which rules out `Sys.CPU_NAME` as a sufficient
+explanation and points at something that varies *within* a host between runs.
+Multithreaded OpenBLAS (2 threads on ubuntu, 3 on macOS) is the leading
+remaining candidate; allocation-dependent vectorisation of a loop tail is
+another. Keep recording `cpu_name` anyway -- a finer-grained difference than
+the LLVM target name is still possible -- but do not go on attributing this to
+the pool.
 
 This is pre-existing and not owned here. `coupled_condensed_tests.jl` is
 vendored (see `VENDORING.md`; only the fixture root differs from upstream), so
 a fix belongs in `boundary-lab` and arrives through a re-sync. **Do not relax
 that `==` to an `≈` in this repository**, and do not relax it upstream without
-first establishing which of the two mechanisms it is -- the assertion is
+first establishing the mechanism -- the assertion is
 deliberate, its comment explains why both the strict and the loose halves are
 there, and turning it loose would discard the only check that the fused sweep
 really does reduce to the base sweep. If it turns out to be a genuine
