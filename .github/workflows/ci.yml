@@ -130,6 +130,28 @@ jobs:
       - name: Run the Julia CPU suite
         run: julia --project=hornlab_beat_bem/julia .github/scripts/run_julia_suite.jl --min-passes=300
 
+      # The only gate in this repository that checks an absolute answer. Every
+      # other exterior gate compares one BEAT code path against another, and an
+      # equivalence test cannot see a globally conjugated kernel because both
+      # sides conjugate together -- this script demonstrates that by re-running
+      # the runtests image-equivalence check at -k and showing it still passes
+      # at 1.203e-15, then failing the analytic comparison by 179.96 degrees.
+      #
+      # CPU only, Float64, no GPU and no fixture files -- it generates its own
+      # icosphere -- so it belongs in this job rather than the Metal one, and
+      # it runs on both legs of the matrix.
+      #
+      # No environment knobs, deliberately. The tolerances are calibrated for
+      # the script's defaults (subdivision 3, 1000 Hz, 34.7 elements per
+      # wavelength) and have about 2x headroom there. Convergence is O(h^2) --
+      # 0.0882 / 0.0223 / 0.0056 dB at subdivisions 2 / 3 / 4 -- so dropping the
+      # subdivision to save CI time does not buy a cheaper gate, it buys a
+      # failing one.
+      - name: Run the analytic exterior gate
+        run: |
+          julia -t auto --project=hornlab_beat_bem/julia \
+            hornlab_beat_bem/julia/scripts/validate_analytic_exterior.jl
+
   metal:
     name: Metal validators (macos-latest)
     runs-on: macos-latest
