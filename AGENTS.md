@@ -83,9 +83,58 @@ microarchitecture, so that half is a **warning**, not an assertion. The
 agreement between the remedies stays hard. Do not "fix" a warning here by
 tightening it into a failure.
 
+CI measured this rather than assuming it. On the first run of the workflow
+(2026-09-03), `ubuntu-latest` fired the warning -- single MGS 39 iterations
+against Float64's 20, inside the 4x threshold -- while `macos-latest` did not
+fire it at all. Both jobs passed, 420 assertions each. So the note above is
+load-bearing and not a caution about something hypothetical: promoted to an
+assertion, that check would make `ubuntu-latest` permanently red on code that
+is correct, and the obvious way to get it green again would be to loosen the
+agreement assertions that are the actual evidence. If you are reading this
+because you were about to tighten it, that is the run to look at first.
+
 Do not weaken a tolerance to make a gate pass. The fused and symmetry gates
 compare two code paths that differ only in Float32 summation order, so their
 tolerances are noise floors and a real regression will not sit just above one.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pull requests and on pushes to `main`. It
+covers the Julia CPU suite and the Python suite on `ubuntu-latest` and
+`macos-latest`, and the exterior, symmetry and fused Burton-Miller Metal
+validators on `macos-latest` -- the hosted macOS runner has a working Metal
+device, so those run for real rather than skipping.
+
+Two things are asserted that an exit code does not cover, because until
+2026-09-03 this repository had no CI at all while a consumer pinned it by SHA
+and sessions described its branches as gated:
+
+- **Julia has to be present.** Three Python test files take a `julia` fixture
+  that skips when `discover_julia()` returns `None`, so without the runtime the
+  suite reports 60 passed, 3 skipped and exits 0 -- green over a run that never
+  solved anything. `.github/scripts/assert_julia_runtime.py` fails first
+  instead, and `check_pytest_report.py` then rejects any skip at all. There is
+  no platform `skipif` anywhere in `tests/`, so zero skips is a real invariant
+  rather than an aspiration; a new skip should be argued for there.
+- **The suites have to be non-empty.** Both checkers enforce a floor and print
+  counts, so a job log carries a number instead of the word "green".
+
+The hosted macOS runner reports an `AppleParavirtDevice`, not the bare metal
+GPU, which is why the job asserts that a kernel compiles, dispatches and
+returns the right answer before trusting `Metal.functional()`.
+
+Nothing in CI compares GPU output byte for byte. The native Metal path
+accumulates through atomics and is not bit-reproducible run to run (~8e-7);
+only the CPU `reference` mode is. The first CI run showed both halves of that
+at once, comparing the paravirtualised runner against a local M1 Max: the
+`host` singular-mode operator errors agreed to every printed digit
+(`double_layer` 2.4922872e-7 on both), while the `native` ones did not
+(2.6501868e-7 local against 2.643291e-7 in CI). Same code, same mesh,
+different accumulation order. An equality assertion on those would fail for
+the reason the design says it would.
+
+`validate_metal_coupled.jl` and the ROCm scripts are not in CI: the first has
+not had a green hosted run yet, and the second needs an AMD host.
 
 ## Benchmarking
 
