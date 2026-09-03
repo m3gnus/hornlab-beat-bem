@@ -207,9 +207,46 @@ class SolveConfig:
 
     # Quadrature (BEAT-native orders: Gauss point counts 1/3/6 for 1/2/4).
     quadrature_order: int = 4
+    #: Duffy 1-D Gauss order for coincident and edge/vertex-adjacent pairs.
+    #: Cost per singular pair grows as order^4. Orders above 4 need a solver
+    #: whose ``gauss_rule_1d`` computes nodes by Golub-Welsch rather than the
+    #: hard-coded 1..4 table -- true from boundary-lab dev c7bf772 onward --
+    #: and they require ``solve_precision="double"``: measured on the ASRO
+    #: quarter mesh, order 4 is already converged to 0.0016 dB rms in Float64,
+    #: while in Float32 the extra Duffy points amplify cancellation faster
+    #: than they cut quadrature error (0.0006 dB rms of single-precision noise
+    #: at order 4, 0.031 dB at order 8). Raising it on the GPU path is a
+    #: pessimisation, so it is refused rather than merely discouraged.
     singular_order: int = 4
     #: None = solver default ("wavelength" on cpu, "fixed" on accelerators).
     regular_quadrature_mode: Literal["fixed", "wavelength"] | None = None
+
+    #: Near-singular correction. Disjoint element pairs closer than
+    #: ``near_correction_cutoff`` times their combined circumradius are
+    #: re-integrated with a tensor-product Gauss rule and the plain regular
+    #: contribution is subtracted. Each pair's order follows the separation
+    #: ratio (Bernstein-ellipse convergence), floored at 4 and capped at
+    #: ``near_correction_order``. Under a symmetry mode it also covers
+    #: mirror-image pairs, one cache per image transform. Off reproduces the
+    #: uncorrected solve bit-for-bit. CPU and Metal only -- see the
+    #: validation below for why CUDA and ROCm refuse it.
+    near_correction: bool = False
+    near_correction_cutoff: float = 2.0
+    near_correction_order: int = 8
+
+    #: Retain the boundary Cauchy datum (P1 pressure per vertex, DP0 normal
+    #: derivative per face) for every solved frequency, so a caller can
+    #: reconstruct field planes after the solve. Off by default because it is
+    #: O(vertices + faces) complex numbers per frequency on the wire, against
+    #: the polar cuts' few dozen.
+    surface_traces: bool = False
+
+    #: Assembly/solve element type. BEAT is a Float32 engine because that is
+    #: what its GPU kernels are; the CPU path is type-generic, so "double"
+    #: runs the identical solve in Float64. CPU backend only. Use it to tell
+    #: single-precision noise apart from discretisation error when comparing
+    #: against a Float64 reference solver.
+    solve_precision: Literal["single", "double"] = "single"
 
     # Execution backend
     beat_backend: Literal["cpu", "cuda", "rocm", "metal"] = "cpu"
@@ -265,10 +302,55 @@ class SolveConfig:
             )
         if not _is_integral_value(self.quadrature_order) or int(self.quadrature_order) < 1:
             raise ValueError("quadrature_order must be a positive integer")
-        if not _is_integral_value(self.singular_order) or not 1 <= int(self.singular_order) <= 4:
-            raise ValueError("singular_order must be between 1 and 4")
+        if not _is_integral_value(self.singular_order) or not 1 <= int(self.singular_order) <= 12:
+            raise ValueError("singular_order must be between 1 and 12")
         if self.regular_quadrature_mode not in {None, "fixed", "wavelength"}:
             raise ValueError("regular_quadrature_mode must be None, 'fixed', or 'wavelength'")
+        if not isinstance(self.near_correction, bool):
+            raise ValueError("near_correction must be a bool")
+        try:
+            cutoff = float(self.near_correction_cutoff)
+        except (TypeError, ValueError, OverflowError):
+            cutoff = float("nan")
+        if not isfinite(cutoff) or cutoff <= 0.0:
+            raise ValueError("near_correction_cutoff must be finite and greater than zero")
+        self.near_correction_cutoff = cutoff
+        if not _is_integral_value(self.near_correction_order) or int(self.near_correction_order) < 4:
+            raise ValueError("near_correction_order must be an integer >= 4")
+        self.near_correction_order = int(self.near_correction_order)
+        if self.near_correction and self.beat_backend in {BEAT_ROCM, BEAT_CUDA}:
+            # ROCm's vendored assembly has no near-pair kernel at all, so
+            # accepting the flag there would report a corrected solve that
+            # never ran the correction.
+            #
+            # CUDA is refused for a narrower and more dangerous reason: it has
+            # the kernel, but upstream's device path still takes a *single*
+            # image-near cache. Under `yz+xz` that leaves two of the three
+            # mirror transforms integrating a near-singular kernel with the
+            # plain regular rule and says nothing about it -- a plausible wrong
+            # number rather than a crash. The CPU assembly in this package
+            # carries the multi-cache patch; the CUDA path deliberately does
+            # not, because no machine available to this project has an NVIDIA
+            # GPU, so the change could not be executed or measured. Lift this
+            # once someone with the hardware ports and validates it.
+            label = "ROCm" if self.beat_backend == BEAT_ROCM else "CUDA"
+            raise NotImplementedError(
+                f"near_correction is not implemented for the BEAT {label} backend"
+            )
+        if not isinstance(self.surface_traces, bool):
+            raise ValueError("surface_traces must be a bool")
+        if self.solve_precision not in {"single", "double"}:
+            raise ValueError("solve_precision must be 'single' or 'double'")
+        if self.solve_precision == "double" and self.beat_backend != BEAT_CPU:
+            raise NotImplementedError(
+                "solve_precision='double' is only available on the BEAT CPU backend"
+            )
+        if self.singular_order > 4 and self.solve_precision != "double":
+            raise ValueError(
+                "singular_order above 4 requires solve_precision='double'; in "
+                "single precision the extra Duffy points add more cancellation "
+                "noise than they remove quadrature error"
+            )
 
     @property
     def source_tag(self) -> int:

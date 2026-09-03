@@ -134,7 +134,32 @@ Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
 `xy` (quarter, x >= 0 and y >= 0). A y-only `xz` half domain is not
 representable and is rejected by `reject_unsupported_native_symmetry`.
 
-Not supported: surface trace retention, multi-source drive.
+Supported: diagonal observation cuts, spherical balloon/DI grids (theta-major,
+so WG's DI integration and 3D balloon both work), axial source motion, and
+surface trace retention (`SolveConfig.surface_traces`, off by default).
+
+Not supported: multi-source drive -- exactly one velocity source tag at unit
+amplitude -- and WG's y-only `xz` half domain, per the symmetry note above.
+
+### The one local patch to the vendored engine
+
+`hornlab_beat_bem/julia/src/` is otherwise a verbatim copy of upstream, so a
+re-sync is a straight file copy. The exception is boundary-lab
+`feature/multiple-image-near-caches`: upstream's assembly takes a single
+image-near correction cache, which is enough for the one ground reflection it
+was written for but not for `yz+xz`, whose three mirror transforms would leave
+two of them uncorrected and say nothing about it. The patch makes
+`image_near_correction_cache` accept a collection; a single cache behaves
+exactly as before. **When that lands upstream, drop the patch and re-sync
+normally; until then a re-sync must re-apply it.**
+
+**The patch is applied to the CPU assembly only.** Upstream's CUDA paths take
+the same single-cache argument and have the same gap, but no machine available
+to this project has an NVIDIA GPU, so a CUDA edit here could not be executed,
+let alone verified -- and the correction is exactly the kind of change whose
+error is a plausible wrong number rather than a crash. `near_correction` is
+therefore accepted on the CPU backend and must not be trusted on `cuda` until
+someone with the hardware ports and measures it.
 
 ## Cold start
 

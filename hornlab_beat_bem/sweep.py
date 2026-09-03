@@ -130,11 +130,30 @@ def _request_payload(
         }
     if config.regular_quadrature_mode is not None:
         solver_config["regular_quadrature_mode"] = config.regular_quadrature_mode
+    if config.surface_traces:
+        solver_config["surface_traces_enabled"] = True
+    if config.solve_precision != "single":
+        solver_config["solve_precision"] = config.solve_precision
+    if config.near_correction:
+        solver_config["near_correction_enabled"] = True
+        solver_config["near_correction_cutoff"] = float(config.near_correction_cutoff)
+        solver_config["near_correction_order"] = int(config.near_correction_order)
     return {
         "schema_version": 2,
         "config": solver_config,
         "frequencies_hz": [float(value) for value in frequencies],
     }
+
+
+def _wire_vector(raw: dict[str, Any] | None, field: str) -> np.ndarray:
+    if raw is None:
+        raise RuntimeError(
+            f"BEAT solver returned no {field}; the installed solver predates "
+            "surface-trace retention"
+        )
+    return np.asarray(raw["real"], dtype=np.float64) + 1j * np.asarray(
+        raw["imag"], dtype=np.float64
+    )
 
 
 def _wire_rows(raw: dict[str, Any] | None) -> np.ndarray:
@@ -254,6 +273,11 @@ def solve_frequencies(
             )
         sphere_pressure = np.full((total, expected_points), np.nan, dtype=np.complex128)
 
+    # Sized from the first result rather than the mesh, so a symmetry-reduced
+    # solve reports the reduced domain it actually assembled.
+    surface_pressure: np.ndarray | None = None
+    surface_neumann: np.ndarray | None = None
+
     pressure = np.full((total, len(planes), angles.size), np.nan, dtype=np.complex128)
     spl = np.full((total, len(planes), angles.size), np.nan, dtype=np.float64)
     impedance = np.full(total, np.nan, dtype=np.complex128)
@@ -338,6 +362,28 @@ def solve_frequencies(
                 )
             sphere_pressure[index] = sphere_row * acceleration_scale
 
+        if config.surface_traces:
+            trace_pressure = _wire_vector(raw.get("surface_pressure"), "surface_pressure")
+            trace_neumann = _wire_vector(raw.get("surface_neumann"), "surface_neumann")
+            if surface_pressure is None:
+                surface_pressure = np.full(
+                    (total, trace_pressure.size), np.nan, dtype=np.complex128
+                )
+                surface_neumann = np.full(
+                    (total, trace_neumann.size), np.nan, dtype=np.complex128
+                )
+            elif (
+                trace_pressure.size != surface_pressure.shape[1]
+                or trace_neumann.size != surface_neumann.shape[1]
+            ):
+                raise RuntimeError(
+                    "BEAT solver surface trace length changed between frequencies"
+                )
+            # Same velocity -> acceleration rescale as every other field this
+            # package returns, so the datum stays consistent with the pressures.
+            surface_pressure[index] = trace_pressure * acceleration_scale
+            surface_neumann[index] = trace_neumann * acceleration_scale
+
         pressure[index] = entry_pressure
         spl[index] = entry_spl
         impedance[index] = entry_impedance if entry_impedance is not None else complex(np.nan, np.nan)
@@ -384,6 +430,8 @@ def solve_frequencies(
         sphere_pressure_complex=None if sphere_pressure is None else sphere_pressure[:count],
         sphere_theta_deg=sphere_theta_deg,
         sphere_phi_deg=sphere_phi_deg,
+        surface_pressure_complex=None if surface_pressure is None else surface_pressure[:count],
+        surface_neumann_complex=None if surface_neumann is None else surface_neumann[:count],
     )
 
 

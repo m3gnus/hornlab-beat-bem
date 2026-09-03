@@ -6,6 +6,17 @@ from hornlab_beat_bem import (
     beat_symmetry_mode,
     reject_unsupported_native_symmetry,
 )
+from hornlab_beat_bem.sweep import _request_payload
+
+
+def _request_payload_config(config: SolveConfig) -> dict:
+    """The ``config`` block the Julia solver actually receives."""
+
+    import numpy as np
+
+    return _request_payload(
+        "mesh.msh", np.asarray([1000.0]), config, translation=(0.0, 0.0, 0.0)
+    )["config"]
 
 
 def test_observation_defaults_are_valid():
@@ -99,3 +110,62 @@ def test_every_declared_backend_has_a_bundled_julia_project():
     for backend in BEAT_BACKENDS:
         project = default_project(backend)
         assert (project / "Project.toml").exists(), backend
+
+
+def test_near_correction_defaults_off_and_stays_out_of_the_request():
+    config = SolveConfig()
+    assert config.near_correction is False
+    assert _request_payload_config(config).keys().isdisjoint(
+        {"near_correction_enabled", "near_correction_cutoff", "near_correction_order"}
+    )
+
+
+def test_near_correction_reaches_the_solver_request():
+    config = SolveConfig(
+        near_correction=True, near_correction_cutoff=1.5, near_correction_order=10
+    )
+    solver_config = _request_payload_config(config)
+    assert solver_config["near_correction_enabled"] is True
+    assert solver_config["near_correction_cutoff"] == pytest.approx(1.5)
+    assert solver_config["near_correction_order"] == 10
+
+
+def test_near_correction_validation():
+    with pytest.raises(ValueError, match="near_correction_cutoff"):
+        SolveConfig(near_correction=True, near_correction_cutoff=0.0)
+    with pytest.raises(ValueError, match="near_correction_order"):
+        SolveConfig(near_correction=True, near_correction_order=3)
+    # The vendored ROCm assembly has no near-pair kernel, so accepting the flag
+    # there would report a corrected solve that never ran the correction.
+    with pytest.raises(NotImplementedError, match="ROCm"):
+        SolveConfig(near_correction=True, beat_backend="rocm")
+    # CUDA has the kernel but still takes a single image-near cache upstream,
+    # so under `yz+xz` it would leave two of three mirror transforms
+    # uncorrected and say nothing. The multi-cache patch is applied to the CPU
+    # assembly only, because no machine here has an NVIDIA GPU to verify a
+    # device-side edit on.
+    with pytest.raises(NotImplementedError, match="CUDA"):
+        SolveConfig(near_correction=True, beat_backend="cuda")
+
+
+def test_solve_precision_is_cpu_only():
+    assert SolveConfig().solve_precision == "single"
+    assert "solve_precision" not in _request_payload_config(SolveConfig())
+    config = SolveConfig(solve_precision="double")
+    assert _request_payload_config(config)["solve_precision"] == "double"
+    with pytest.raises(NotImplementedError, match="CPU backend"):
+        SolveConfig(solve_precision="double", beat_backend="cuda")
+    with pytest.raises(ValueError, match="solve_precision"):
+        SolveConfig(solve_precision="extended")
+
+
+def test_singular_order_above_four_requires_double_precision():
+    # Measured on the ASRO quarter mesh: order 4 is converged to 0.0016 dB rms
+    # in Float64, while in Float32 order 8 is 0.031 dB *worse* than its own
+    # double-precision answer. Allowing it on the GPU path would be a
+    # pessimisation dressed up as an accuracy knob.
+    with pytest.raises(ValueError, match="solve_precision='double'"):
+        SolveConfig(singular_order=8)
+    assert SolveConfig(singular_order=8, solve_precision="double").singular_order == 8
+    with pytest.raises(ValueError, match="singular_order"):
+        SolveConfig(singular_order=13, solve_precision="double")
