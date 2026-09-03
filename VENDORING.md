@@ -28,6 +28,7 @@ below**, and everything not listed is a byte-for-byte copy.
 | Sync at first publish (2026-09-02) | `f536d9e6a89c348cb5e071349f788cfe0f078156` | `feat/beat-adaptive-solve` |
 | Sync at 3ebc90a (2026-09-02) | `3ebc90aa95743b56dd19cd85ececf190d2672776` | `feat/beat-adaptive-solve` |
 | Current sync (2026-09-02) | `cd50b3c64771b242d681aaf440a5b786757ba35a` | `feat/beat-cold-start-adaptive` |
+| Cherry-pick (2026-09-03) | `1f90433` on `fix/condensed-entrywise-floor` | the :off condensed comparison becomes an entrywise absolute floor; decided by Magnus after the AVX-512 experiment |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`

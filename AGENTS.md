@@ -255,7 +255,14 @@ later, or Zen 4/5 with AVX-512 not hidden by the hypervisor. Until then, a
 Windows developer on an AVX-512 workstation should expect these four assertions
 red on correct code, and should read this section before "fixing" them.
 
-**The contract decision is open and belongs to Magnus.** The mechanism above is
+**The contract decision was taken by Magnus on 2026-09-03: the entrywise
+absolute floor** (the recommended option below). It landed upstream first —
+fork commit `1f90433` on `fix/condensed-entrywise-floor` — and arrived here by
+cherry-pick, recorded in `VENDORING.md`. The four assertions now bound every
+entry at `1.0f-5 * maximum(abs, shared)`; the cached-vs-uncached fused
+comparison stays bitwise. The options are kept below as the decision record.
+
+**The original note, for the record:** The mechanism above is
 the evidence the earlier note asked for before anyone touched the assertion; it
 is not permission to touch it. `coupled_condensed_tests.jl` is vendored (see
 `VENDORING.md`), so a change lands upstream in `boundary-lab` and arrives by
