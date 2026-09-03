@@ -459,19 +459,82 @@ All are environment variables; the defaults are the shipped configuration.
 | variable | default | effect |
 |---|---|---|
 | `BLAB_BEAT_DENSE_SOLVE` | `auto` | `lu` or `gmres` forces the choice past the cost model |
-| `BLAB_BEAT_GMRES_TOL` | `1e-6` | tolerance on the true relative residual |
+| `BLAB_BEAT_GMRES_TOL` | `1e-5` | tolerance on the true relative residual. Exterior solves only; the coupled FEM/LEM path factorizes directly. See `VENDORING.md` |
 | `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |
+| `BLAB_METAL_PIPELINE` | `0` here, `1` upstream | `1` overlaps the next frequency's GPU assembly with this one's CPU solve. Slower on small meshes, **1.51x faster at 4,552 dofs**; see below |
 | `BLAB_BEAT_ENGINE_BUNDLE` | `1` | `0` ignores the precompiled bundle and includes the engine from source: bit-identical to the pre-bundle package, at the old cold start |
 | `HORNLAB_BEAT_JULIA` | — | explicit Julia executable |
 | `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available |
 
 `docs/beat-engine-metal.md` and `docs/beat-engine-core.md` list the rest.
-Those pages are Boundary Lab's, kept verbatim; `VENDORING.md` notes the two
+Those pages are Boundary Lab's, kept verbatim; `VENDORING.md` notes the
 places where this README's measurements supersede them.
+
+### Sweep threads and sweep pipelining
+
+Two defaults differ from upstream's. Both are set from `worker.py`, so the
+vendored solver is unmodified and either can be put back with one environment
+variable.
+
+Measured on an M1 Max (8 performance + 2 efficiency cores) against the ATH
+`asro68` quarter model — 1,209 P1 dofs, Metal backend, fused Burton-Miller —
+sweeping 12 frequencies from 300 Hz to 12 kHz on a warm worker. Five
+interleaved rounds, minimum reported, medians in brackets:
+
+| | `JULIA_NUM_THREADS=8` | `=10` (`os.cpu_count()`) |
+|---|---|---|
+| `BLAB_METAL_PIPELINE=0` | **2.105 s** (2.138) | 2.792 s (2.926) |
+| `BLAB_METAL_PIPELINE=1` | 2.313 s (2.334) | 3.050 s (3.115) |
+
+The two effects are independent and compose: 1.09-1.10x from the pipelining,
+1.32-1.33x from the thread count, **1.45x** from the pair. All four arms agree
+to 3e-4 dB, which is the assembly's own run-to-run noise floor — the native
+singular correction scatters with atomics.
+
+**`julia_threads="auto"` counts performance cores, not all cores.** The Metal
+path sets BLAS to `Threads.nthreads()`, so `os.cpu_count()` put 2 of 10
+factorization threads on the efficiency cores and the other 8 waited for them.
+On a symmetric part this resolves to the same number as before.
+
+**`BLAB_METAL_PIPELINE` defaults off.** Assembling frequency i+1 on a spawned
+task while the CPU solves frequency i costs about 10% rather than saving
+anything, because Metal.jl's command queues are task-local and the spawned task
+builds a new one every frequency. This was first measured as a larger penalty
+at the old 10-thread default, which suggested it was an artifact of
+oversubscribing the performance cores; the table above rules that out, since it
+costs the same 1.09x at 8 threads.
+
+On *this model* there is also not much to win by fixing it rather than switching
+it off. Instrumented separately here, the sweep is **6.10 s of GPU assembly and
+field evaluation against a 1.51 s CPU solve** — the solve is 20% of the work, so
+a *perfect* scheduler reaches ~6.1 s against 7.74 s, about **1.10x**, and neither
+arm has an idle core to reclaim.
+
+**But the sign of the effect depends on mesh size, so `0` is a default and not a
+verdict.** The ratio above is the small model's; the CPU solve grows faster than
+the GPU assembly does, so on a larger mesh there is a much bigger CPU share to
+hide behind. Measured over 40 frequencies from 100 Hz to 20 kHz, four
+interleaved rounds, minimum:
+
+| model | `PIPELINE=0` | `PIPELINE=1` | |
+|---|---:|---:|---|
+| asro68 quarter, 1,209 dofs | **5.299 s** | 5.928 s | pipelining 0.89x |
+| asro68 full, 4,552 dofs | 27.832 s | **18.431 s** | pipelining **1.51x** |
+
+All four rounds agree at both sizes. The default stays `0` because the calls this
+package is built to serve are short per-band sweeps on symmetry-reduced meshes,
+which is the row where it loses — but anyone sweeping a full model at this size
+or above should set `BLAB_METAL_PIPELINE=1`, and a size-aware default is the
+obvious follow-up rather than a fix to the queue handling.
+
+So the ~1.10x ceiling argument is sound only where the CPU solve really is 20% of
+the work. An engine that overlaps frequencies and is further ahead than that is
+ahead on assembly speed; the overlap is a consequence of having a large CPU share
+to hide behind, not a separate thing to copy.
 
 ## Licence and provenance
 

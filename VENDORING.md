@@ -104,6 +104,37 @@ quarter export: 228 runtime compilations on a first solve rather than 95, with
 against this package's own `SolveConfig`, so the next such divergence fails a
 test rather than costing two thirds of the win in silence.
 
+## Two later cherry-picks, 2026-09-03
+
+Two fork branches carry work that postdates `3ebc90a` and is on neither
+`feat/beat-adaptive-solve` nor the cold-start merge above. Both are taken here
+as verbatim file copies, and both had a base identical to `3ebc90a` for every
+file they touch, so each is exactly its own change and nothing else. That base
+is still current: the cold-start sync from `3ebc90a` to `cd50b3c` left
+`src/BeatEngineDenseSolve.jl`, `src/BeatEngineMetalField.jl` and
+`tests/runtests.jl` byte-for-byte unchanged, so re-basing these two picks onto
+it was a no-op rather than a merge.
+
+| branch | commit | files taken | what it does |
+|---|---|---|---|
+| `feat/beat-gmres-tolerance-1e-5` | `a52b8f4` | `src/BeatEngineDenseSolve.jl`, `tests/runtests.jl` | **exterior GMRES tolerance 1e-6 → 1e-5.** At 1e-6 the sliver-rim ATH meshes floor above the target below ~6 kHz and fall back to the dense LU, paying a full GMRES budget *and* the factorization. The radiated field moves at most 0.00100 dB. **Scoped to exterior solves**: the coupled FEM/LEM path factorizes directly and was never measured at either tolerance |
+| `feat/beat-metal-field-occupancy` | `ca5597a` | `src/BeatEngineMetalField.jl`, `scripts/benchmark_metal_field.jl` | **Metal field-evaluation occupancy.** The kernel launched one thread per evaluation point — a two-cut polar sweep is 74 points, so 74 threads on a 32-core GPU, each walking 13,650 quadrature sources (4× that with symmetry images). Chunking the source loop is ~20× on the stage (0.0571 → 0.0028 s/frequency) |
+| `feat/beat-metal-field-occupancy` | `d9ecee6` | `scripts/benchmark_metal_assembly_stages.jl`, `scripts/probe_metal_assembly_concurrency.jl` | the two probes behind the decision **not** to pursue cross-frequency concurrency: concurrent assemblies measure *slower* than sequential (0.85× at N=2), because one assembly already saturates the GPU |
+
+Measured effect on the shipped package, asro68 quarter export, M1 Max, against
+`hornlab-metal-bem` `74eca82` as an unchanged control — this is the package as
+it now stands, with no environment overrides:
+
+| case | metal-bem | BEAT-Metal | |
+|---|---:|---:|---|
+| 1,209 dofs, 3 frequencies | 0.539 s | **0.437 s** | BEAT 1.23× |
+| 1,209 dofs, 40 frequencies | **2.206 s** | 4.600 s | metal-bem 2.09× |
+| 4,552 dofs, 3 frequencies | 3.325 s | **2.322 s** | BEAT 1.43× |
+| 4,552 dofs, 40 frequencies | **20.79 s** | 27.95 s | metal-bem 1.34× |
+
+Before these two cherry-picks the 40-frequency quarter case was ~11 s. Far-field
+agreement is unchanged at 0.0082 dB main-lobe rms in band.
+
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind:
@@ -122,6 +153,9 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 | `hornlab_beat_bem/julia/tests/runtests.jl` | `src/blab/solvers/julia_local/tests/` |
 | `hornlab_beat_bem/julia/scripts/*.jl`, except the four listed below | `src/blab/solvers/julia_local/scripts/` |
 
+Six of those files are taken from the two 2026-09-03 branches above rather than
+from the `3ebc90a` sync commit; they are verbatim copies of *those* commits.
+
 Every numerical result this package produces comes from those files, and they
 are unmodified. That is deliberate: it is what lets the extraction be verified
 by identity rather than by tolerance.
@@ -129,6 +163,16 @@ by identity rather than by tolerance.
 The `julia_cuda/` project files carry one local addition, described below.
 
 ## What is modified, and why
+
+### Two runtime defaults, set from `hornlab_beat_bem/worker.py`
+
+Not source differences — the vendored solver is unchanged — but they mean this
+package's out-of-the-box behaviour is not upstream's, so they are listed here
+too. `BLAB_METAL_PIPELINE` defaults to `0` rather than `1`, and
+`julia_threads="auto"` resolves to the performance-core count rather than
+`os.cpu_count()`. Both are `setdefault`-style: an explicit environment variable
+or an explicit `julia_threads` wins, and both were measured rather than
+assumed. See the README's "Sweep threads and sweep pipelining".
 
 ### `hornlab_beat_bem/julia/solver.jl` and `BeatEngineDriver.jl`
 
@@ -228,7 +272,7 @@ application in places — `blab` CLI commands, `.blab.json` projects, solver
 selection in application preferences. Those describe upstream, not this package.
 
 **Where these docs are superseded.** They are upstream's, kept verbatim rather
-than corrected, so two statements in them are narrower than they read and the
+than corrected, so three statements in them are narrower than they read and the
 README carries the measured version:
 
 - `beat-engine-metal.md`'s summary bullet "the default `pair_gather` kernels
@@ -242,6 +286,21 @@ README carries the measured version:
 - `beat-engine-core.md` at `f536d9e` already records the A1r routing
   regression, so it is current; earlier copies of it claimed the operator
   never stagnates, which is retired.
+- `beat-engine-metal.md` describes the sweep pipelining as the shipped
+  behaviour. It is upstream's default and **not this package's**: `worker.py`
+  sets `BLAB_METAL_PIPELINE=0` unless the environment already names a value,
+  because the overlap is measurably slower on the small symmetry-reduced meshes
+  this package is built to serve. The sign reverses with mesh size — 0.89x on
+  the 1,209-dof quarter but **1.51x faster** on the 4,552-dof full model, over
+  40 frequencies, four interleaved rounds — so `0` is a default chosen for the
+  expected workload and not a finding that the overlap never pays. See the
+  README's "Sweep threads and sweep pipelining". The small-mesh measurement is
+  M1 Max, asro68 quarter, 12 frequencies, five interleaved rounds: 2.105 s
+  sequential against 2.313 s pipelined, and 2.792 s against 3.050 s at the old
+  thread default. The mechanism is that Metal.jl's command queues are task-local, so the spawned
+  assembly task builds a new queue every frequency. The solver source is
+  untouched; setting `BLAB_METAL_PIPELINE=1` restores upstream's behaviour
+  exactly, and the two paths agree to 3e-4 dB.
 
 ## What is deliberately not vendored
 
