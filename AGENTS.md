@@ -154,11 +154,12 @@ comparison was also a different machine.
 
 | Host, by `/proc/cpuinfo` flags | Draws | Unmasked | Masked |
 |---|---|---|---|
-| AVX-512 present | 7 | **fail, every one** | pass, every one |
-| AVX-512 absent | 31 | pass, every one | pass, every one |
+| AVX-512 present | 10 | **fail, every one** | pass, every one |
+| AVX-512 absent | 36 | pass, every one | pass, every one |
 
-The seven cover all four families the older sightings named -- `graniterapids`,
-`sapphirerapids`, `icelake-server` and `znver4` -- and the thirty-one are
+46 draws, no exception either way. The ten cover all four families the older
+sightings named -- `graniterapids`, `sapphirerapids`, `icelake-server` and
+`znver4` -- plus a `znver5` that no sighting had seen; the thirty-six are
 `znver3` and the AVX-512-less `znver4` below.
 
 On an AVX-512 host it fails **every time**, with the same 201 and 205 differing
@@ -168,7 +169,7 @@ entries every time. What looked intermittent was the pool draw.
 ISA level was "necessary but not sufficient" because `znver4` appeared once as
 a pass and twice as a fail. It is sufficient: some `znver4` hosts in the pool
 do not expose AVX-512 to the guest at all. Across these draws `znver4` came up
-3 times with the flags and 11 times without, and failed on exactly the 3. One
+3 times with the flags and 14 times without, and failed on exactly the 3. One
 CPU model, opposite outcomes, separated perfectly by the feature flags -- so
 key on the flags, which the workflow prints, never on the model name.
 
