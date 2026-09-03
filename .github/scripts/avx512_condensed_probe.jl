@@ -23,6 +23,12 @@
 # `BeatEngineCoupledCondensed.jl` expects to already exist), then the fork.
 const SOURCE = joinpath(@__DIR__, "..", "..", "hornlab_beat_bem", "julia", "src")
 
+# `norm` is used below and is not re-exported by the engine modules. It sits on
+# a branch only reached when the operators actually differ, so leaving it out
+# cost nothing on every host that agreed and threw on the first host that did
+# not -- which is the only host this script exists for.
+using LinearAlgebra
+
 include(joinpath(SOURCE, "BeatEngineCore.jl"))
 using .BeatEngineCore
 include(joinpath(SOURCE, "BeatEngineCoupled.jl"))

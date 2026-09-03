@@ -163,8 +163,17 @@ jobs:
           julia -C "$AVX512_MASK" --project=hornlab_beat_bem/julia \
             .github/scripts/avx512_condensed_probe.jl > probe-masked.log 2>&1
           set -e
-          echo "--- unmasked ---"; grep -E '^probe' probe-unmasked.log || cat probe-unmasked.log
-          echo "--- masked ---";   grep -E '^probe' probe-masked.log   || cat probe-masked.log
+          for arm in unmasked masked; do
+            echo "--- $arm ---"
+            if grep -q '^probe_verdict' "probe-$arm.log"; then
+              grep -E '^probe' "probe-$arm.log"
+            else
+              # The probe swallowed by `set +e` once hid a crash as a clean
+              # sheet of zeroes. Say so instead.
+              echo "::warning::The $arm probe did not finish; its output follows."
+              cat "probe-$arm.log"
+            fi
+          done
 
       - name: Verdict
         if: always()
