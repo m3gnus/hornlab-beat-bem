@@ -1,0 +1,157 @@
+name: CI
+
+# Until this file existed the repository had no CI at all -- the workflows API
+# returned total_count 0 on 2026-09-03 -- while Waveguide Generator pinned it by
+# SHA and sessions described its branches as gated. A pinned consumer deserves a
+# verdict rather than a claim.
+on:
+  push:
+    branches: [main, next]
+  pull_request:
+
+# A pushed topic branch with no pull request is not gated by anything; the
+# pull_request trigger above is what produces a run. Restricting the push
+# trigger to the two long-lived branches keeps a PR from running twice.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Both manifests record julia_version 1.12.6. Resolving within 1.12 keeps the
+  # manifests usable without pinning a patch that will go stale.
+  JULIA_VERSION: "1.12"
+
+jobs:
+  python:
+    name: Python suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # The Python suite is not a pure-Python suite. Three of its files run a
+      # real BEM solve through Julia, so the runtime has to be here or those
+      # files skip themselves -- see the assertion step below.
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ env.JULIA_VERSION }}
+      - uses: julia-actions/cache@v2
+
+      - name: Install the package
+        run: python -m pip install -e ".[dev]"
+
+      # A fresh runner has no instantiated depot, so `using JSON` inside
+      # solver.jl would fail at solve time and surface as an opaque worker
+      # error rather than as a missing dependency.
+      - name: Instantiate the Julia CPU project
+        run: julia --project=hornlab_beat_bem/julia -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Require a working Julia runtime
+        run: python .github/scripts/assert_julia_runtime.py
+
+      # The whole suite, slow tests included. `pytest` collects them by
+      # default -- the `slow` marker is a way to deselect a real solve locally,
+      # not a way to keep it out of CI -- so this is a superset of both
+      # commands AGENTS.md lists, and `-m slow` separately would only re-run
+      # three tests that already ran here.
+      #
+      # Output is redirected rather than piped: a pipe would discard the exit
+      # code, which is how a suite with failures once got committed behind a
+      # `&&` that read as a gate and gated nothing.
+      - name: Run the Python suite
+        run: python -m pytest -q -rs --junitxml=pytest-report.xml
+
+      # Exit code alone does not distinguish "everything passed" from
+      # "everything that mattered skipped". Without a Julia executable this
+      # suite reports 3 skipped, 60 passed and exits 0.
+      - name: Check the report is not a vacuous green
+        if: always()
+        run: python .github/scripts/check_pytest_report.py pytest-report.xml --min-tests 60
+
+  julia:
+    name: Julia CPU suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ env.JULIA_VERSION }}
+      - uses: julia-actions/cache@v2
+
+      - name: Instantiate the Julia CPU project
+        run: julia --project=hornlab_beat_bem/julia -e 'using Pkg; Pkg.instantiate()'
+
+      # The driver wraps runtests.jl in one aggregate testset for a total, and
+      # enforces a floor so a suite that stops running is not mistaken for one
+      # that agrees. Two testsets are gated on accelerator hardware and are
+      # correctly absent here: `cuda production pipeline` reports Broken on a
+      # hosted runner, and the ROCm path needs an AMD host.
+      #
+      # No `--depwarn=error`, deliberately. The suite emits a documented
+      # warning when unreorthogonalised Float32 Gram-Schmidt fails to degrade
+      # on the host, which is a property of the host's floating point rather
+      # than of the code. See the header of the driver.
+      - name: Run the Julia CPU suite
+        run: julia --project=hornlab_beat_bem/julia .github/scripts/run_julia_suite.jl --min-passes=300
+
+  metal:
+    name: Metal validators (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ env.JULIA_VERSION }}
+      - uses: julia-actions/cache@v2
+
+      - name: Instantiate the Julia Metal project
+        run: julia --project=hornlab_beat_bem/julia_metal -e 'using Pkg; Pkg.instantiate()'
+
+      # Assert the device before the validators, so a lost GPU reads as one
+      # error rather than as three copies of the same one. This checks that a
+      # kernel runs and returns the right answer, not merely that
+      # Metal.functional() is true.
+      - name: Require a working Metal device
+        run: julia --project=hornlab_beat_bem/julia_metal .github/scripts/assert_metal_device.jl
+
+      # Each validator compares the Metal path against the BEAT CPU reference
+      # and calls error() or exits non-zero on disagreement, so a failure is
+      # the job's exit code. Their tolerances are noise floors between two code
+      # paths that differ only in Float32 summation order -- do not widen one
+      # to make a run pass, and do not add an assertion that assumes byte-exact
+      # GPU output: the native path accumulates through atomics and is not
+      # bit-reproducible run to run (~8e-7).
+      #
+      # validate_metal_coupled.jl is the fourth Metal script in AGENTS.md and
+      # is deliberately not here yet: it was outside this change's scope, and
+      # adding it belongs with a run that shows it green rather than with a
+      # workflow that assumes it.
+      - name: validate_metal_exterior.jl
+        run: julia --project=hornlab_beat_bem/julia_metal hornlab_beat_bem/julia/scripts/validate_metal_exterior.jl
+
+      - name: validate_metal_symmetry.jl
+        run: julia --project=hornlab_beat_bem/julia_metal hornlab_beat_bem/julia/scripts/validate_metal_symmetry.jl
+
+      - name: validate_metal_fused_burton_miller.jl
+        run: julia --project=hornlab_beat_bem/julia_metal hornlab_beat_bem/julia/scripts/validate_metal_fused_burton_miller.jl

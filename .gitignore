@@ -6,3 +6,4 @@ dist/
 .pytest_cache/
 .DS_Store
 .metadata_never_index
+pytest-report.xml
