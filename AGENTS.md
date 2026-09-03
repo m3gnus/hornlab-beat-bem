@@ -156,10 +156,32 @@ Sightings so far, `ubuntu-latest` only:
 | CI run 4 | AGENTS.md only | `znver4` | pass |
 | PR #6 | AGENTS.md only | `znver3` | pass |
 | PR #7 run 33758796520 | a new script CI did not yet invoke | `znver4` | **fail** |
+| PR #4 run 33766122696 att.1 | rebase only (docs base moved) | `graniterapids` | **fail** |
+| PR #4 att.2 (re-run) | nothing | `sapphirerapids` | **fail** |
+| PR #4 att.3 (re-run) | nothing | `znver4` | **fail** |
+| PR #4 att.4 (re-run) | nothing | `znver3` | pass |
+| main 5500f6a run 33766048335 att.1 | AGENTS.md only (PR #6 merge) | `icelake-server` | **fail** |
+| main 5500f6a att.2 (re-run) | nothing | `znver3` | pass |
 
 Two of those changed no Julia code whatsoever, and the sixth added a script
 the workflow did not call. So the suite disagrees with itself across runs of
 identical code.
+
+**2026-09-03, after five more sightings: every failure to date is on an
+AVX-512 host, and `znver3` — the only host without AVX-512 — has never
+failed.** `graniterapids`, `sapphirerapids`, `icelake-server` and `znver4`
+all carry AVX-512; `znver4` has one pass, so the ISA level looks *necessary
+but not sufficient*, which keeps the negative result below intact and fits
+the second candidate there (allocation-dependent loop-tail vectorisation)
+rather than the OpenBLAS one — BLAS thread count was identical across green
+and red runs, and elementwise quadrature should not call BLAS at all. The
+workflow now prints the host's AVX-512 feature flag next to `cpu_name` so
+this correlation is recorded per run rather than inferred from model names.
+The candidate fix — the `symmetry == :off` branch's bitwise `==` premise,
+where sibling branches already use `rtol=1.0f-5` — is a test-contract
+decision and deliberately not taken unilaterally; whoever takes it should
+confirm the mechanism first (a run with AVX-512 masked off going green would
+settle it).
 
 `Threads.nthreads()` is 1 on the runners, so the `Threads.@threads` loops in
 `BeatEngineCpuAssembly.jl` and `BeatEngineCondensedAssembly.jl` are disabled

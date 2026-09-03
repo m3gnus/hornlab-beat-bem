@@ -116,6 +116,9 @@ jobs:
             println("julia       ", VERSION)
             println("threads     ", Threads.nthreads())
             println("blas        ", BLAS.get_num_threads(), " ", BLAS.get_config())'
+          # The condensed-assembly intermittent correlates with AVX-512 (see
+          # AGENTS.md): record the feature bits per run, not just the model name.
+          echo "avx512      $(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | grep -o 'avx512[a-z_]*' | sort -u | tr '\n' ' ')"
 
       # The driver wraps runtests.jl in one aggregate testset for a total, and
       # enforces a floor so a suite that stops running is not mistaken for one
