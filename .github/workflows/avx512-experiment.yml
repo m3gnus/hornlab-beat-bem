@@ -1,0 +1,190 @@
+name: AVX-512 mask experiment
+
+# A temporary experiment, not a gate. It exists to settle the mechanism behind the
+# condensed-assembly intermittent documented in AGENTS.md: four bitwise-equality
+# assertions in `coupled_condensed_tests.jl` that fail by one Float32 ULP, only on
+# `ubuntu-latest`, and so far only on AVX-512 hosts. Delete this file once the
+# question is answered -- it is evidence-gathering machinery with a finite life.
+#
+# The design is paired, within host. Each draw runs the Julia CPU suite twice on
+# the same runner from the same checkout: once unmasked, once with AVX-512 masked
+# out of the JIT's target. Two arms on one host removes the confound that sank the
+# earlier attempts to read this off the CI history, where a masked run and an
+# unmasked run were necessarily different machines from a heterogeneous pool and
+# any difference could be attributed to the draw rather than the flag.
+#
+# Repeats are the point: the intermittent is roughly five failures in six on an
+# AVX-512 host, so a single green masked run says almost nothing, and one that is
+# green while its own unmasked partner on the same silicon went red says a great
+# deal. The matrix draws hosts; `ubuntu-latest` is a pool of `znver3` (no AVX-512),
+# `znver4`, `graniterapids`, `sapphirerapids` and `icelake-server`.
+#
+# `push` on this branch is the trigger because a topic branch with no pull request
+# is not gated by anything and would otherwise never run. That is also why this is
+# a separate workflow file rather than a change to `ci.yml`: the experiment must not
+# alter what the real gate does on anyone else's branch.
+
+on:
+  push:
+    branches: [chore/avx512-mask-experiment]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Deliberately not cancel-in-progress. Every run is a sample, and cancelling the
+# previous one to start a newer one would throw away the draws already collected.
+concurrency:
+  group: avx512-experiment
+  cancel-in-progress: false
+
+env:
+  JULIA_VERSION: "1.12"
+  # Disabling `avx512f` disables every feature that depends on it, but the rest are
+  # named anyway: a mask that silently failed to apply would make a green masked arm
+  # look like a result when it is an artefact. The codegen assay below is what
+  # actually proves the mask took -- this list only makes the request specific.
+  AVX512_MASK: "native,-avx512f,-avx512cd,-avx512dq,-avx512bw,-avx512vl"
+
+jobs:
+  draw:
+    name: draw ${{ matrix.draw }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ env.JULIA_VERSION }}
+      - uses: julia-actions/cache@v2
+
+      - name: Instantiate the Julia CPU project
+        run: julia --project=hornlab_beat_bem/julia -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Report the host
+        id: host
+        run: |
+          cpu_name=$(julia --project=hornlab_beat_bem/julia -e 'print(Sys.CPU_NAME)')
+          # `|| true` because the host without AVX-512 is the control this
+          # experiment needs most, and a grep that matches nothing exits 1.
+          avx512_flags=$(grep -m1 '^flags' /proc/cpuinfo | grep -o 'avx512[a-z_]*' | sort -u | tr '\n' ' ' || true)
+          echo "cpu_name    $cpu_name"
+          echo "avx512      ${avx512_flags:-(none)}"
+          julia --project=hornlab_beat_bem/julia -e '
+            using LinearAlgebra
+            println("cpu_threads ", Sys.CPU_THREADS)
+            println("julia       ", VERSION)
+            println("threads     ", Threads.nthreads())
+            println("blas        ", BLAS.get_num_threads(), " ", BLAS.get_config())'
+          echo "cpu_name=$cpu_name" >> "$GITHUB_OUTPUT"
+          if [ -n "$avx512_flags" ]; then
+            echo "avx512=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "avx512=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Establish that the flag does something before trusting what happens under
+      # it. On an AVX-512 host the expected signature is zmm registers present
+      # unmasked and absent masked; on `znver3` both are zero, which is the correct
+      # null rather than a broken mask.
+      - name: Assay the code generation
+        id: assay
+        run: |
+          julia --project=hornlab_beat_bem/julia .github/scripts/avx512_codegen_assay.jl > assay-unmasked.log 2>&1
+          julia -C "$AVX512_MASK" --project=hornlab_beat_bem/julia .github/scripts/avx512_codegen_assay.jl > assay-masked.log 2>&1
+          echo "--- unmasked ---"; cat assay-unmasked.log
+          echo "--- masked ---";   cat assay-masked.log
+          zmm_unmasked=$(awk '/assay_zmm/ {print $2}' assay-unmasked.log)
+          zmm_masked=$(awk '/assay_zmm/ {print $2}' assay-masked.log)
+          echo "zmm_unmasked=${zmm_unmasked:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "zmm_masked=${zmm_masked:-unknown}" >> "$GITHUB_OUTPUT"
+          # A masked arm that still emits 512-bit registers would invalidate this
+          # draw, so say so loudly rather than reporting its suite result.
+          if [ "${zmm_masked:-unknown}" != "0" ]; then
+            echo "::error::The mask did not take: masked codegen still emits zmm ($zmm_masked)."
+            exit 1
+          fi
+
+      # Both arms run the suite exactly as `ci.yml` runs it, including the vacuity
+      # floor. Running only `coupled_condensed_tests.jl` would be faster and would
+      # also change the experiment: the leading hypothesis is allocation-dependent
+      # code generation, so the thirty testsets that run first are part of the
+      # condition being tested, not overhead to be optimised away.
+      #
+      # Output is redirected, never piped -- a pipe would discard the exit code that
+      # is the measurement here. `set +e` because a red arm is a result to record,
+      # not a job to fail.
+      - name: Arm A, unmasked -- the status quo
+        id: unmasked
+        run: |
+          set +e
+          julia --project=hornlab_beat_bem/julia \
+            .github/scripts/run_julia_suite.jl --min-passes=300 > unmasked-suite.log 2>&1
+          status=$?
+          set -e
+          condensed=$(grep -c -E 'coupled_condensed_tests\.jl:(592|618)' unmasked-suite.log || true)
+          echo "exit=$status" >> "$GITHUB_OUTPUT"
+          echo "condensed=$condensed" >> "$GITHUB_OUTPUT"
+          echo "exit status $status, $condensed condensed-assembly failures"
+          tail -n 25 unmasked-suite.log
+
+      - name: Arm B, masked -- the same host, AVX-512 off
+        id: masked
+        run: |
+          set +e
+          julia -C "$AVX512_MASK" --project=hornlab_beat_bem/julia \
+            .github/scripts/run_julia_suite.jl --min-passes=300 > masked-suite.log 2>&1
+          status=$?
+          set -e
+          condensed=$(grep -c -E 'coupled_condensed_tests\.jl:(592|618)' masked-suite.log || true)
+          echo "exit=$status" >> "$GITHUB_OUTPUT"
+          echo "condensed=$condensed" >> "$GITHUB_OUTPUT"
+          echo "exit status $status, $condensed condensed-assembly failures"
+          tail -n 25 masked-suite.log
+
+      # Diagnostic, not measurement. Reports which operators disagree and by how
+      # many ULPs, in a process that has run nothing else -- see the script's header
+      # for why a quiet probe does not imply a quiet suite.
+      - name: Probe the comparison directly
+        if: always()
+        run: |
+          set +e
+          julia --project=hornlab_beat_bem/julia .github/scripts/avx512_condensed_probe.jl > probe-unmasked.log 2>&1
+          julia -C "$AVX512_MASK" --project=hornlab_beat_bem/julia \
+            .github/scripts/avx512_condensed_probe.jl > probe-masked.log 2>&1
+          set -e
+          echo "--- unmasked ---"; grep -E '^probe' probe-unmasked.log || cat probe-unmasked.log
+          echo "--- masked ---";   grep -E '^probe' probe-masked.log   || cat probe-masked.log
+
+      - name: Verdict
+        if: always()
+        run: |
+          # An empty status means the step never ran -- which happens when the
+          # assay refused the draw -- and must not be reported as a failing suite.
+          arm() { case "$1" in 0) echo pass;; "") echo skipped;; *) echo fail;; esac; }
+          line="RESULT draw=${{ matrix.draw }}"
+          line="$line cpu=${{ steps.host.outputs.cpu_name }}"
+          line="$line avx512=${{ steps.host.outputs.avx512 }}"
+          line="$line zmm=${{ steps.assay.outputs.zmm_unmasked }}/${{ steps.assay.outputs.zmm_masked }}"
+          line="$line unmasked=$(arm '${{ steps.unmasked.outputs.exit }}')/${{ steps.unmasked.outputs.condensed }}"
+          line="$line masked=$(arm '${{ steps.masked.outputs.exit }}')/${{ steps.masked.outputs.condensed }}"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: draw-${{ matrix.draw }}
+          path: |
+            assay-*.log
+            probe-*.log
+            unmasked-suite.log
+            masked-suite.log
+          retention-days: 7
