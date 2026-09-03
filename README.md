@@ -459,7 +459,7 @@ All are environment variables; the defaults are the shipped configuration.
 | variable | default | effect |
 |---|---|---|
 | `BLAB_BEAT_DENSE_SOLVE` | `auto` | `lu` or `gmres` forces the choice past the cost model |
-| `BLAB_BEAT_GMRES_TOL` | `1e-6` | tolerance on the true relative residual |
+| `BLAB_BEAT_GMRES_TOL` | `1e-5` | tolerance on the true relative residual. Exterior solves only; the coupled FEM/LEM path factorizes directly. See `VENDORING.md` |
 | `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |

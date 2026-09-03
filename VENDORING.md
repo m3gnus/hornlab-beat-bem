@@ -104,6 +104,37 @@ quarter export: 228 runtime compilations on a first solve rather than 95, with
 against this package's own `SolveConfig`, so the next such divergence fails a
 test rather than costing two thirds of the win in silence.
 
+## Two later cherry-picks, 2026-09-03
+
+Two fork branches carry work that postdates `3ebc90a` and is on neither
+`feat/beat-adaptive-solve` nor the cold-start merge above. Both are taken here
+as verbatim file copies, and both had a base identical to `3ebc90a` for every
+file they touch, so each is exactly its own change and nothing else. That base
+is still current: the cold-start sync from `3ebc90a` to `cd50b3c` left
+`src/BeatEngineDenseSolve.jl`, `src/BeatEngineMetalField.jl` and
+`tests/runtests.jl` byte-for-byte unchanged, so re-basing these two picks onto
+it was a no-op rather than a merge.
+
+| branch | commit | files taken | what it does |
+|---|---|---|---|
+| `feat/beat-gmres-tolerance-1e-5` | `a52b8f4` | `src/BeatEngineDenseSolve.jl`, `tests/runtests.jl` | **exterior GMRES tolerance 1e-6 → 1e-5.** At 1e-6 the sliver-rim ATH meshes floor above the target below ~6 kHz and fall back to the dense LU, paying a full GMRES budget *and* the factorization. The radiated field moves at most 0.00100 dB. **Scoped to exterior solves**: the coupled FEM/LEM path factorizes directly and was never measured at either tolerance |
+| `feat/beat-metal-field-occupancy` | `ca5597a` | `src/BeatEngineMetalField.jl`, `scripts/benchmark_metal_field.jl` | **Metal field-evaluation occupancy.** The kernel launched one thread per evaluation point — a two-cut polar sweep is 74 points, so 74 threads on a 32-core GPU, each walking 13,650 quadrature sources (4× that with symmetry images). Chunking the source loop is ~20× on the stage (0.0571 → 0.0028 s/frequency) |
+| `feat/beat-metal-field-occupancy` | `d9ecee6` | `scripts/benchmark_metal_assembly_stages.jl`, `scripts/probe_metal_assembly_concurrency.jl` | the two probes behind the decision **not** to pursue cross-frequency concurrency: concurrent assemblies measure *slower* than sequential (0.85× at N=2), because one assembly already saturates the GPU |
+
+Measured effect on the shipped package, asro68 quarter export, M1 Max, against
+`hornlab-metal-bem` `74eca82` as an unchanged control — this is the package as
+it now stands, with no environment overrides:
+
+| case | metal-bem | BEAT-Metal | |
+|---|---:|---:|---|
+| 1,209 dofs, 3 frequencies | 0.539 s | **0.437 s** | BEAT 1.23× |
+| 1,209 dofs, 40 frequencies | **2.206 s** | 4.600 s | metal-bem 2.09× |
+| 4,552 dofs, 3 frequencies | 3.325 s | **2.322 s** | BEAT 1.43× |
+| 4,552 dofs, 40 frequencies | **20.79 s** | 27.95 s | metal-bem 1.34× |
+
+Before these two cherry-picks the 40-frequency quarter case was ~11 s. Far-field
+agreement is unchanged at 0.0082 dB main-lobe rms in band.
+
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind:
@@ -121,6 +152,9 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 | `hornlab_beat_bem/julia/test_fixtures/*.msh` | `tests/fixtures/{femvolume,exterior_conforming}.msh` |
 | `hornlab_beat_bem/julia/tests/runtests.jl` | `src/blab/solvers/julia_local/tests/` |
 | `hornlab_beat_bem/julia/scripts/*.jl`, except the four listed below | `src/blab/solvers/julia_local/scripts/` |
+
+Six of those files are taken from the two 2026-09-03 branches above rather than
+from the `3ebc90a` sync commit; they are verbatim copies of *those* commits.
 
 Every numerical result this package produces comes from those files, and they
 are unmodified. That is deliberate: it is what lets the extraction be verified
