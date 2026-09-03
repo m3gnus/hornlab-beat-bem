@@ -164,6 +164,134 @@ function regular_quadrature_selection(config, mesh::BoundaryMesh{T}, freq::T, so
     )
 end
 
+"""Gauss order that resolves a 1/r peak at a given separation-to-size ratio.
+
+An n-point Gauss rule integrating a function whose nearest pole sits outside
+the interval converges like `R^(-2n)`, with `R = rho + sqrt(rho^2 - 1)` the
+Bernstein-ellipse parameter and `rho` the pole distance in half-widths. Here
+`ratio` is the separation in *combined* circumradii, so a single element's
+half-width sees `rho ~ 2 * ratio`. Solving `2n * log(R) >= log(10^7)` for n
+gives the order below: ratio 0.75 asks for 8, ratio 1.0 for 6, ratio >= 1.5
+for the floor of 4 -- which is still a 16-point tensor rule against the
+6-point regular rule it replaces.
+"""
+function near_correction_order_for_ratio(ratio::Real, top_order::Int)
+    rho = 2 * Float64(ratio)
+    rho <= 1.0 && return top_order
+    bernstein = rho + sqrt(rho * rho - 1)
+    required = ceil(Int, log(1.0e7) / (2 * log(bernstein)))
+    return clamp(required, 4, top_order)
+end
+"""Near-singular face-pair selection.
+
+The vendored BEAT assembly corrects *coincident* and *edge/vertex-adjacent*
+element pairs with Duffy rules, and integrates every other pair with the plain
+regular Gauss rule. Pairs that are disjoint but close -- the second ring of a
+triangulation, the two sides of a thin wall, a mouth roll-back folding back on
+itself -- are neither, so their 1/r kernel is sampled by a 6-point rule across
+a peak the rule cannot resolve. `build_near_correction_cache` (upstream)
+re-integrates a supplied pair list with a high-order tensor-product rule and
+subtracts the regular contribution; this function decides which pairs earn it.
+
+Upstream selects pairs by an absolute metre threshold tuned for cabinet
+spacing, and grades the order into three hand-set distance bands. Quadrature
+error does not scale with metres, it scales with the ratio of pair separation
+to element size, so the threshold here is `separation / (r_test + r_trial)`
+with `r` the element circumradius, and the order each pair gets comes from
+`near_correction_order_for_ratio` rather than a band table -- which matters
+because the pair count grows like ratio^2, so a band scheme spends most of its
+budget on the pairs that need it least.
+"""
+function near_correction_selection(config, mesh::BoundaryMesh{T}, symmetry_mode::Symbol) where {T<:AbstractFloat}
+    Bool(get_value(config, "near_correction_enabled", false)) || return nothing
+    cutoff = Float64(get_value(config, "near_correction_cutoff", 2.0))
+    cutoff > 0.0 || error("near_correction_cutoff must be greater than zero.")
+    top_order = Int(get_value(config, "near_correction_order", 8))
+    top_order >= 4 || error("near_correction_order must be at least 4.")
+
+    face_count = length(mesh.faces)
+    face_count == 0 && return nothing
+    radii = [
+        maximum(norm(vertex - mesh.centroids[index]) for vertex in mesh.face_vertices[index])
+        for index in 1:face_count
+    ]
+    maximum(radii) > 0 || return nothing
+
+    identity_pairs = near_correction_pairs(mesh, radii, cutoff, top_order, nothing)
+    # A symmetric solve assembles each face against the mirror images of every
+    # other face as well, and those image pairs run closer than the identity
+    # ones -- a face a millimetre off the symmetry plane sits a hair from its
+    # own reflection. One cache carries one transform, so `yz+xz` needs three.
+    image_selections = Tuple{Any,Vector{Tuple{Int,Int,Int}}}[]
+    for transform in symmetry_image_transforms(symmetry_mode)
+        pairs = near_correction_pairs(mesh, radii, cutoff, top_order, transform)
+        pairs === nothing || push!(image_selections, (transform, pairs))
+    end
+    identity_pairs === nothing && isempty(image_selections) && return nothing
+    return (
+        identity_pairs=identity_pairs,
+        image_selections=image_selections,
+        cutoff=cutoff,
+        top_order=top_order,
+    )
+end
+
+"""Face pairs within `cutoff` combined circumradii, optionally across a mirror.
+
+With `transform === nothing` this is the self-domain search and a face is never
+paired with itself; across a mirror the `i == j` pair is the one that matters
+most, because that is a face against its own reflection.
+"""
+function near_correction_pairs(
+    mesh::BoundaryMesh{T},
+    radii::Vector{T},
+    cutoff::Float64,
+    top_order::Int,
+    transform,
+) where {T<:AbstractFloat}
+    face_count = length(mesh.faces)
+    trial_centroids = transform === nothing ? mesh.centroids :
+        [reflect_point(transform, centroid) for centroid in mesh.centroids]
+
+    # Cell edge equals the largest search radius any pair can ask for, so the
+    # 27-cell neighbourhood of a face is guaranteed to hold every candidate.
+    cell = cutoff * 2 * maximum(radii)
+    buckets = Dict{NTuple{3,Int},Vector{Int}}()
+    cell_of(point) = (
+        Int(floor(point[1] / cell)),
+        Int(floor(point[2] / cell)),
+        Int(floor(point[3] / cell)),
+    )
+    for index in 1:face_count
+        push!(get!(() -> Int[], buckets, cell_of(trial_centroids[index])), index)
+    end
+
+    pairs = Tuple{Int,Int,Int}[]
+    for test_index in 1:face_count
+        base = cell_of(mesh.centroids[test_index])
+        test_centroid = mesh.centroids[test_index]
+        test_radius = radii[test_index]
+        for dx in -1:1, dy in -1:1, dz in -1:1
+            neighbours = get(buckets, (base[1] + dx, base[2] + dy, base[3] + dz), nothing)
+            neighbours === nothing && continue
+            for trial_index in neighbours
+                transform === nothing && trial_index == test_index && continue
+                scale = test_radius + radii[trial_index]
+                scale > 0 || continue
+                ratio = norm(test_centroid - trial_centroids[trial_index]) / scale
+                ratio <= cutoff || continue
+                # Coincident and adjacent pairs already carry a Duffy
+                # correction; the cache builder drops them either way, but
+                # skipping the self-domain ones here keeps the list small.
+                transform === nothing &&
+                    elements_are_adjacent(mesh.faces[test_index], mesh.faces[trial_index]) &&
+                    continue
+                push!(pairs, (test_index, trial_index, near_correction_order_for_ratio(ratio, top_order)))
+            end
+        end
+    end
+    return isempty(pairs) ? nothing : pairs
+end
 function mesh_inputs_from_config(config)
     meshes = get_value(config, "meshes", Any[])
     if !isempty(meshes)
@@ -634,6 +762,10 @@ function pressure_to_spl(pressure, ::Type{T}) where {T<:AbstractFloat}
     return Float32.(T(20.0) .* log10.(abs.(pressure) ./ T(20e-6)))
 end
 
+function complex_vector_to_wire(values)
+    return Dict("real" => Float32.(real.(values)), "imag" => Float32.(imag.(values)))
+end
+
 function complex_rows_to_wire(rows)
     return Dict(
         "real" => [Float32.(real.(row)) for row in rows],
@@ -861,7 +993,18 @@ function solve_request_impl(request)
     source_motion = Symbol(lowercase(strip(String(get_value(config, "source_motion", "normal")))))
     source_motion in (:normal, :axial) || error("Unsupported source_motion: $(source_motion). Expected normal or axial.")
 
-    FloatType = Float32
+    # BEAT assembles and solves in Float32 because that is what its CUDA and
+    # ROCm kernels are written for. The CPU path is generic in the element
+    # type, so it can run the same solve in Float64 -- which is what makes it
+    # usable as an arbiter for how much of a discrepancy is single-precision
+    # noise rather than discretisation. Results stay Float32 on the wire.
+    solve_precision = lowercase(strip(String(get_value(config, "solve_precision", "single"))))
+    solve_precision in ("single", "double") ||
+        error("Unsupported solve_precision: $(solve_precision). Expected single or double.")
+    if solve_precision == "double" && beat_backend != :cpu
+        error("solve_precision=double is only available on the BEAT CPU backend.")
+    end
+    FloatType = solve_precision == "double" ? Float64 : Float32
     mesh_inputs = mesh_inputs_from_config(config)
     radiators = radiator_inputs_from_config(config, mesh_inputs)
     channels = channel_inputs_from_config(config)
@@ -906,6 +1049,7 @@ function solve_request_impl(request)
     rho = FloatType(get_value(config, "rho", 1.21))
     sound_speed = FloatType(get_value(config, "sound_speed", 343.0))
     flat_target = Bool(get_value(config, "flat_target_normalization_enabled", true))
+    surface_traces_enabled = Bool(get_value(config, "surface_traces_enabled", false))
     flat_target_reference_angle_deg = FloatType(get_value(config, "flat_target_reference_angle_deg", 0.0))
     channel_names = sort(unique([String(get_value(radiator, "channel", "main")) for radiator in radiators]))
     # The fused Burton-Miller path assembles the system matrix and every
@@ -917,12 +1061,53 @@ function solve_request_impl(request)
     # The fused path has one regular kernel of its own, so a request for a
     # specific diagnostic kernel mode has to fall back to the four-operator
     # path or the request would be silently ignored.
+    singular_cache = build_singular_correction_cache(mesh, singular_order)
+    near_selection = near_correction_selection(config, mesh, Symbol(symmetry_mode))
+    # The fused Burton-Miller path forms the combination inside the pair kernel
+    # and never reaches assemble_regular_galerkin_operators, which is the only
+    # place a near-correction cache is applied. It is on by default for :cpu and
+    # :metal, so leaving it on here would build every cache, report the pair
+    # counts in a status event, and then assemble without them -- a solve that
+    # says it was corrected and was not. Near-correction therefore takes the
+    # general operators path; it costs the fusion speed-up on those solves only.
     fused_burton_miller = beat_backend in (:cpu, :metal) &&
+        near_selection === nothing &&
         get(ENV, "BLAB_BEAT_FUSED_BM", "1") != "0" &&
         (beat_backend != :metal || (metal_assembly_mode != :host_staged &&
             BeatEngineCore._normalized_metal_singular_mode() == :native &&
             BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather))
-    singular_cache = build_singular_correction_cache(mesh, singular_order)
+    near_correction_cache = nothing
+    image_near_correction_caches = nothing
+    device_near_correction_cache = nothing
+    device_image_near_correction_caches = nothing
+    if near_selection !== nothing
+        if beat_backend == :rocm
+            # BeatEngineRocmAssembly has no near-pair kernel upstream; silently
+            # assembling without it would report a corrected solve that is not.
+            error("Near-singular correction is not implemented for the ROCm backend.")
+        end
+        if near_selection.identity_pairs !== nothing
+            near_correction_cache = build_near_correction_cache(
+                mesh, near_selection.identity_pairs, near_selection.top_order,
+            )
+        end
+        image_near_correction_caches = [
+            build_near_correction_cache(
+                mesh, pairs, near_selection.top_order; trial_transform=transform,
+            )
+            for (transform, pairs) in near_selection.image_selections
+        ]
+        emit_event(
+            "status";
+            message=@sprintf(
+                "Near-singular correction within %.2f element radii: %d self-domain pair(s), %d mirror-image pair(s) across %d transform(s)",
+                near_selection.cutoff,
+                near_correction_cache === nothing ? 0 : near_correction_cache.pair_count,
+                sum(cache.pair_count for cache in image_near_correction_caches; init=0),
+                length(image_near_correction_caches),
+            ),
+        )
+    end
     device_cache = nothing
     device_singular_cache = nothing
     device_image_singular_cache = nothing
@@ -948,6 +1133,19 @@ function solve_request_impl(request)
                 eachindex(mesh.faces),
                 Symbol(symmetry_mode),
             )
+        end
+        if near_correction_cache !== nothing && near_correction_cache.pair_count > 0
+            device_near_correction_cache = build_cuda_near_correction_cache(
+                near_correction_cache,
+                p1_space,
+                dp0_space,
+            )
+        end
+        if image_near_correction_caches !== nothing && !isempty(image_near_correction_caches)
+            device_image_near_correction_caches = [
+                build_cuda_near_correction_cache(cache, p1_space, dp0_space)
+                for cache in image_near_correction_caches
+            ]
         end
         cuda_solve_identity_cache = build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType)
     elseif beat_backend == :rocm
@@ -1166,12 +1364,15 @@ function solve_request_impl(request)
                     cpu_cache=selected_cpu_assembly_cache,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
+                    near_correction_cache=near_correction_cache,
+                    device_near_correction_cache=device_near_correction_cache,
+                    image_near_correction_cache=image_near_correction_caches,
+                    device_image_near_correction_cache=device_image_near_correction_caches,
                     rocm_assembly_mode=rocm_assembly_mode,
                     metal_assembly_mode=metal_assembly_mode,
                     symmetry_mode=Symbol(symmetry_mode),
                 ))
-            end
-        end
+            end        end
         metal_pipeline && (t_assembly = pipelined_assembly_seconds)
         operators = get(assembly_payload, :operators, nothing)
 
@@ -1206,6 +1407,7 @@ function solve_request_impl(request)
             end
         end
         channel_boundary_pressures = Vector{Vector{Complex{FloatType}}}()
+        channel_boundary_neumann = Vector{Vector{Complex{FloatType}}}()
         horizontal_pressure_rows = Vector{Vector{Complex{FloatType}}}()
         vertical_pressure_rows = Vector{Vector{Complex{FloatType}}}()
         diagonal_pressure_rows = diagonal_points === nothing ? nothing : Vector{Vector{Complex{FloatType}}}()
@@ -1259,6 +1461,7 @@ function solve_request_impl(request)
                     push!(sphere_pressure_rows, Complex{FloatType}.(combined_pressure[sphere_start:end]))
                 end
                 push!(channel_boundary_pressures, Complex{FloatType}.(pressure))
+                push!(channel_boundary_neumann, Complex{FloatType}.(q_neumann))
             end
         end
 
@@ -1271,6 +1474,7 @@ function solve_request_impl(request)
         synthesis = nothing
         drives = Complex{FloatType}[]
         mixed_boundary_pressure = zeros(Complex{FloatType}, length(mesh.vertices))
+        mixed_boundary_neumann = zeros(Complex{FloatType}, length(mesh.faces))
         t_field += @elapsed begin
             synthesis = synthesize_channel_basis(
                 channel_names,
@@ -1293,6 +1497,7 @@ function solve_request_impl(request)
             drives = radiator_drives_from_channel_basis(radiators, channels, freq, synthesis.corrections, FloatType)
             for channel_index in eachindex(channel_names)
                 mixed_boundary_pressure .+= channel_boundary_pressures[channel_index] .* synthesis.weights[channel_index]
+                mixed_boundary_neumann .+= channel_boundary_neumann[channel_index] .* synthesis.weights[channel_index]
             end
             impedance = impedance_for_radiators(mesh, element_mesh_ids, mixed_boundary_pressure, radiators, drives, FloatType; symmetry_mode=Symbol(symmetry_mode))
         end
@@ -1317,6 +1522,8 @@ function solve_request_impl(request)
                 "diagonal_spl_db" => synthesis.diagonal_spl,
                 "diagonal_spl_norm_db" => synthesis.diagonal_norm,
                 "sphere_pressure" => sphere_pressure_rows === nothing ? nothing : complex_rows_to_wire(sphere_pressure_rows),
+                "surface_pressure" => surface_traces_enabled ? complex_vector_to_wire(mixed_boundary_pressure) : nothing,
+                "surface_neumann" => surface_traces_enabled ? complex_vector_to_wire(mixed_boundary_neumann) : nothing,
                 "timings" => Dict(
                     "assembly_s" => Float32(t_assembly),
                     "solve_s" => Float32(t_solve),
@@ -1396,6 +1603,12 @@ function solve_request_impl(request)
         end
         if device_image_singular_cache !== nothing
             release_cuda_image_singular_correction_cache!(device_image_singular_cache)
+        end
+        # Same device-array layout as the image-singular cache upstream.
+        device_near_correction_cache === nothing ||
+            release_cuda_image_singular_correction_cache!(device_near_correction_cache)
+        for cache in something(device_image_near_correction_caches, ())
+            release_cuda_image_singular_correction_cache!(cache)
         end
     end
 

@@ -48,14 +48,23 @@ class SolveResult:
     timings: dict[str, float] = field(default_factory=dict)
     solver_log: list[dict] = field(default_factory=list)
 
-    # Populated only when ``ObservationConfig.sphere_grid`` asks for the
-    # theta-major spherical grid that HornLab's balloon/DI mapping needs; the
-    # solver's own Fibonacci-lattice sampling is a different layout and is not
-    # surfaced here. ``None`` otherwise, so downstream getattr-probes see an
-    # explicit None rather than an AttributeError.
+    # Populated whenever ``ObservationConfig.sphere_grid`` is set: the solver
+    # samples a theta-major grid and the package rebuilds the exact float64
+    # axes from the request, because the solver echoes them in Float32 radians
+    # and DI integration checks the endpoints. ``None`` when no grid was asked
+    # for. (F, n_theta*n_phi) and (n_theta*n_phi,).
     sphere_pressure_complex: NDArray[np.complex128] | None = None
     sphere_theta_deg: NDArray[np.float64] | None = None
     sphere_phi_deg: NDArray[np.float64] | None = None
+
+    # Boundary Cauchy datum, populated when ``SolveConfig.surface_traces`` is
+    # set: (F, n_vertices) P1 pressure and (F, n_faces) DP0 normal derivative,
+    # in the same unit-acceleration convention as ``pressure_complex``. Names
+    # match hornlab-metal-bem and hornlab-bempp-bem so HornLab's field-trace
+    # artifact builder consumes all three identically. Under a reduced-mesh
+    # symmetry solve these cover the fundamental domain, not the full body.
+    surface_pressure_complex: NDArray[np.complex128] | None = None
+    surface_neumann_complex: NDArray[np.complex128] | None = None
 
     @property
     def directivity_db(self) -> NDArray[np.float64]:
