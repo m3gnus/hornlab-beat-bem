@@ -29,6 +29,7 @@ below**, and everything not listed is a byte-for-byte copy.
 | Sync at 3ebc90a (2026-09-02) | `3ebc90aa95743b56dd19cd85ececf190d2672776` | `feat/beat-adaptive-solve` |
 | Current sync (2026-09-02) | `cd50b3c64771b242d681aaf440a5b786757ba35a` | `feat/beat-cold-start-adaptive` |
 | Cherry-pick (2026-09-03) | `1f90433` on `fix/condensed-entrywise-floor` | the :off condensed comparison becomes an entrywise absolute floor; decided by Magnus after the AVX-512 experiment |
+| Driver sync (2026-09-03) | `724d573d596b60db521a7ba618d04557ed7727d2` | `feat/beat-metal-pipeline-size-aware`, cut from `cd50b3c`: the Metal sweep overlap becomes a per-solve decision from the dof count |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`
@@ -169,15 +170,25 @@ The `julia_cuda/` project files carry one local addition, described below.
 
 ## What is modified, and why
 
-### Two runtime defaults, set from `hornlab_beat_bem/worker.py`
+### One runtime default, set from `hornlab_beat_bem/worker.py`
 
-Not source differences — the vendored solver is unchanged — but they mean this
-package's out-of-the-box behaviour is not upstream's, so they are listed here
-too. `BLAB_METAL_PIPELINE` defaults to `0` rather than `1`, and
+Not a source difference — the vendored solver is unchanged — but it means this
+package's out-of-the-box behaviour is not upstream's, so it is listed here too.
 `julia_threads="auto"` resolves to the performance-core count rather than
-`os.cpu_count()`. Both are `setdefault`-style: an explicit environment variable
-or an explicit `julia_threads` wins, and both were measured rather than
-assumed. See the README's "Sweep threads and sweep pipelining".
+`os.cpu_count()`. It is `setdefault`-style: an explicit `julia_threads` wins,
+and it was measured rather than assumed. See the README's "Sweep threads and
+sweep pipelining".
+
+**There used to be a second one, and it is gone.** `worker.py` set
+`BLAB_METAL_PIPELINE=0`, because the sweep overlap is a loss on the small
+symmetry-reduced meshes this package usually serves. That was the wrong place
+for the answer and, at a large enough mesh, the wrong answer: the worker starts
+before any mesh has been read, so a process-wide value could only ever suit one
+mesh size, and it cost ~1.4x on a full model. The choice moved upstream into
+`BeatEngineDriver.jl`, which knows the dof count and decides per solve — sync
+commit `267512c` above. `worker.py` now sets nothing, so an explicit
+`BLAB_METAL_PIPELINE` in the caller's environment still reaches the solver and
+still wins in both directions, and the default is the solver's own.
 
 ### `hornlab_beat_bem/julia/solver.jl` and `BeatEngineDriver.jl`
 
@@ -328,21 +339,15 @@ README carries the measured version:
 - `beat-engine-core.md` at `f536d9e` already records the A1r routing
   regression, so it is current; earlier copies of it claimed the operator
   never stagnates, which is retired.
-- `beat-engine-metal.md` describes the sweep pipelining as the shipped
-  behaviour. It is upstream's default and **not this package's**: `worker.py`
-  sets `BLAB_METAL_PIPELINE=0` unless the environment already names a value,
-  because the overlap is measurably slower on the small symmetry-reduced meshes
-  this package is built to serve. The sign reverses with mesh size — 0.89x on
-  the 1,209-dof quarter but **1.51x faster** on the 4,552-dof full model, over
-  40 frequencies, four interleaved rounds — so `0` is a default chosen for the
-  expected workload and not a finding that the overlap never pays. See the
-  README's "Sweep threads and sweep pipelining". The small-mesh measurement is
-  M1 Max, asro68 quarter, 12 frequencies, five interleaved rounds: 2.105 s
-  sequential against 2.313 s pipelined, and 2.792 s against 3.050 s at the old
-  thread default. The mechanism is that Metal.jl's command queues are task-local, so the spawned
-  assembly task builds a new queue every frequency. The solver source is
-  untouched; setting `BLAB_METAL_PIPELINE=1` restores upstream's behaviour
-  exactly, and the two paths agree to 3e-4 dB.
+- `beat-engine-metal.md` is **current again on the sweep pipelining**, and this
+  entry is kept only so that anyone holding an older copy of this file knows
+  why it said otherwise. Between 2026-09-02 and 2026-09-03 the page described
+  an unconditional overlap while `worker.py` forced `BLAB_METAL_PIPELINE=0`,
+  because the overlap is slower on the small symmetry-reduced meshes this
+  package usually serves. The sync at `267512c` removed the divergence at its
+  source: the page and the solver now both say the sweep decides per solve from
+  the dof count, so there is nothing left here to supersede. See the README's
+  "Sweep threads and sweep pipelining" for this package's own measurements.
 
 ## What is deliberately not vendored
 

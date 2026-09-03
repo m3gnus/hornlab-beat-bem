@@ -77,23 +77,17 @@ def _resolve_julia_threads(julia_threads: str | int = "auto") -> str:
 def _julia_process_env(julia_threads: str | int, julia_project: Path | None) -> dict[str, str]:
     env = os.environ.copy()
     env["JULIA_NUM_THREADS"] = _resolve_julia_threads(julia_threads)
-    # The solver's Metal sweep pipelining defaults on; it is a net loss and is
-    # switched off here rather than upstream, so the vendored solver stays a
-    # merge-clean copy. It assembles frequency i+1 on a spawned task while the
-    # CPU solves frequency i, but Metal.jl's command queues are task-local, so
-    # each frequency builds a new queue. Measured on an M1 Max, asro68 quarter:
-    # sequential 7.74 s, pipelined 9.43 s, and the ceiling there is small anyway
-    # -- 6.10 s of GPU assembly and field work against a 1.51 s CPU solve leaves
-    # only ~1.10x to overlap away.
+    # BLAB_METAL_PIPELINE is deliberately not set here any more. This function
+    # runs when the worker starts, which is before any mesh has been read, and
+    # whether overlapping the sweep pays is a property of the mesh: it is a loss
+    # on the small symmetry-reduced meshes this package usually serves and a
+    # ~1.5x win on a full model. A process-wide value could only ever be right
+    # for one of those, so the choice moved into the solver, which knows the dof
+    # count -- see `metal_pipeline_requested` in julia/BeatEngineDriver.jl and
+    # the README's "Sweep threads and sweep pipelining".
     #
-    # The sign reverses with mesh size, so this is a default for the expected
-    # workload and not a finding that the overlap never pays: over 40
-    # frequencies it is 0.89x on the 1,209-dof quarter but 1.51x FASTER on the
-    # 4,552-dof full model, where the CPU solve is a much larger share. Short
-    # per-band sweeps on symmetry-reduced meshes are what this package serves,
-    # which is the case that loses. Set BLAB_METAL_PIPELINE=1 to opt back in;
-    # a size-aware default is the follow-up.
-    env.setdefault("BLAB_METAL_PIPELINE", "0")
+    # An explicit BLAB_METAL_PIPELINE in the caller's environment still reaches
+    # the solver through the copy above and still wins, in both directions.
     if julia_project is not None:
         # The solver's accelerator hint falls back to the project directory
         # name; the env var makes the choice explicit even for custom paths.

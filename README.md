@@ -586,7 +586,7 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |
-| `BLAB_METAL_PIPELINE` | `0` here, `1` upstream | `1` overlaps the next frequency's GPU assembly with this one's CPU solve. Slower on small meshes, **1.51x faster at 4,552 dofs**; see below |
+| `BLAB_METAL_PIPELINE` | by mesh size | Overlaps the next frequency's GPU assembly with this one's CPU solve. Unset, the solver decides per solve — on at **1,900 P1 dofs** and above. `0` forces sequential, `1` forces the overlap; see below |
 | `BLAB_BEAT_ENGINE_BUNDLE` | `1` | `0` ignores the precompiled bundle and includes the engine from source: bit-identical to the pre-bundle package, at the old cold start |
 | `HORNLAB_BEAT_JULIA` | — | explicit Julia executable |
 | `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available |
@@ -597,9 +597,11 @@ places where this README's measurements supersede them.
 
 ### Sweep threads and sweep pipelining
 
-Two defaults differ from upstream's. Both are set from `worker.py`, so the
-vendored solver is unmodified and either can be put back with one environment
-variable.
+One default differs from upstream's, set from `worker.py`: the sweep's thread
+count. The other used to — `worker.py` forced `BLAB_METAL_PIPELINE=0` — and
+that answer now lives in the solver, which decides per solve from the mesh
+size. Both stories are below, because the numbers behind the old default are
+what motivated the new one.
 
 Measured on an M1 Max (8 performance + 2 efficiency cores) against the ATH
 `asro68` quarter model — 1,209 P1 dofs, Metal backend, fused Burton-Miller —
@@ -621,13 +623,44 @@ path sets BLAS to `Threads.nthreads()`, so `os.cpu_count()` put 2 of 10
 factorization threads on the efficiency cores and the other 8 waited for them.
 On a symmetric part this resolves to the same number as before.
 
-**`BLAB_METAL_PIPELINE` defaults off.** Assembling frequency i+1 on a spawned
-task while the CPU solves frequency i costs about 10% rather than saving
-anything, because Metal.jl's command queues are task-local and the spawned task
-builds a new one every frequency. This was first measured as a larger penalty
-at the old 10-thread default, which suggested it was an artifact of
+**`BLAB_METAL_PIPELINE` is decided per solve, from the dof count.** Assembling
+frequency i+1 on a spawned task while the CPU solves frequency i costs about 10%
+on this model rather than saving anything. This was first measured as a larger
+penalty at the old 10-thread default, which suggested it was an artifact of
 oversubscribing the performance cores; the table above rules that out, since it
 costs the same 1.09x at 8 threads.
+
+**Where that cost comes from, measured rather than assumed.** The standing
+explanation here and upstream was the command queue: Metal.jl keeps it in
+task-local storage, so the spawned task builds its own every frequency. That is
+true and it is not the mechanism. Timed directly, a spawned task's Metal
+overhead is a fixed **0.23–0.29 ms**, and it does not grow with the number of
+kernels the task dispatches — 0.288 ms for a task doing one launch, 0.129 ms for
+one doing a hundred. The per-frequency penalty it has to explain is two orders
+of magnitude larger. Comparing the two arms stage by stage over 20 frequencies,
+best of three rounds:
+
+| stage | quarter, 1,209 dofs | full, 4,552 dofs |
+|---|---:|---:|
+| assembly | +30.3 ms/freq | +25.8 ms/freq |
+| field evaluation | +105.2 ms/freq | +74.4 ms/freq |
+| CPU solve | +10.2 ms/freq | +80.8 ms/freq |
+
+So the cost is GPU-side contention, not queue construction. One assembly
+already saturates this GPU — the cross-frequency concurrency probes reached the
+same conclusion from the other direction, measuring concurrent assemblies at
+0.85x of sequential — so dispatching the next assembly while this frequency's
+field evaluation is still running does not find idle silicon, it interleaves two
+queues over the same units. The same GPU work (assembly plus field) measures
+**2.82 s sequentially against 5.53 s split across two tasks** on the quarter,
+and 8.11 s against 10.11 s on the full model. The CPU solve pays separately, for
+the core the spawned task takes.
+
+**This retires the obvious follow-up.** A persistent assembly task holding one
+command queue would recover ~0.25 ms per frequency out of ~145. The lever that
+would pay is not overlapping GPU work with GPU work — keeping the field
+evaluation off the assembly's back — and that is a scheduling change, not a
+queue-lifetime one.
 
 On *this model* there is also not much to win by fixing it rather than switching
 it off. Instrumented separately here, the sweep is **6.10 s of GPU assembly and
@@ -635,27 +668,68 @@ field evaluation against a 1.51 s CPU solve** — the solve is 20% of the work, 
 a *perfect* scheduler reaches ~6.1 s against 7.74 s, about **1.10x**, and neither
 arm has an idle core to reclaim.
 
-**But the sign of the effect depends on mesh size, so `0` is a default and not a
-verdict.** The ratio above is the small model's; the CPU solve grows faster than
-the GPU assembly does, so on a larger mesh there is a much bigger CPU share to
-hide behind. Measured over 40 frequencies from 100 Hz to 20 kHz, four
-interleaved rounds, minimum:
+**The sign of the effect depends on mesh size, which is why neither `0` nor `1`
+is the right default.** The ratio above is the small model's; the CPU solve grows
+as O(N^3) against the assembly's O(N^2), so on a larger mesh there is a much
+bigger CPU share to hide behind while the GPU contention it pays for does not
+grow with it. Measured over 20 frequencies from 100 Hz to 20 kHz, minimum of four
+interleaved rounds:
 
-| model | `PIPELINE=0` | `PIPELINE=1` | |
-|---|---:|---:|---|
-| asro68 quarter, 1,209 dofs | **5.299 s** | 5.928 s | pipelining 0.89x |
-| asro68 full, 4,552 dofs | 27.832 s | **18.431 s** | pipelining **1.51x** |
+| model | P1 dofs | symmetry | `PIPELINE=0` | `PIPELINE=1` | |
+|---|---:|---|---:|---:|---|
+| asro68 quarter | 1,209 | `xy` | **3.217 s** | 3.354 s | 0.96x |
+| ATH ladder A1 | 1,974 | off | 3.523 s | **3.118 s** | 1.13x |
+| ATH ladder A2 | 2,559 | off | 5.509 s | **4.642 s** | 1.19x |
+| ATH ladder A3 | 3,898 | off | 9.247 s | **7.218 s** | 1.28x |
+| asro68 full | 4,552 | off | 13.481 s | **9.802 s** | **1.38x** |
+| asro68 quarter, subdivided | 4,692 | `xy` | 29.718 s | **26.769 s** | 1.11x |
+| ATH ladder A5 | 5,107 | off | 15.058 s | **11.616 s** | 1.30x |
 
-All four rounds agree at both sizes. The default stays `0` because the calls this
-package is built to serve are short per-band sweeps on symmetry-reduced meshes,
-which is the row where it loses — but anyone sweeping a full model at this size
-or above should set `BLAB_METAL_PIPELINE=1`, and a size-aware default is the
-obvious follow-up rather than a fix to the queue handling.
+The crossover was then pinned with six spheres filling the gap the waveguide
+ladder leaves between 1,209 and 1,974, in a second run of five rounds: 1,202
+dofs 0.82x, 1,514 0.97x, 1,742 0.96x, 1,986 1.13x, 2,382 1.22x, 3,122 1.19x.
+The two families agree where they overlap — the 1,986-dof sphere's 1.13x against
+the 1,974-dof waveguide's 1.13x — so the crossover is between 1,742 and 1,986
+dofs, and **the default is on at 1,900 and above**.
+
+Two things that table is evidence for beyond the threshold itself. The rule can
+be expressed in dofs alone: the subdivided quarter wins at 4,692 dofs with two
+mirror planes, so a symmetry mode that quadruples the assembly does not move the
+sign, and the solver needs to know nothing about images. And 1,900 is a machine
+constant, not a physical one — a GPU with capacity to spare during an assembly,
+or a slower dense solve, puts it elsewhere. That is why the environment variable still wins
+in both directions, and why every frequency now reports its `metal_pipeline`
+choice and `p1_dof_count` in `native_diagnostics`: a size-aware default that
+reported nothing would have invisible regressions.
+
+**What the change is worth, end to end.** Against the previous shipped
+behaviour, which forced the overlap off at every size — minimum of three
+interleaved rounds, and the choice read back from the diagnostic rather than
+inferred from the clock:
+
+| model | dofs | frequencies | before | after | |
+|---|---:|---:|---:|---:|---|
+| asro68 quarter | 1,209 | 40 | 5.459 s | 5.477 s | 1.00x, overlap off |
+| asro68 quarter | 1,209 | 3 | 0.468 s | 0.451 s | 1.04x, overlap off |
+| asro68 full | 4,552 | 40 | 25.434 s | **17.520 s** | **1.45x**, overlap on |
+| asro68 full | 4,552 | 3 | 2.155 s | **1.784 s** | **1.21x**, overlap on |
+
+The quarter rows are the point of the two-sided check: the mesh this package
+serves most often is unchanged, within noise, because the heuristic leaves it
+sequential. The full model gains 1.45x on a long sweep and still 1.21x on a
+three-frequency one, so the win does not depend on having many frequencies to
+amortize the first, un-overlapped assembly over. The two scheduling paths agree
+to 1.2e-3 dB, the assembly's own run-to-run noise floor.
 
 So the ~1.10x ceiling argument is sound only where the CPU solve really is 20% of
 the work. An engine that overlaps frequencies and is further ahead than that is
 ahead on assembly speed; the overlap is a consequence of having a large CPU share
 to hide behind, not a separate thing to copy.
+
+Every timing above records the number of foreign Julia workers on the machine
+around each sample and discards the sample if there were any; all three runs are
+0 dropped, of 56, 60 and 24 samples. Two of them had to be: a peer session's
+solver made the first attempt at this measurement wrong by a factor of seven.
 
 ## Licence and provenance
 

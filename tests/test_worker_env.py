@@ -42,12 +42,20 @@ def test_performance_core_count_matches_sysctl_on_asymmetric_apple_silicon():
         assert int(_resolve_julia_threads("auto")) < (os.cpu_count() or 1)
 
 
-def test_metal_sweep_pipelining_is_off_by_default():
+def test_metal_sweep_pipelining_is_left_for_the_solver_to_decide(monkeypatch):
+    """The worker starts before any mesh is known, so it must not answer this.
+
+    Setting a value here would pin one answer for every solve the worker goes
+    on to run, and the right answer depends on the mesh: see
+    `metal_pipeline_requested` in julia/BeatEngineDriver.jl.
+    """
+    monkeypatch.delenv("BLAB_METAL_PIPELINE", raising=False)
     env = _julia_process_env("auto", None)
-    assert env["BLAB_METAL_PIPELINE"] == "0"
+    assert "BLAB_METAL_PIPELINE" not in env
 
 
-def test_metal_sweep_pipelining_can_be_opted_back_in(monkeypatch):
-    monkeypatch.setenv("BLAB_METAL_PIPELINE", "1")
-    env = _julia_process_env("auto", None)
-    assert env["BLAB_METAL_PIPELINE"] == "1"
+def test_an_explicit_metal_sweep_pipelining_choice_still_reaches_the_solver(monkeypatch):
+    for value in ("0", "1"):
+        monkeypatch.setenv("BLAB_METAL_PIPELINE", value)
+        env = _julia_process_env("auto", None)
+        assert env["BLAB_METAL_PIPELINE"] == value
