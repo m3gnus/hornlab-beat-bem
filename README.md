@@ -19,6 +19,7 @@ which records the exact upstream commit and every difference from it.
 | `hornlab_beat_bem/julia/tests/` | the Julia test suite (`runtests.jl`) |
 | `hornlab_beat_bem/julia{,_cuda,_rocm,_metal}/` | one Julia project per backend |
 | `hornlab_beat_bem/*.py` | the Python wrapper: config, sweep, worker, capability probe, runtime provisioning |
+| `hornlab_beat_bem/worker{_registry,_host,_client}.py` | the worker that outlives the application: its key and registry, the detached host process, the adopting client |
 | `docs/` | Boundary Lab's BEAT Engine and coupled-solver documentation |
 
 **Formulation.** Galerkin Burton-Miller with P1 pressure and DP0 Neumann
@@ -109,7 +110,7 @@ config = beat.SolveConfig(
     observation=beat.ObservationConfig(distance_m=2.0, angle_count=37),
 )
 result = beat.solve_frequencies("horn.msh", [500.0, 1000.0, 2000.0], config)
-beat.shutdown_workers()
+beat.shutdown_workers()      # or detach_workers() to leave it warm for next time
 ```
 
 `solve_frequencies()` is the convention boundary. Every returned array is
@@ -299,6 +300,93 @@ It costs the old start-up.
 On the Metal backend the question answers itself — the `native` singular
 correction's atomics already make two runs of the *same* code differ by more
 than this does.
+
+### The worker outlives the application
+
+Keeping one worker alive across solves removes the cold start *within* a
+session. It does nothing for the next session, and that is where the cost was
+actually being paid: an application that starts a worker, solves, and quits
+pays the whole thing again on its next launch. Measured on the packaged
+Waveguide Generator 0.3.1 on an M1 Max, from the app's own job events: 15-19 s
+to the first result after a restart against 3.4-3.9 s warm, with the warm-up
+firing correctly. **The warm-up cannot fix it** — the warm-up and the user's
+first solve compete for the same single worker, so whichever wins pays the
+compilation and the other waits for it. The wait is reshuffled, not removed.
+
+So the worker now outlives the client. A detached **host process** owns the
+Julia child on the same inherited-pipe protocol as before and serves it over a
+socket; a later application launch finds that host in a per-user registry and
+adopts it, Julia runtime and all.
+
+Measured here, three consecutive Python processes against a fresh registry,
+`--project=julia_metal`, four-triangle tetrahedron, machine under load:
+
+| | first process | second | third |
+|---|---|---|---|
+| worker ready | 24.00 s | **0.01 s** | **0.01 s** |
+| first solve | 12.15 s | **0.02 s** | **0.02 s** |
+| SPL | 37.11 dB | 37.11 dB | 37.11 dB |
+
+The same shape on the CPU backend is 2.00 s against 0.01 s. The SPL row is the
+control: adoption returns the same numbers, because it is the same runtime —
+the host pid *and* the Julia pid are unchanged across all three.
+
+**Why a host process rather than a socket in Julia.** `julia/src/` is a
+verbatim vendored copy (`VENDORING.md`), and a transport change there would
+have to be re-applied on every re-sync, permanently. The host keeps the Julia
+side untouched: it speaks the JSON lines `BeatEngineDriver.jl` has always
+spoken, on the same stdin and stdout.
+
+**Identity is the whole safety argument.** A worker is adopted only when the
+Julia executable, the solver script, the project, the sysimage, the thread
+count, the installed package version, a **content fingerprint of the wrapper
+and the vendored engine**, the Julia-relevant environment
+(`JULIA_DEPOT_PATH`, `JULIA_LOAD_PATH`, `JULIA_PROJECT`, every `BLAB_*`) and
+the wire protocol version all match. The last four are in there because an
+adoption that crosses them has no symptom: the wrong worker answers every
+request perfectly and returns the previous configuration's numbers. The
+fingerprint is the one doing the work — **the version number cannot**, because
+consumers pin this repository by commit SHA, so the declared version sits
+still across a re-vendor, a driver fix or a wrapper change while the solver
+underneath it moves. It hashes `hornlab_beat_bem/*.py`, `julia/*.jl`,
+`julia/src/*.jl` and `julia_engine/*/src/*.jl`: 1.2 MB over 60 files, 7.5 ms
+once per process against the 15 s it protects. The host re-checks the key
+during the handshake, so a client cannot talk its way in past a record it was
+handed.
+
+**Lifetime, for an embedding application:**
+
+```python
+beat.detach_workers()      # quit hook: let go, leave the worker running
+beat.shutdown_workers()    # stop the worker too (the default; scripts, tests)
+```
+
+`shutdown_workers(detach=True)` is the same thing as `detach_workers()`. An
+application that wants a warm next launch calls the detaching one from its
+shutdown hook and nothing else changes: `get_worker`, `solve_frequencies` and
+`warm_up` keep their signatures, and a solve is streamed through the host
+exactly as it was through the pipe.
+
+Nothing accumulates. A host with no connected client and no running job retires
+itself after `HORNLAB_BEAT_WORKER_IDLE_S` (30 minutes by default), and every
+way a host can be gone — a dead pid in the registry, a socket file nobody
+answers, a wedged process, a client killed mid-solve — resolves to a clean
+respawn. Two applications launched together take a cross-process lock, so the
+race produces one worker rather than two. A client that dies mid-solve is
+noticed by the host, which cancels the job and replaces the runtime rather than
+handing a mid-job worker to the next adopter.
+
+**Retiring is no longer expensive.** A failed or abandoned solve still retires
+the Julia child — after an accelerator failure the runtime may be in any state
+— but the host immediately starts its replacement, so the compilation happens
+while nobody is waiting rather than in front of the next solve.
+
+**Transport.** A Unix domain socket where one is available and the path fits in
+`sun_path` (about 100 bytes), and a loopback TCP port otherwise. The fallback
+is both the Windows path and what a deep registry directory selects on POSIX,
+so the two are not separate code. Both are guarded the same way: the registry
+directory is 0700, the key file is 0600, and the handshake carries a per-host
+token that only a process able to read that file can present.
 
 ## Measured performance
 
@@ -590,6 +678,11 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_BEAT_ENGINE_BUNDLE` | `1` | `0` ignores the precompiled bundle and includes the engine from source: bit-identical to the pre-bundle package, at the old cold start |
 | `HORNLAB_BEAT_JULIA` | — | explicit Julia executable |
 | `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available |
+| `HORNLAB_BEAT_PERSISTENT_HOST` | `1` | `0` runs the worker as a child of this process again — it dies with the application, and every launch pays the cold start |
+| `HORNLAB_BEAT_WORKER_IDLE_S` | `1800` | how long a host with no connected client and no job stays alive |
+| `HORNLAB_BEAT_WORKER_DIR` | per-user | where the registry (key files, sockets, host logs) lives |
+| `HORNLAB_BEAT_WORKER_SPAWN_TIMEOUT_S` | `60` | how long a client waits for a host it started to become reachable |
+| `HORNLAB_BEAT_WORKER_TRANSPORT` | by platform | `unix` or `tcp`, forcing a transport that would not otherwise be chosen |
 
 `docs/beat-engine-metal.md` and `docs/beat-engine-core.md` list the rest.
 Those pages are Boundary Lab's, kept verbatim; `VENDORING.md` notes the
@@ -752,7 +845,20 @@ sync preserves unchanged: `beat_engine_status`, `SolveConfig`,
 `ObservationConfig`, `ObservationFrame`, `reject_unsupported_native_symmetry`,
 `solve_frequencies`, `shutdown_workers`.
 
-Two things a consumer should know before bumping its pin:
+Three things a consumer should know before bumping its pin:
+
+- **The Julia worker now outlives the application, and a consumer has to opt
+  into that.** `shutdown_workers()` still stops it, so an unchanged consumer
+  keeps its old behaviour and its old cold start. To get the warm launch, call
+  `detach_workers()` — new, and importable from the package root — from the
+  quit hook instead. In Waveguide Generator that is one line in
+  `server/app.py`'s `shutdown_beat_worker`: `from hornlab_beat_bem import
+  detach_workers` and `await asyncio.to_thread(detach_workers)`. Nothing else
+  changes; the prewarm task is still cancelled first, and a worker left running
+  retires itself after 30 minutes. See
+  [The worker outlives the application](#the-worker-outlives-the-application)
+  for what the consumer is opting into, and
+  `HORNLAB_BEAT_PERSISTENT_HOST=0` for the escape hatch.
 
 - **`beat_engine_status()` now reports *available* on Apple Silicon**, with
   backend `metal`, where it previously reported no supported GPU. For an

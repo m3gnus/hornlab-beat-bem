@@ -37,6 +37,42 @@ So do not verify this by running it and seeing output. Count runtime
 compilations (`julia --trace-compile=stderr`) or measure time to first result
 through the worker; `tests/test_engine_bundles.py` does both.
 
+## The worker is not your child process
+
+Since 0.3.2 a Julia worker runs inside a detached host process and survives
+the Python process that started it, so that an application restart can adopt a
+warm runtime instead of recompiling one (README, *The worker outlives the
+application*). Two consequences matter while working here.
+
+**You can be talking to code you have already changed.** A worker is keyed on
+a content fingerprint of `hornlab_beat_bem/*.py`, `julia/*.jl`, `julia/src/*.jl`
+and `julia_engine/*/src/*.jl` precisely so that an edit produces a new key and
+never adopts the old worker. Anything that changes behaviour but is *not* in
+that list -- a file outside those globs, or a Julia depot mutated in place --
+is invisible to the key, and a stale worker will answer with the old
+behaviour and no symptom. If a change refuses to take effect, that is the
+first hypothesis; stop the hosts and try again.
+
+```python
+from hornlab_beat_bem import worker_registry as r
+from hornlab_beat_bem.worker_client import find_live_hosts
+for record in find_live_hosts():          # every host this user is running
+    print(record.pid, record.endpoint.as_dict(), record.key["package_fingerprint"])
+    r.terminate_pid(record.pid)
+```
+
+`HORNLAB_BEAT_PERSISTENT_HOST=0` runs the worker as a child process again,
+which is the old behaviour and the fastest way to take the mechanism out of a
+bisection.
+
+**The suite runs its own registry.** `tests/conftest.py` points every test at a
+throwaway directory and kills whatever is left in it, so a test run neither
+adopts nor stops the worker a developer has warm. `tests/fake_julia_worker.py`
+stands in for `solver.jl --worker` in the lifecycle tests -- same protocol, no
+Julia -- so `tests/test_worker_persistence.py` runs in seconds and in CI on any
+host. It is not a substitute for the real thing: `pytest -m slow` still drives
+a real Julia worker through the same host.
+
 ## A consumer pins this repository by SHA
 
 Waveguide Generator pins `hornlab-beat-bem` in `pins.json` and
