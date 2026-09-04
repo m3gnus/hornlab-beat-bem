@@ -149,6 +149,13 @@ def test_the_key_separates_workers_that_must_not_be_shared():
     assert registry.key_id(base) != registry.key_id(fake_key(version="test-0.0.1"))
     assert registry.key_id(base) != registry.key_id(fake_key(fingerprint="fp1"))
 
+    with_runtime = dict(base, julia_executable="/different/julia")
+    with_project = dict(base, julia_project="/different/project")
+    with_sysimage = dict(base, julia_sysimage="/different/sysimage")
+    assert registry.key_id(base) != registry.key_id(with_runtime)
+    assert registry.key_id(base) != registry.key_id(with_project)
+    assert registry.key_id(base) != registry.key_id(with_sysimage)
+
     with_env = dict(base)
     with_env["environment"] = {"BLAB_METAL_PIPELINE": "1"}
     assert registry.key_id(base) != registry.key_id(with_env)
@@ -191,6 +198,191 @@ def test_the_fingerprint_follows_the_code_not_the_version_number():
         scratch.unlink()
         package_fingerprint.cache_clear()
     assert package_fingerprint() == before
+
+
+def test_the_fingerprint_includes_dependency_manifests_and_relative_names(
+    monkeypatch, tmp_path
+):
+    from hornlab_beat_bem import runtime
+
+    package = tmp_path / "package"
+    backend = package / "julia_metal"
+    bundle = package / "julia_engine" / "BeatEngineMetalBundle"
+    backend.mkdir(parents=True)
+    bundle.mkdir(parents=True)
+    (package / "wrapper.py").write_text("# wrapper\n", encoding="utf-8")
+    (backend / "Project.toml").write_text("name = \"Backend\"\n", encoding="utf-8")
+    manifest = backend / "Manifest.toml"
+    manifest.write_text("version = \"1\"\n", encoding="utf-8")
+    bundle_project = bundle / "Project.toml"
+    bundle_project.write_text("name = \"Bundle\"\n", encoding="utf-8")
+
+    monkeypatch.setattr(runtime, "PACKAGE_DIR", package)
+    runtime.package_fingerprint.cache_clear()
+    try:
+        before = runtime.package_fingerprint()
+        os.utime(manifest, (1, 1))
+        runtime.package_fingerprint.cache_clear()
+        assert runtime.package_fingerprint() == before
+
+        manifest.write_text("version = \"2\"\n", encoding="utf-8")
+        runtime.package_fingerprint.cache_clear()
+        after_manifest = runtime.package_fingerprint()
+        assert after_manifest != before
+
+        bundle_project.write_text("name = \"ChangedBundle\"\n", encoding="utf-8")
+        runtime.package_fingerprint.cache_clear()
+        before_rename = runtime.package_fingerprint()
+        assert before_rename != after_manifest
+
+        renamed = package / "julia_rocm"
+        backend.rename(renamed)
+        runtime.package_fingerprint.cache_clear()
+        assert runtime.package_fingerprint() != before_rename
+    finally:
+        runtime.package_fingerprint.cache_clear()
+
+
+def test_the_fingerprint_includes_custom_project_and_sysimage(tmp_path):
+    from hornlab_beat_bem.runtime import package_fingerprint
+
+    project = tmp_path / "custom-project"
+    project.mkdir()
+    (project / "Project.toml").write_text("name = \"Custom\"\n", encoding="utf-8")
+    manifest = project / "Manifest.toml"
+    manifest.write_text("version = \"1\"\n", encoding="utf-8")
+    sysimage = tmp_path / "custom.so"
+    sysimage.write_bytes(b"image-1")
+
+    package_fingerprint.cache_clear()
+    before = package_fingerprint(project, sysimage)
+    os.utime(manifest, (1, 1))
+    os.utime(sysimage, (1, 1))
+    package_fingerprint.cache_clear()
+    assert package_fingerprint(project, sysimage) == before
+
+    manifest.write_text("version = \"2\"\n", encoding="utf-8")
+    package_fingerprint.cache_clear()
+    after_project = package_fingerprint(project, sysimage)
+    assert after_project != before
+
+    package_fingerprint.cache_clear()
+    assert package_fingerprint(project / "Project.toml", sysimage) == after_project
+    manifest.write_text("version = \"3\"\n", encoding="utf-8")
+    package_fingerprint.cache_clear()
+    after_project_file = package_fingerprint(project / "Project.toml", sysimage)
+    assert after_project_file != after_project
+
+    sysimage.write_bytes(b"image-2")
+    package_fingerprint.cache_clear()
+    assert package_fingerprint(project / "Project.toml", sysimage) != after_project_file
+
+
+def test_worker_identity_uses_selected_project_and_sysimage_content(tmp_path):
+    from hornlab_beat_bem.runtime import package_fingerprint
+    from hornlab_beat_bem.worker import worker_key
+
+    project = tmp_path / "custom-project"
+    project.mkdir()
+    (project / "Project.toml").write_text("name = \"Custom\"\n", encoding="utf-8")
+    manifest = project / "Manifest.toml"
+    manifest.write_text("version = \"1\"\n", encoding="utf-8")
+    sysimage = tmp_path / "custom.so"
+    sysimage.write_bytes(b"image-1")
+    arguments = {
+        "julia_executable": sys.executable,
+        "solver_script": FAKE_WORKER,
+        "julia_threads": "1",
+        "julia_project": project,
+        "julia_sysimage": sysimage,
+    }
+
+    package_fingerprint.cache_clear()
+    before = worker_key(**arguments)
+    manifest.write_text("version = \"2\"\n", encoding="utf-8")
+    package_fingerprint.cache_clear()
+    after_project = worker_key(**arguments)
+    assert registry.key_id(after_project) != registry.key_id(before)
+
+    sysimage.write_bytes(b"image-2")
+    package_fingerprint.cache_clear()
+    after_sysimage = worker_key(**arguments)
+    assert registry.key_id(after_sysimage) != registry.key_id(after_project)
+
+
+def test_windows_default_registry_is_stable_across_processes(tmp_path):
+    """Source-level Windows check using two independent app processes."""
+
+    environment = os.environ.copy()
+    environment.pop(registry.WORKER_DIR_ENV_VAR, None)
+    environment["LOCALAPPDATA"] = str(tmp_path / "local-app-data")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).resolve().parents[1]), environment.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from hornlab_beat_bem.worker_registry import _default_worker_dir; "
+            "print(_default_worker_dir('nt'))"
+        ),
+    ]
+
+    first = subprocess.run(
+        command, capture_output=True, text=True, check=True, env=environment
+    ).stdout.strip()
+    second = subprocess.run(
+        command, capture_output=True, text=True, check=True, env=environment
+    ).stdout.strip()
+    assert first == second == str(
+        tmp_path / "local-app-data" / "HornLab" / "BEAT" / "workers"
+    )
+
+
+@pytest.mark.parametrize("fallback", ["local_app_data", "home"])
+def test_windows_default_registry_fallbacks_are_local_and_pid_independent(
+    fallback, monkeypatch, tmp_path
+):
+    local_app_data = tmp_path / "local-app-data"
+    home = tmp_path / "home"
+    roaming = tmp_path / "roaming-must-not-be-used"
+    monkeypatch.setenv("APPDATA", str(roaming))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+
+    if fallback == "local_app_data":
+        monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+        monkeypatch.setattr(
+            Path, "home", lambda: (_ for _ in ()).throw(AssertionError("home used"))
+        )
+        expected_root = local_app_data
+    elif fallback == "home":
+        monkeypatch.setattr(Path, "home", lambda: home)
+        expected_root = home / "AppData" / "Local"
+
+    first = registry._default_worker_dir("nt")
+    second = registry._default_worker_dir("nt")
+    assert first == second == expected_root / "HornLab" / "BEAT" / "workers"
+    assert roaming not in first.parents
+
+
+def test_windows_default_registry_refuses_a_shared_fallback(monkeypatch, tmp_path):
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "roaming-must-not-be-used"))
+    monkeypatch.setattr(
+        Path, "home", lambda: (_ for _ in ()).throw(RuntimeError("no home"))
+    )
+
+    with pytest.raises(RuntimeError, match=registry.WORKER_DIR_ENV_VAR):
+        registry._default_worker_dir("nt")
+
+
+def test_worker_dir_creates_the_selected_default(monkeypatch, tmp_path):
+    expected = tmp_path / "registry"
+    monkeypatch.delenv(registry.WORKER_DIR_ENV_VAR, raising=False)
+    monkeypatch.setattr(registry, "_default_worker_dir", lambda: expected)
+
+    assert registry.worker_dir() == expected
+    assert expected.is_dir()
 
 
 def test_a_socket_path_too_long_for_sun_path_selects_loopback(monkeypatch, tmp_path):

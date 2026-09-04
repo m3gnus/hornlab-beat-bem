@@ -44,14 +44,37 @@ def package_version() -> str | None:
 _FINGERPRINT_GLOBS = (
     "*.py",
     "julia/*.jl",
+    "julia*/Project.toml",
+    "julia*/Manifest.toml",
     "julia/src/*.jl",
+    "julia_engine/*/Project.toml",
+    "julia_engine/*/Manifest.toml",
     "julia_engine/*/src/*.jl",
 )
 
 
-@lru_cache(maxsize=1)
-def package_fingerprint() -> str:
-    """A content hash of the wrapper and the vendored engine.
+def _hash_file(digest: Any, path: Path, identity: str) -> None:
+    """Add one named file to a runtime identity without trusting its mtime."""
+
+    name = identity.encode("utf-8")
+    content = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                content.update(chunk)
+    except OSError:
+        content.update(b"<unreadable>")
+    digest.update(len(name).to_bytes(4, "big"))
+    digest.update(name)
+    digest.update(content.digest())
+
+
+@lru_cache(maxsize=16)
+def package_fingerprint(
+    julia_project: str | Path | None = None,
+    julia_sysimage: str | Path | None = None,
+) -> str:
+    """A content hash of the wrapper and the selected Julia runtime inputs.
 
     ``package_version()`` is the obvious staleness signal and it is not enough
     here: consumers pin this repository **by commit SHA**, so the declared
@@ -63,20 +86,41 @@ def package_fingerprint() -> str:
     the process that started it, so that adoption is now possible in the field
     and not only in an editable development tree.
 
+    The backend environments and bundle projects are part of the package
+    identity too. A Manifest can change the code Julia loads while every
+    Python and Julia source file stays byte-identical. For the same reason an
+    explicitly selected project and sysimage are hashed as runtime inputs;
+    their resolved paths remain separate fields in the worker key.
+
     Content, not mtimes: a checkout, a copy and a restore all move mtimes
     without changing behaviour, and a patch applied in place can leave one
-    alone. It costs 7.5 ms on an M1 Max -- 1.2 MB over 60 files -- once per
-    process, against the 15 s it is protecting.
+    alone. The result is cached per selected project/sysimage for the process
+    lifetime. Large custom sysimages cost one streaming read, which is still
+    small beside adopting an incompatible warm runtime.
     """
 
     digest = hashlib.sha256()
     for pattern in _FINGERPRINT_GLOBS:
         for path in sorted(PACKAGE_DIR.glob(pattern)):
-            digest.update(path.name.encode("utf-8"))
-            try:
-                digest.update(path.read_bytes())
-            except OSError:
-                digest.update(b"<unreadable>")
+            _hash_file(digest, path, path.relative_to(PACKAGE_DIR).as_posix())
+
+    if julia_project is not None:
+        project = Path(julia_project)
+        project_root = (
+            project.parent
+            if project.name in {"Project.toml", "Manifest.toml"}
+            else project
+        )
+        project_files = (
+            project_root / "Project.toml",
+            project_root / "Manifest.toml",
+        )
+        for path in project_files:
+            _hash_file(digest, path, f"selected-project/{path.name}")
+
+    if julia_sysimage is not None:
+        _hash_file(digest, Path(julia_sysimage), "selected-sysimage")
+
     return digest.hexdigest()[:16]
 
 

@@ -45,13 +45,17 @@ warm runtime instead of recompiling one (README, *The worker outlives the
 application*). Two consequences matter while working here.
 
 **You can be talking to code you have already changed.** A worker is keyed on
-a content fingerprint of `hornlab_beat_bem/*.py`, `julia/*.jl`, `julia/src/*.jl`
-and `julia_engine/*/src/*.jl` precisely so that an edit produces a new key and
-never adopts the old worker. Anything that changes behaviour but is *not* in
-that list -- a file outside those globs, or a Julia depot mutated in place --
-is invisible to the key, and a stale worker will answer with the old
-behaviour and no symptom. If a change refuses to take effect, that is the
-first hypothesis; stop the hosts and try again.
+a content fingerprint of `hornlab_beat_bem/*.py`, `julia/*.jl`,
+`julia/src/*.jl`, every bundled backend and engine-bundle `Project.toml` and
+`Manifest.toml`, and `julia_engine/*/src/*.jl` precisely so that an edit or a
+dependency update produces a new key and never adopts the old worker. A
+selected custom project's `Project.toml` and `Manifest.toml`, and a selected
+custom sysimage, are content-hashed too. Anything that changes behaviour but
+is *not* in those inputs -- a file outside those globs, or dependency source
+mutated directly in a Julia depot without a Manifest change -- is invisible
+to the key, and a stale worker will answer with the old behaviour and no
+symptom. If a change refuses to take effect, that is the first hypothesis;
+stop the hosts and try again.
 
 ```python
 from hornlab_beat_bem import worker_registry as r

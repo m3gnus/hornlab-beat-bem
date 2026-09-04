@@ -340,7 +340,7 @@ spoken, on the same stdin and stdout.
 **Identity is the whole safety argument.** A worker is adopted only when the
 Julia executable, the solver script, the project, the sysimage, the thread
 count, the installed package version, a **content fingerprint of the wrapper
-and the vendored engine**, the Julia-relevant environment
+and its Julia dependency manifests**, the Julia-relevant environment
 (`JULIA_DEPOT_PATH`, `JULIA_LOAD_PATH`, `JULIA_PROJECT`, every `BLAB_*`) and
 the wire protocol version all match. The last four are in there because an
 adoption that crosses them has no symptom: the wrong worker answers every
@@ -349,10 +349,12 @@ fingerprint is the one doing the work — **the version number cannot**, because
 consumers pin this repository by commit SHA, so the declared version sits
 still across a re-vendor, a driver fix or a wrapper change while the solver
 underneath it moves. It hashes `hornlab_beat_bem/*.py`, `julia/*.jl`,
-`julia/src/*.jl` and `julia_engine/*/src/*.jl`: 1.2 MB over 60 files, 7.5 ms
-once per process against the 15 s it protects. The host re-checks the key
-during the handshake, so a client cannot talk its way in past a record it was
-handed.
+`julia/src/*.jl`, every bundled backend and engine-bundle `Project.toml` and
+`Manifest.toml`, and `julia_engine/*/src/*.jl`: about 1.3 MB over 72 package
+files. A selected custom project and sysimage are content-hashed too. The
+result is cached once per runtime choice in each client process. The host
+re-checks the key during the handshake, so a client cannot talk its way in
+past a record it was handed.
 
 **Lifetime, for an embedding application:**
 
@@ -385,8 +387,16 @@ while nobody is waiting rather than in front of the next solve.
 `sun_path` (about 100 bytes), and a loopback TCP port otherwise. The fallback
 is both the Windows path and what a deep registry directory selects on POSIX,
 so the two are not separate code. Both are guarded the same way: the registry
-directory is 0700, the key file is 0600, and the handshake carries a per-host
-token that only a process able to read that file can present.
+directory is owner-only (0700 on POSIX and the user's local application-data
+directory on Windows), the key file is 0600 on POSIX, and the handshake
+carries a per-host token that only a process able to read that file can
+present. The Windows registry defaults to
+`%LOCALAPPDATA%\HornLab\BEAT\workers`, so a later application process finds
+the same host without an override. If `LOCALAPPDATA` is absent it uses
+`%USERPROFILE%\AppData\Local`. A stripped service environment with no profile
+is refused because its system temp directory may be shared across accounts;
+set `HORNLAB_BEAT_WORKER_DIR` to a service-private local directory in that
+environment.
 
 ## Measured performance
 

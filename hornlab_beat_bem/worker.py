@@ -384,7 +384,7 @@ def worker_key(
         julia_sysimage=julia_sysimage,
         julia_threads=_resolve_julia_threads(julia_threads),
         package_version=package_version(),
-        package_fingerprint=package_fingerprint(),
+        package_fingerprint=package_fingerprint(julia_project, julia_sysimage),
         environment=keyed_environment(),
     )
 

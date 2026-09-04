@@ -105,27 +105,56 @@ def persistent_host_enabled() -> bool:
     return os.environ.get(PERSISTENT_HOST_ENV_VAR, "1").strip() != "0"
 
 
+def _default_worker_dir(platform_name: str | None = None) -> Path:
+    """Return a stable per-user registry root for the current platform."""
+
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name == "nt":
+        # Windows has no getuid(). LOCALAPPDATA is per-user and survives an
+        # application restart, unlike the old pid-suffixed temp directory.
+        # Do not use APPDATA: it can roam to other machines with the worker
+        # token and logs. A home-relative local directory is the normal
+        # fallback when LOCALAPPDATA is absent.
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            root = Path(local_app_data)
+        else:
+            try:
+                root = Path.home() / "AppData" / "Local"
+            except (OSError, RuntimeError) as exc:
+                # A system temp directory may be shared across accounts. The
+                # registry contains the host token, so ambiguous ownership is
+                # a reason to refuse persistence rather than guess.
+                raise RuntimeError(
+                    "Cannot determine a private per-user BEAT worker directory "
+                    "on Windows. Set HORNLAB_BEAT_WORKER_DIR to a local "
+                    "directory readable only by this user."
+                ) from exc
+        return root / "HornLab" / "BEAT" / "workers"
+
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime_dir and Path(runtime_dir).is_dir():
+        return Path(runtime_dir) / "hornlab-beat"
+    return Path(tempfile.gettempdir()) / f"hornlab-beat-{os.getuid()}"
+
+
 def worker_dir() -> Path:
     """The per-user registry directory, created with owner-only permissions.
 
     ``XDG_RUNTIME_DIR`` is preferred on Linux because it is already per-user,
-    already 0700 and already cleaned at logout. Everywhere else this is a
-    uid-suffixed directory under the system temporary directory, which
-    survives an app restart (the whole point) and is cleaned by the operating
-    system's own reboot policy rather than by us.
+    already 0700 and already cleaned at logout. Other POSIX systems use a
+    uid-suffixed directory under the system temporary directory. Windows uses
+    the user's local application-data directory and refuses to choose a shared
+    fallback when no user profile is available. Every selected default is
+    stable across application processes, which is required for worker adoption.
     """
 
     override = os.environ.get(WORKER_DIR_ENV_VAR, "").strip()
     if override:
         directory = Path(override)
     else:
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-        if runtime_dir and Path(runtime_dir).is_dir():
-            directory = Path(runtime_dir) / "hornlab-beat"
-        else:
-            suffix = str(getattr(os, "getuid", lambda: os.getpid())())
-            directory = Path(tempfile.gettempdir()) / f"hornlab-beat-{suffix}"
-    directory.mkdir(parents=True, exist_ok=True)
+        directory = _default_worker_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name == "posix":
         try:
             os.chmod(directory, 0o700)
