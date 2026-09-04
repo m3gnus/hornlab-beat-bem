@@ -120,13 +120,19 @@ julia --project=hornlab_beat_bem/julia -e "using Pkg; Pkg.instantiate()"
 `HORNLAB_BEAT_JULIA`, then the provisioned runtime, then `PATH`. The third tier
 is **not a search**: `provisioned_julia()` reads `state.json` out of the runtime
 directory and returns the single path a previous provisioning run recorded.
-Provisioning is GPU-gated on purpose -- `provision_gpu()` returns `skipped` and
-writes nothing when no matching GPU is present, so a machine that will never
-run an accelerator never pays for the Julia download or the multi-gigabyte
-CUDA/ROCm artifacts behind it.
+*Automatic* provisioning is GPU-gated on purpose -- `provision_gpu()` returns
+`skipped` and writes nothing when no matching GPU is present, so a machine
+that will never run an accelerator never pays for the Julia download or the
+multi-gigabyte CUDA/ROCm artifacts behind it. `--backend auto` never selects
+the CPU.
 
-So on a GPU-less host that tier is dead by construction and the chain is really
-env-var-or-`PATH`. A Julia installed anywhere else is invisible to it, because
+So on a GPU-less host that tier is dead **until someone asks for it by name**:
+`provision_cpu()` / `python -m hornlab_beat_bem.provision --backend cpu` has no
+hardware gate, instantiates `julia` (no accelerator dependency, no GPU
+artifacts) and records the runtime that makes the third tier live. Nothing
+infers that, so the gate above still holds for every caller who does not opt
+in. Without either, the chain is really env-var-or-`PATH`, and a Julia
+installed anywhere else is invisible to it, because
 nothing searches: unpacking one by hand next to the checkout does not make it
 discoverable, and neither does any other layout the package was never told
 about. **This is not platform-specific.** The same three conditions return the
@@ -151,13 +157,20 @@ python .github/scripts/assert_julia_runtime.py  # one legible error, not eight q
 CI never meets this: `julia-actions/setup-julia` puts Julia on `PATH`, which is
 why the tier being dead has never shown up as a red run.
 
-This is a documented requirement rather than a defect, and the alternatives
-were weighed and declined. A CPU-only provisioning mode would invert the
-promise `provision.py` opens with, and would download a second Julia onto a
-host that already had one. Giving discovery a workspace-relative search root
-would make a pip-installed package execute whatever binary happens to sit
-under the directory it was launched from -- discovery would depend on the
-working directory, which is precisely what the current four tiers avoid.
+For a developer this is still the documented requirement: the variable is one
+line and provisioning is a Julia download. The opt-in CPU mode is for the case
+the variable cannot serve -- an installer on a machine with no Julia at all,
+where there is no path to name. It does not invert the promise `provision.py`
+opens with, because it is never selected for anyone: `auto` skips it, and a
+GPU gate flag combined with `--backend cpu` is refused rather than resolved.
+Nor does it fetch a second Julia onto a host that already has one; the
+existing install wins, including one this same runtime directory unpacked
+earlier.
+
+The other alternative stays declined. Giving discovery a workspace-relative
+search root would make a pip-installed package execute whatever binary happens
+to sit under the directory it was launched from -- discovery would depend on
+the working directory, which is precisely what the current four tiers avoid.
 
 One check is deliberately conditional. The Julia suite and the Krylov gate
 both compare an unreorthogonalised Float32 Gram-Schmidt against the remedies,

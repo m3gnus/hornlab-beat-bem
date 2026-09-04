@@ -98,6 +98,45 @@ reasons; retry with `--force`. CUDA's first run pulls several GB (CUDA.jl ships
 its own toolkit artifacts; users need only the driver); Metal pulls a small
 package, because the driver is the operating system's.
 
+#### CPU, by explicit opt-in
+
+```bash
+python -m hornlab_beat_bem.provision --backend cpu
+```
+
+provisions the CPU runtime **on any host, with no hardware gate** — that is
+what an installer on a GPU-less Windows or Linux machine runs so the package
+has a Julia to discover without an operator setting `HORNLAB_BEAT_JULIA` by
+hand. Nothing infers it: `--backend auto` (the default) never selects `cpu`,
+so the no-op promise above is unchanged for everyone who does not ask. The
+same Julia resolution applies — an existing install, including one an earlier
+run of this command unpacked, is reused before anything is downloaded — and
+the project it instantiates is `hornlab_beat_bem/julia`, which depends on no
+accelerator package and therefore pulls no GPU artifacts.
+
+*Ready* is not granted for instantiating. The last step imports the
+precompiled `BeatEngineCpuBundle`, checks that it resolved **this** package's
+engine directory, and solves one 1 kHz frequency of the bundle's own workload
+mesh, requiring a finite non-zero pressure row. That is the only check that
+distinguishes a live bundle from the silent compile-from-source fallback (see
+[Cold start](#cold-start)). A failure is recorded in `state.json` like any
+other and the CLI exits non-zero.
+
+Two contradictions are refused rather than resolved. `--backend cpu` with
+`--if-gpu` or `--if-nvidia-gpu` exits 2 with an error: "provision the CPU" and
+"do nothing unless there is a GPU" cannot both be honoured, and a setup hook
+should learn that when it is written, not from a runtime that is sometimes
+provisioned. And a recorded *ready* names the backend, project and content
+fingerprint it was provisioned for, so a CPU-ready runtime never answers a GPU
+request or the reverse, and an in-place dependency/source update is
+provisioned again — the runtime directory holds one backend's state at a time.
+
+`--dir` writes wherever you point it, but discovery only ever reads
+`HORNLAB_BEAT_RUNTIME_DIR` (or its per-platform default), so the command
+prints a note telling you to set that variable in the environment that runs
+BEAT. The Python entry points are `provision_cpu()` and `provision_gpu()` in
+`hornlab_beat_bem.provision`; `provision_cuda()` remains as it was.
+
 ## Use
 
 ```python

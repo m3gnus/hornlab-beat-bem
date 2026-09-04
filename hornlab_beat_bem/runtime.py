@@ -140,7 +140,7 @@ def discover_julia(explicit: str | None = None) -> str | None:
     """Resolve Julia: explicit > env var > provisioned runtime > PATH.
 
     The provisioned runtime (a known-good portable Julia fetched by
-    ``hornlab_beat_bem.provision`` on GPU hosts) outranks whatever happens to
+    ``hornlab_beat_bem.provision``) outranks whatever happens to
     be on PATH, but an explicit path or the env var always wins.
     """
 
@@ -251,10 +251,10 @@ def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]
         return {
             "available": False,
             "reason": (
-                "No Julia executable was found. On a machine with an NVIDIA "
-                "GPU, run: python -m hornlab_beat_bem.provision (downloads "
-                "Julia and the CUDA stack). Otherwise install Julia >= 1.10 "
-                f"and put it on PATH or set {JULIA_ENV_VAR}."
+                "No Julia executable was found. Run: python -m "
+                "hornlab_beat_bem.provision --backend cpu for the CPU runtime, "
+                "or omit --backend cpu to provision a detected GPU. "
+                f"Alternatively install Julia >= 1.10 and put it on PATH or set {JULIA_ENV_VAR}."
             ),
             "version": version,
             "backend": None,
