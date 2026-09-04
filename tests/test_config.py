@@ -169,3 +169,82 @@ def test_singular_order_above_four_requires_double_precision():
     assert SolveConfig(singular_order=8, solve_precision="double").singular_order == 8
     with pytest.raises(ValueError, match="singular_order"):
         SolveConfig(singular_order=13, solve_precision="double")
+
+def _axis_aligned_frame(origin):
+    import numpy as np
+
+    from hornlab_beat_bem import ObservationFrame
+
+    return ObservationFrame(
+        axis=np.array([0.0, 0.0, 1.0]),
+        origin=np.asarray(origin, dtype=float),
+        u=np.array([1.0, 0.0, 0.0]),
+        v=np.array([0.0, 1.0, 0.0]),
+    )
+
+
+def _payload_for_frame(config: SolveConfig) -> dict:
+    """The ``config`` block including the translation the frame asks for."""
+
+    import numpy as np
+
+    from hornlab_beat_bem.sweep import _validated_frame_translation
+
+    return _request_payload(
+        "mesh.msh",
+        np.asarray([1000.0]),
+        config,
+        translation=_validated_frame_translation(config.frame_override),
+    )["config"]
+
+
+def test_observation_origin_defaults_to_the_frame_or_the_mesh_origin():
+    """No named origin means no claim: the arcs sit where the frame puts them."""
+
+    assert ObservationConfig().origin is None
+    payload = _request_payload_config(SolveConfig())
+    assert payload["meshes"][0]["translation_m"] == [0.0, 0.0, 0.0]
+
+
+def test_named_observation_origin_without_a_frame_is_refused():
+    """It used to be accepted and then ignored -- identical requests either way."""
+
+    for named in ("mouth", "throat"):
+        with pytest.raises(NotImplementedError, match="needs an explicit frame_override"):
+            SolveConfig(observation=ObservationConfig(origin=named))
+
+
+def test_named_observation_origin_is_realised_by_the_frame():
+    """An axially displaced horn: mouth and throat now move the mesh apart."""
+
+    mouth = SolveConfig(
+        observation=ObservationConfig(origin="mouth"),
+        frame_override=_axis_aligned_frame([0.0, 0.0, 0.32]),
+    )
+    throat = SolveConfig(
+        observation=ObservationConfig(origin="throat"),
+        frame_override=_axis_aligned_frame([0.0, 0.0, 0.0]),
+    )
+    assert _payload_for_frame(mouth)["meshes"][0]["translation_m"] == [0.0, 0.0, -0.32]
+    assert _payload_for_frame(throat)["meshes"][0]["translation_m"] == [0.0, 0.0, 0.0]
+    assert _payload_for_frame(mouth) != _payload_for_frame(throat)
+
+
+def test_observation_origin_rejects_an_unknown_feature():
+    with pytest.raises(ValueError, match="origin must be"):
+        ObservationConfig(origin="baffle")
+
+
+def test_the_origin_refusal_survives_mutation_after_construction():
+    """``solve_frequencies`` re-checks, so dropping the frame later still fails."""
+
+    from hornlab_beat_bem.config import reject_unrepresentable_observation_origin
+
+    config = SolveConfig(
+        observation=ObservationConfig(origin="throat"),
+        frame_override=_axis_aligned_frame([0.0, 0.0, 0.0]),
+    )
+    reject_unrepresentable_observation_origin(config)
+    config.frame_override = None
+    with pytest.raises(NotImplementedError, match="needs an explicit frame_override"):
+        reject_unrepresentable_observation_origin(config)

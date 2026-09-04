@@ -146,7 +146,17 @@ class ObservationConfig:
     angle_min_deg: float = 0.0
     angle_max_deg: float = 180.0
     angle_count: int = 37
-    origin: Literal["mouth", "throat"] = "mouth"
+
+    #: Which feature of the horn the polar arcs are centred on. The vendored
+    #: solver measures around the solver's coordinate origin and this package
+    #: cannot find a mouth or a throat in a mesh, so the choice is realised by
+    #: ``SolveConfig.frame_override`` -- the caller resolves the point and
+    #: hands over the frame. ``None`` (the default) means "wherever the frame
+    #: puts it", i.e. the mesh coordinate origin when no frame is supplied.
+    #: Naming ``"mouth"`` or ``"throat"`` without a frame is refused by
+    #: ``reject_unrepresentable_observation_origin`` rather than accepted and
+    #: ignored, which is what this field used to do.
+    origin: Literal["mouth", "throat"] | None = None
 
     #: Diagonal-cut rotation from the horizontal toward the vertical plane.
     inclination_deg: float = 45.0
@@ -192,8 +202,8 @@ class ObservationConfig:
         if self.angle_count == 1 and self.angle_min_deg != self.angle_max_deg:
             raise ValueError("angle_count 1 requires angle_min_deg == angle_max_deg")
 
-        if self.origin not in ("mouth", "throat"):
-            raise ValueError("origin must be 'mouth' or 'throat'")
+        if self.origin not in (None, "mouth", "throat"):
+            raise ValueError("origin must be None, 'mouth', or 'throat'")
 
         if not isinstance(self.planes, list) or not self.planes:
             raise ValueError("planes must be a non-empty list of plane names")
@@ -353,7 +363,10 @@ class SolveConfig:
     # progress_callback(freq_index, total, frequency_hz)
     progress_callback: Callable[[int, int, float], None] | None = None
     # on_frequency_result(freq_index, frequency_hz, log_entry) -> bool
-    # Returning exactly False cancels the sweep (partial result is built).
+    # Returning exactly False cancels the sweep. The partial result that comes
+    # back is marked: SolveResult.cancelled is true and is_partial compares
+    # what was solved against requested_frequency_count. A sweep that ends
+    # short for any other reason raises instead of returning.
     on_frequency_result: Callable[[int, float, dict], bool] | None = None
 
     def __post_init__(self) -> None:
@@ -448,11 +461,48 @@ class SolveConfig:
                 "single precision the extra Duffy points add more cancellation "
                 "noise than they remove quadrature error"
             )
+        # Fail here rather than after a Julia worker has been started, and
+        # keep the refusal in one place: sweep.solve_frequencies re-checks it
+        # so a field mutated after construction cannot slip past.
+        reject_unrepresentable_observation_origin(self)
 
     @property
     def source_tag(self) -> int:
         ((tag, _),) = self.velocity_sources.items()
         return int(tag)
+
+
+def reject_unrepresentable_observation_origin(config: SolveConfig) -> None:
+    """Refuse a mouth/throat observation origin that nothing here can realise.
+
+    The vendored solver measures its polar cuts around the solver's own
+    coordinate origin, and the only freedom this package has is the rigid mesh
+    translation ``frame_override`` asks for. So a named origin can only take
+    effect through a frame, and inferring one from the mesh is not something
+    this package can do conservatively: it reads a Gmsh 2.2 file for tag
+    areas, not for a horn's axis, and the extent-based mouth/throat guesses
+    that would be needed are exactly the heuristics WG's own frame builder
+    refuses to make (a horn in a cabinet puts the throat in the front
+    quarter). A wrong guess here is silent -- polar cuts measured metres from
+    where the caller meant, with a plausible-looking response.
+
+    Rather than infer, this refuses. Resolve the point in the caller, where
+    the CAD model is, and pass ``frame_override``: ``ObservationFrame.origin``
+    is then authoritative and ``observation.origin`` records which feature it
+    stands for. That is the path WG already takes for every solve, so this
+    refusal cannot fire there.
+    """
+
+    origin = config.observation.origin
+    if origin is None or config.frame_override is not None:
+        return
+    raise NotImplementedError(
+        f"observation.origin={origin!r} needs an explicit frame_override: "
+        "hornlab-beat-bem observes around the solver origin and cannot locate "
+        f"a horn's {origin} in the mesh. Pass ObservationFrame(origin=<the "
+        f"{origin} centre>, axis=+z, u=+x, v=+y), or leave observation.origin "
+        "as None to observe around the mesh coordinate origin."
+    )
 
 
 def beat_symmetry_mode(plane: NativeSymmetryPlane | None) -> str:

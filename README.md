@@ -137,6 +137,39 @@ Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
 `xy` (quarter, x >= 0 and y >= 0). A y-only `xz` half domain is not
 representable and is rejected by `reject_unsupported_native_symmetry`.
 
+### What comes back, and what it is normalised to
+
+`spl_db` is absolute SPL in dB re 20 uPa. `directivity_db` (alias
+`spl_norm_db`) is the same field normalised so the reference angle reads
+0 dB, which is what hornlab-metal-bem means by that name — the two differ by
+the reference sample's own level, about 94 dB for a 1 Pa reference. This
+alias previously returned `spl_db` unchanged, so a consumer written against
+the metal package's contract read absolute SPL under a name that promises a
+pattern.
+
+The reference is the first sample of smallest `|angle|`: on axis for the
+ordinary cut, which `ObservationConfig` already requires to span 0 degrees,
+and deterministic for a grid that straddles zero without landing on it.
+`directivity_reference_index` and `directivity_reference_deg` say which sample
+was used. Amplitudes are floored at -120 dB SPL before the dB conversion, as
+in hornlab-metal-bem, so a null on the reference angle lifts the cut by a
+visibly implausible amount instead of producing `nan`.
+
+`observation.origin` names which feature the arcs are centred on, and this
+package cannot find a mouth or a throat in a mesh: the solver measures around
+its own coordinate origin and the only freedom here is the rigid translation
+`frame_override` asks for. So `"mouth"` or `"throat"` **requires** a frame,
+and is refused without one rather than accepted and ignored. Resolve the point
+where the CAD model is and pass `ObservationFrame(origin=...)`; the default
+`None` observes around the mesh coordinate origin.
+
+A returned sweep is complete or it is an error. `completed` carrying fewer
+results than frequencies requested, an event stream that ends without a
+terminal event, and a pressure block whose dimensions do not match the
+angle grid all raise. The one short result is a cancellation, and it says so:
+`cancelled` is true, `requested_frequency_count` records what was asked for,
+and `is_partial` compares the two.
+
 ### Rigid half space
 
 ```python

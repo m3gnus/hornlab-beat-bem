@@ -24,6 +24,7 @@ from .config import (
     beat_image_mode,
     beat_symmetry_mode,
     ground_plane_enabled,
+    reject_unrepresentable_observation_origin,
     reject_unsupported_ground_plane,
     reject_unsupported_native_symmetry,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "package_version",
     "probe_gpu_functional_cache_clear",
     "read_gmsh22_info",
+    "reject_unrepresentable_observation_origin",
     "reject_unsupported_ground_plane",
     "reject_unsupported_native_symmetry",
     "shutdown_workers",

@@ -31,6 +31,7 @@ from .config import (
     SolveConfig,
     beat_image_mode,
     ground_plane_enabled,
+    reject_unrepresentable_observation_origin,
     reject_unsupported_ground_plane,
     reject_unsupported_native_symmetry,
 )
@@ -252,6 +253,7 @@ def solve_frequencies(
 
     reject_unsupported_native_symmetry(config)
     reject_unsupported_ground_plane(config)
+    reject_unrepresentable_observation_origin(config)
     frequencies = np.asarray(list(frequencies_hz), dtype=np.float64)
     if frequencies.size == 0:
         raise ValueError("frequencies_hz must contain at least one frequency")
@@ -295,205 +297,236 @@ def solve_frequencies(
         persistent_worker=config.persistent_worker,
         status_callback=status_callback,
     )
-    assert session.metadata is not None
-    angles = np.asarray(session.metadata.get("polar_angle_deg", []), dtype=np.float64)
-    if angles.size == 0:
-        raise RuntimeError("BEAT solver reported no observation angles")
+    try:
+        metadata = session.metadata
+        if metadata is None:
+            raise RuntimeError("BEAT solver reported no initialization metadata")
+        angles = np.asarray(metadata.get("polar_angle_deg", []), dtype=np.float64)
+        if angles.size == 0:
+            raise RuntimeError("BEAT solver reported no observation angles")
 
-    planes = list(config.observation.planes)
-    total = int(frequencies.size)
+        planes = list(config.observation.planes)
+        total = int(frequencies.size)
 
-    sphere_theta_deg: np.ndarray | None = None
-    sphere_phi_deg: np.ndarray | None = None
-    sphere_pressure: np.ndarray | None = None
-    if config.observation.sphere_grid is not None:
-        sphere_meta = session.metadata.get("sphere_metadata") or {}
-        theta_rad = np.asarray(sphere_meta.get("theta_polar_rad") or [], dtype=np.float64)
-        phi_rad = np.asarray(sphere_meta.get("phi_azimuth_rad") or [], dtype=np.float64)
-        n_theta, n_phi = (int(value) for value in config.observation.sphere_grid)
-        expected_points = n_theta * n_phi
-        if theta_rad.size != expected_points or phi_rad.size != expected_points:
-            raise RuntimeError(
-                "BEAT solver sphere grid does not match the requested layout: "
-                f"{theta_rad.size} points for {expected_points} requested"
+        sphere_theta_deg: np.ndarray | None = None
+        sphere_phi_deg: np.ndarray | None = None
+        sphere_pressure: np.ndarray | None = None
+        if config.observation.sphere_grid is not None:
+            sphere_meta = metadata.get("sphere_metadata") or {}
+            theta_rad = np.asarray(sphere_meta.get("theta_polar_rad") or [], dtype=np.float64)
+            phi_rad = np.asarray(sphere_meta.get("phi_azimuth_rad") or [], dtype=np.float64)
+            n_theta, n_phi = (int(value) for value in config.observation.sphere_grid)
+            expected_points = n_theta * n_phi
+            if theta_rad.size != expected_points or phi_rad.size != expected_points:
+                raise RuntimeError(
+                    "BEAT solver sphere grid does not match the requested layout: "
+                    f"{theta_rad.size} points for {expected_points} requested"
+                )
+            # The solver echoes the grid in Float32 radians (180 deg comes back as
+            # 180.000005). Downstream DI integration checks the axes against exact
+            # grid endpoints, so rebuild the requested float64 layout and only use
+            # the echo to verify the solver sampled what was asked for.
+            theta_axis = np.linspace(0.0, float(config.observation.sphere_theta_max_deg), n_theta)
+            phi_axis = np.arange(n_phi) * (360.0 / n_phi)
+            sphere_theta_deg = np.repeat(theta_axis, n_phi)
+            sphere_phi_deg = np.tile(phi_axis, n_theta)
+            if not np.allclose(
+                np.degrees(theta_rad), sphere_theta_deg, atol=1.0e-3
+            ) or not np.allclose(np.degrees(phi_rad), sphere_phi_deg, atol=1.0e-3):
+                raise RuntimeError(
+                    "BEAT solver sphere grid angles do not match the requested "
+                    "theta-major layout"
+                )
+            sphere_pressure = np.full((total, expected_points), np.nan, dtype=np.complex128)
+
+        # Sized from the first result rather than the mesh, so a symmetry-reduced
+        # solve reports the reduced domain it actually assembled.
+        surface_pressure: np.ndarray | None = None
+        surface_neumann: np.ndarray | None = None
+
+        pressure = np.full((total, len(planes), angles.size), np.nan, dtype=np.complex128)
+        spl = np.full((total, len(planes), angles.size), np.nan, dtype=np.float64)
+        impedance = np.full(total, np.nan, dtype=np.complex128)
+        solved_frequencies = np.full(total, np.nan, dtype=np.float64)
+        timings = {"assembly_s": 0.0, "solve_s": 0.0, "field_s": 0.0}
+        solver_log: list[dict[str, Any]] = []
+        solved_count = 0
+        #: Which terminal event ended the stream. Staying ``None`` means the
+        #: solver's event stream ran out -- an EOF, not a completion.
+        terminal_event: str | None = None
+
+        for event in session.events():
+            event_type = str(event.get("type", ""))
+            if event_type in ("cancelled", "completed"):
+                terminal_event = event_type
+                break
+            if event_type != "result":
+                continue
+
+            raw = event["result"]
+            index = solved_count
+            if index >= total:
+                raise RuntimeError("BEAT solver returned more results than requested frequencies")
+            # The solver echoes the frequency in Float32; the durable axis must be
+            # the requested float64 value so it matches the other engines exactly.
+            frequency = float(frequencies[index])
+            echoed = float(raw["freq_hz"])
+            if not math.isclose(echoed, frequency, rel_tol=1e-6, abs_tol=1e-6):
+                raise RuntimeError(
+                    f"BEAT solver returned frequency {echoed} Hz where {frequency} Hz "
+                    "was requested; results are out of order"
+                )
+            omega = 2.0 * math.pi * frequency
+            # 1 m/s velocity basis -> unit normal acceleration (v = a/(-i*omega)).
+            acceleration_scale = 1.0 / (-1j * omega)
+
+            channel_names = list(raw.get("channel_names") or ["main"])
+            if len(channel_names) != 1:
+                raise RuntimeError(
+                    "hornlab-beat-bem drives a single synthesized channel; the "
+                    f"solver returned channels {channel_names}"
+                )
+            rows_by_cut = {
+                "horizontal": _wire_rows(raw.get("horizontal_pressure"))[0],
+                "vertical": _wire_rows(raw.get("vertical_pressure"))[0],
+            }
+            if "diagonal" in planes:
+                rows_by_cut["diagonal"] = _wire_rows(raw.get("diagonal_pressure"))[0]
+            entry_pressure = np.stack(
+                [rows_by_cut[plane] * acceleration_scale for plane in planes]
             )
-        # The solver echoes the grid in Float32 radians (180 deg comes back as
-        # 180.000005). Downstream DI integration checks the axes against exact
-        # grid endpoints, so rebuild the requested float64 layout and only use
-        # the echo to verify the solver sampled what was asked for.
-        theta_axis = np.linspace(0.0, float(config.observation.sphere_theta_max_deg), n_theta)
-        phi_axis = np.arange(n_phi) * (360.0 / n_phi)
-        sphere_theta_deg = np.repeat(theta_axis, n_phi)
-        sphere_phi_deg = np.tile(phi_axis, n_theta)
-        if not np.allclose(
-            np.degrees(theta_rad), sphere_theta_deg, atol=1.0e-3
-        ) or not np.allclose(np.degrees(phi_rad), sphere_phi_deg, atol=1.0e-3):
+            if entry_pressure.shape[1] != angles.size:
+                raise RuntimeError(
+                    "BEAT solver angle grid does not match its pressure rows: "
+                    f"{entry_pressure.shape[1]} != {angles.size}"
+                )
+            with np.errstate(divide="ignore"):
+                entry_spl = 20.0 * np.log10(np.abs(entry_pressure) / 20e-6)
+
+            impedance_pairs = raw.get("impedance") or []
+            entry_impedance: complex | None = None
+            if impedance_pairs:
+                pair = impedance_pairs[0]
+                if len(pair) == 2 and all(math.isfinite(float(value)) for value in pair):
+                    # Undo the solver's [Re(F)/2, -Im(F)/2] packing and its x10
+                    # display factor. The wire force integrates the full domain
+                    # (reduced-mesh sum times the symmetry factor), so dividing by
+                    # the same factor and the reduced-mesh source area yields the
+                    # area-weighted mean pressure per unit velocity.
+                    force = 2.0 * float(pair[0]) - 2.0j * float(pair[1])
+                    mean_pressure_velocity = force / (
+                        _BEAT_IMPEDANCE_FORCE_FACTOR * symmetry_factor * source_area
+                    )
+                    entry_impedance = complex(mean_pressure_velocity * acceleration_scale)
+
+            if sphere_pressure is not None:
+                sphere_row = _wire_rows(raw.get("sphere_pressure"))[0]
+                if sphere_row.size != sphere_pressure.shape[1]:
+                    raise RuntimeError(
+                        "BEAT solver sphere pressure row does not match its grid: "
+                        f"{sphere_row.size} != {sphere_pressure.shape[1]}"
+                    )
+                sphere_pressure[index] = sphere_row * acceleration_scale
+
+            if config.surface_traces:
+                trace_pressure = _wire_vector(raw.get("surface_pressure"), "surface_pressure")
+                trace_neumann = _wire_vector(raw.get("surface_neumann"), "surface_neumann")
+                if surface_pressure is None:
+                    surface_pressure = np.full(
+                        (total, trace_pressure.size), np.nan, dtype=np.complex128
+                    )
+                    surface_neumann = np.full(
+                        (total, trace_neumann.size), np.nan, dtype=np.complex128
+                    )
+                elif (
+                    trace_pressure.size != surface_pressure.shape[1]
+                    or trace_neumann.size != surface_neumann.shape[1]
+                ):
+                    raise RuntimeError(
+                        "BEAT solver surface trace length changed between frequencies"
+                    )
+                # Same velocity -> acceleration rescale as every other field this
+                # package returns, so the datum stays consistent with the pressures.
+                surface_pressure[index] = trace_pressure * acceleration_scale
+                surface_neumann[index] = trace_neumann * acceleration_scale
+
+            pressure[index] = entry_pressure
+            spl[index] = entry_spl
+            impedance[index] = entry_impedance if entry_impedance is not None else complex(np.nan, np.nan)
+            solved_frequencies[index] = frequency
+            raw_timings = raw.get("timings") or {}
+            for key in timings:
+                timings[key] += float(raw_timings.get(key, 0.0))
+
+            log_entry: dict[str, Any] = {
+                "frequency_hz": frequency,
+                "converged": True,
+                "observation_angles_deg": angles,
+                "observation_planes": planes,
+                "observation_pressure_complex": entry_pressure,
+                "observation_spl_db": entry_spl,
+                "impedance": entry_impedance,
+                "timings": dict(raw_timings),
+                "native_diagnostics": raw.get("diagnostics"),
+            }
+            solver_log.append(log_entry)
+            solved_count += 1
+
+            if config.progress_callback is not None:
+                config.progress_callback(index, total, frequency)
+            if config.on_frequency_result is not None:
+                keep_going = config.on_frequency_result(index, frequency, log_entry)
+                if keep_going is False:
+                    session.request_cancel()
+
+        # A short sweep is only ever a cancellation. Truncating silently on any
+        # other ending -- a `completed` that carried no results, or an event
+        # stream that simply stopped -- reports a successful empty solve, which
+        # is indistinguishable from a horn that radiates nothing.
+        if terminal_event is None:
             raise RuntimeError(
-                "BEAT solver sphere grid angles do not match the requested "
-                "theta-major layout"
+                "BEAT solver event stream ended without a completed or cancelled "
+                f"event after {solved_count} of {total} frequencies"
             )
-        sphere_pressure = np.full((total, expected_points), np.nan, dtype=np.complex128)
-
-    # Sized from the first result rather than the mesh, so a symmetry-reduced
-    # solve reports the reduced domain it actually assembled.
-    surface_pressure: np.ndarray | None = None
-    surface_neumann: np.ndarray | None = None
-
-    pressure = np.full((total, len(planes), angles.size), np.nan, dtype=np.complex128)
-    spl = np.full((total, len(planes), angles.size), np.nan, dtype=np.float64)
-    impedance = np.full(total, np.nan, dtype=np.complex128)
-    solved_frequencies = np.full(total, np.nan, dtype=np.float64)
-    timings = {"assembly_s": 0.0, "solve_s": 0.0, "field_s": 0.0}
-    solver_log: list[dict[str, Any]] = []
-    solved_count = 0
-    cancelled = False
-
-    for event in session.events():
-        event_type = str(event.get("type", ""))
-        if event_type == "cancelled":
-            cancelled = True
-            break
-        if event_type == "completed":
-            break
-        if event_type != "result":
-            continue
-
-        raw = event["result"]
-        index = solved_count
-        if index >= total:
-            raise RuntimeError("BEAT solver returned more results than requested frequencies")
-        # The solver echoes the frequency in Float32; the durable axis must be
-        # the requested float64 value so it matches the other engines exactly.
-        frequency = float(frequencies[index])
-        echoed = float(raw["freq_hz"])
-        if not math.isclose(echoed, frequency, rel_tol=1e-6, abs_tol=1e-6):
+        if terminal_event == "completed" and solved_count != total:
             raise RuntimeError(
-                f"BEAT solver returned frequency {echoed} Hz where {frequency} Hz "
-                "was requested; results are out of order"
+                f"BEAT solver reported completion with {solved_count} of {total} "
+                "requested frequencies; a successful solve must return every "
+                "frequency it was asked for"
             )
-        omega = 2.0 * math.pi * frequency
-        # 1 m/s velocity basis -> unit normal acceleration (v = a/(-i*omega)).
-        acceleration_scale = 1.0 / (-1j * omega)
-
-        channel_names = list(raw.get("channel_names") or ["main"])
-        if len(channel_names) != 1:
-            raise RuntimeError(
-                "hornlab-beat-bem drives a single synthesized channel; the "
-                f"solver returned channels {channel_names}"
-            )
-        rows_by_cut = {
-            "horizontal": _wire_rows(raw.get("horizontal_pressure"))[0],
-            "vertical": _wire_rows(raw.get("vertical_pressure"))[0],
-        }
-        if "diagonal" in planes:
-            rows_by_cut["diagonal"] = _wire_rows(raw.get("diagonal_pressure"))[0]
-        entry_pressure = np.stack(
-            [rows_by_cut[plane] * acceleration_scale for plane in planes]
+        timings["total_s"] = time.time() - started
+        count = solved_count
+        return SolveResult(
+            frequencies_hz=solved_frequencies[:count],
+            pressure_complex=pressure[:count],
+            spl_db=spl[:count],
+            impedance=impedance[:count],
+            observation_angles_deg=angles,
+            observation_planes=planes,
+            config=config,
+            mesh_info=mesh_info,
+            timings=timings,
+            solver_log=solver_log,
+            sphere_pressure_complex=None if sphere_pressure is None else sphere_pressure[:count],
+            sphere_theta_deg=sphere_theta_deg,
+            sphere_phi_deg=sphere_phi_deg,
+            surface_pressure_complex=None if surface_pressure is None else surface_pressure[:count],
+            surface_neumann_complex=None if surface_neumann is None else surface_neumann[:count],
+            cancelled=terminal_event == "cancelled",
+            requested_frequency_count=total,
         )
-        if entry_pressure.shape[1] != angles.size:
-            raise RuntimeError(
-                "BEAT solver angle grid does not match its pressure rows: "
-                f"{entry_pressure.shape[1]} != {angles.size}"
-            )
-        with np.errstate(divide="ignore"):
-            entry_spl = 20.0 * np.log10(np.abs(entry_pressure) / 20e-6)
-
-        impedance_pairs = raw.get("impedance") or []
-        entry_impedance: complex | None = None
-        if impedance_pairs:
-            pair = impedance_pairs[0]
-            if len(pair) == 2 and all(math.isfinite(float(value)) for value in pair):
-                # Undo the solver's [Re(F)/2, -Im(F)/2] packing and its x10
-                # display factor. The wire force integrates the full domain
-                # (reduced-mesh sum times the symmetry factor), so dividing by
-                # the same factor and the reduced-mesh source area yields the
-                # area-weighted mean pressure per unit velocity.
-                force = 2.0 * float(pair[0]) - 2.0j * float(pair[1])
-                mean_pressure_velocity = force / (
-                    _BEAT_IMPEDANCE_FORCE_FACTOR * symmetry_factor * source_area
-                )
-                entry_impedance = complex(mean_pressure_velocity * acceleration_scale)
-
-        if sphere_pressure is not None:
-            sphere_row = _wire_rows(raw.get("sphere_pressure"))[0]
-            if sphere_row.size != sphere_pressure.shape[1]:
-                raise RuntimeError(
-                    "BEAT solver sphere pressure row does not match its grid: "
-                    f"{sphere_row.size} != {sphere_pressure.shape[1]}"
-                )
-            sphere_pressure[index] = sphere_row * acceleration_scale
-
-        if config.surface_traces:
-            trace_pressure = _wire_vector(raw.get("surface_pressure"), "surface_pressure")
-            trace_neumann = _wire_vector(raw.get("surface_neumann"), "surface_neumann")
-            if surface_pressure is None:
-                surface_pressure = np.full(
-                    (total, trace_pressure.size), np.nan, dtype=np.complex128
-                )
-                surface_neumann = np.full(
-                    (total, trace_neumann.size), np.nan, dtype=np.complex128
-                )
-            elif (
-                trace_pressure.size != surface_pressure.shape[1]
-                or trace_neumann.size != surface_neumann.shape[1]
-            ):
-                raise RuntimeError(
-                    "BEAT solver surface trace length changed between frequencies"
-                )
-            # Same velocity -> acceleration rescale as every other field this
-            # package returns, so the datum stays consistent with the pressures.
-            surface_pressure[index] = trace_pressure * acceleration_scale
-            surface_neumann[index] = trace_neumann * acceleration_scale
-
-        pressure[index] = entry_pressure
-        spl[index] = entry_spl
-        impedance[index] = entry_impedance if entry_impedance is not None else complex(np.nan, np.nan)
-        solved_frequencies[index] = frequency
-        raw_timings = raw.get("timings") or {}
-        for key in timings:
-            timings[key] += float(raw_timings.get(key, 0.0))
-
-        log_entry: dict[str, Any] = {
-            "frequency_hz": frequency,
-            "converged": True,
-            "observation_angles_deg": angles,
-            "observation_planes": planes,
-            "observation_pressure_complex": entry_pressure,
-            "observation_spl_db": entry_spl,
-            "impedance": entry_impedance,
-            "timings": dict(raw_timings),
-            "native_diagnostics": raw.get("diagnostics"),
-        }
-        solver_log.append(log_entry)
-        solved_count += 1
-
-        if config.progress_callback is not None:
-            config.progress_callback(index, total, frequency)
-        if config.on_frequency_result is not None:
-            keep_going = config.on_frequency_result(index, frequency, log_entry)
-            if keep_going is False:
-                session.request_cancel()
-
-    del cancelled  # partial results are represented by truncation below
-    timings["total_s"] = time.time() - started
-    count = solved_count
-    return SolveResult(
-        frequencies_hz=solved_frequencies[:count],
-        pressure_complex=pressure[:count],
-        spl_db=spl[:count],
-        impedance=impedance[:count],
-        observation_angles_deg=angles,
-        observation_planes=planes,
-        config=config,
-        mesh_info=mesh_info,
-        timings=timings,
-        solver_log=solver_log,
-        sphere_pressure_complex=None if sphere_pressure is None else sphere_pressure[:count],
-        sphere_theta_deg=sphere_theta_deg,
-        sphere_phi_deg=sphere_phi_deg,
-        surface_pressure_complex=None if surface_pressure is None else surface_pressure[:count],
-        surface_neumann_complex=None if surface_neumann is None else surface_neumann[:count],
-    )
+    finally:
+        # The session owns a temporary job directory and, for a persistent
+        # worker, that worker's turn. ``events()`` releases both when its
+        # generator is closed, but every exit that does not drain the
+        # generator -- a malformed metadata block before the loop even
+        # starts, a progress or result callback raising, a dimension guard
+        # firing mid-stream -- leaves that to garbage collection, which under
+        # a live traceback holds the frame (and the worker) indefinitely.
+        # Closing here makes the lifetime explicit; ``close()`` is idempotent
+        # and, for an unfinished solve, retires the worker rather than
+        # handing it over mid-job.
+        session.close()
 
 
 _WARMUP_TETRAHEDRON = """$MeshFormat
