@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import os
 import platform
@@ -36,6 +37,47 @@ def package_version() -> str | None:
         return importlib.metadata.version("hornlab-beat-bem")
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+#: Files whose contents decide what a worker computes. Globs are relative to
+#: the package directory and are resolved in sorted order.
+_FINGERPRINT_GLOBS = (
+    "*.py",
+    "julia/*.jl",
+    "julia/src/*.jl",
+    "julia_engine/*/src/*.jl",
+)
+
+
+@lru_cache(maxsize=1)
+def package_fingerprint() -> str:
+    """A content hash of the wrapper and the vendored engine.
+
+    ``package_version()`` is the obvious staleness signal and it is not enough
+    here: consumers pin this repository **by commit SHA**, so the declared
+    version sits still for a whole release cycle while the solver underneath
+    it changes. A worker keyed on the version alone would therefore be adopted
+    across a re-vendor, a driver fix or a wrapper change, and would answer
+    every request with the previous code -- correctly formed numbers from a
+    solver that no longer exists in the checkout. Since 0.3.2 a worker outlives
+    the process that started it, so that adoption is now possible in the field
+    and not only in an editable development tree.
+
+    Content, not mtimes: a checkout, a copy and a restore all move mtimes
+    without changing behaviour, and a patch applied in place can leave one
+    alone. It costs 7.5 ms on an M1 Max -- 1.2 MB over 60 files -- once per
+    process, against the 15 s it is protecting.
+    """
+
+    digest = hashlib.sha256()
+    for pattern in _FINGERPRINT_GLOBS:
+        for path in sorted(PACKAGE_DIR.glob(pattern)):
+            digest.update(path.name.encode("utf-8"))
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+    return digest.hexdigest()[:16]
 
 
 def default_project(beat_backend: str) -> Path:
