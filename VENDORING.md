@@ -182,6 +182,30 @@ Two things the fix surfaced that the old default had been hiding:
   with the measured `32 / 38 / 39`. The A5 ladder counts beside them are marked
   as 1e-6-era rather than restated as current; that mesh is not in this package.
 
+## GMRES elapsed-deadline re-sync
+
+The two files below are copied verbatim from fork commit
+`4e22bc7471d0c45e7da42242bb2d553c890e85f2`
+(`fix/beat-gmres-deadline-resync`). This commit starts at `a52b8f4`, merges
+the deadline merge `c8de262`, and shares one absolute monotonic deadline
+across drive columns, preserves the exact remaining iteration budget, and
+reports the reason for a fallback. It retains the `1e-5` exterior tolerance
+and later Krylov tests from `a52b8f4`. Deadline tests use an injected clock
+for partial-iterate coverage rather than comparing timings across solves.
+
+This package copies these two files byte for byte from that upstream
+commit:
+
+| here | upstream |
+|---|---|
+| `hornlab_beat_bem/julia/src/BeatEngineDenseSolve.jl` | `src/blab/solvers/julia_local/src/BeatEngineDenseSolve.jl` |
+| `hornlab_beat_bem/julia/tests/runtests.jl` | `src/blab/solvers/julia_local/tests/runtests.jl` |
+
+Their SHA-256 values are respectively
+`813da0d82c82f242e0af8f8c28be74c7efda2a4ec3bf1487888c941fbcb838d0`
+and `5999489fcbee66390ce3dc9d4b4628d16ef13523c60edd6e54ed6444515b765f`.
+No fixture-path adaptation is needed for either file.
+
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind:
