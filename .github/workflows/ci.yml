@@ -6,7 +6,7 @@ name: CI
 # verdict rather than a claim.
 on:
   push:
-    branches: [main, next]
+    branches: [main]
   pull_request:
 
 # A pushed topic branch with no pull request is not gated by anything; the
