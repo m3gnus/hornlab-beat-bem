@@ -155,6 +155,35 @@ jobs:
           julia -t auto --project=hornlab_beat_bem/julia \
             hornlab_beat_bem/julia/scripts/validate_analytic_exterior.jl
 
+      # The Krylov gate on the adaptive dense solve: GMRES against the dense LU
+      # on a real assembled Burton-Miller operator, across the band, with the
+      # physical tag-2 drive.
+      #
+      # It is here because it was not, and that gap had a cost. AGENTS.md has
+      # listed this script as a verification command since the repository was
+      # published, and no job ran it, so when the GMRES tolerance moved to 1e-5
+      # and this script's own default stayed at 1e-6, the gate went red on
+      # `main` and trunk went on reporting green. Six failing assertions sat on
+      # a pinned public repository for a day. A gate nothing invokes is
+      # documentation, and it decays like documentation.
+      #
+      # CPU only and Float64-free -- 1,390 dofs on the bundled sample, about 11
+      # seconds warm -- so it belongs in this job and runs on both legs of the
+      # matrix. `-t auto` is what AGENTS.md documents; the assembly it exercises
+      # is threaded and running it single-threaded would test a configuration
+      # nothing ships.
+      #
+      # No environment knobs. The gate reads the solver's own tolerance now
+      # rather than restating it, which is what stops the two drifting apart
+      # again, and the retired BLAB_VALIDATE_GMRES_TOLERANCE would only move
+      # half of it. One check inside is a printed WARNING rather than an
+      # assertion, deliberately: whether unreorthogonalised Float32 loses
+      # orthogonality is a property of the host's arithmetic. Do not promote it.
+      - name: Run the Krylov Burton-Miller gate
+        run: |
+          julia -t auto --project=hornlab_beat_bem/julia \
+            hornlab_beat_bem/julia/scripts/validate_gmres_burton_miller.jl
+
   metal:
     name: Metal validators (macos-latest)
     runs-on: macos-latest

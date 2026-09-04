@@ -137,6 +137,51 @@ it now stands, with no environment overrides:
 Before these two cherry-picks the 40-frequency quarter case was ~11 s. Far-field
 agreement is unchanged at 0.0082 dB main-lobe rms in band.
 
+## A third pick, 2026-09-04: the Krylov gate follows the tolerance
+
+`feat/beat-gmres-tolerance-1e-5` above supplied `src/BeatEngineDenseSolve.jl`
+and `tests/runtests.jl`, but not `scripts/validate_gmres_burton_miller.jl`. The
+gate's own default tolerance therefore stayed at 1e-6 while the product's moved
+to 1e-5, and the gate began measuring a 1e-5 solve against a bound built from
+1e-6: six failures on `main`, on a solver that was correct. This branch is the
+repair, and it is upstream because the script is vendored verbatim.
+
+| branch | commit | files taken | what it does |
+|---|---|---|---|
+| `fix/beat-krylov-gate-tolerance` | `531d99f` | `scripts/validate_gmres_burton_miller.jl` | the gate reads `_beat_gmres_tolerance` instead of restating it, so the two cannot drift again; `BLAB_VALIDATE_GMRES_TOLERANCE` is retired because it moved the bound and the Krylov probes but never the `beat_solve_dense_system` call they guard, and `BLAB_BEAT_GMRES_TOL` moves both together |
+
+Cut from `cd50b3c`, the recorded sync point, against which the vendored copy was
+byte-identical before this change. Nothing else on the branch.
+
+Measured on the bundled 1,390-dof sample at 500 / 2000 / 6000 Hz, two drives:
+
+| run | result |
+|---|---|
+| before, gate at 1e-6 against a 1e-5 solve | exit 1, six FAIL, residuals 6.9e-6 to 1.05e-5 against a 4.44e-6 bound |
+| after, gate at the solver's 1e-5 | exit 0, PASS |
+| after, `BLAB_BEAT_GMRES_TOL=1e-6` | exit 0, PASS — 500 Hz and 2 kHz correctly fall back to the LU |
+| after, `BLAB_VALIDATE_GMRES_TOLERANCE=1e-6` | exit 1, refuses with the retirement message |
+
+**No tolerance was weakened.** The `sqrt(N) * eps(Float32)` evaluation floor and
+the `4 x tolerance` factor are both unchanged; only the tolerance fed into them
+moved, from a stale literal to the value the checked solve actually ran at. The
+LU-agreement assertion — the one that says the answers are right — passed
+throughout at 1.0e-6 to 1.8e-6 against its unchanged 1e-4 bound, before and
+after.
+
+Two things the fix surfaced that the old default had been hiding:
+
+- At 1e-6 the three Krylov variants **do not converge** at 500 Hz and 2 kHz on
+  this fixture; they stop at ~1.1e-6. Their reported counts, 53 / 58 / 55, are
+  where they gave up rather than where they agreed, and 55 against 58 inverts
+  the frequency ordering the script's own header describes. At the solver's
+  1e-5 they converge at 32 / 38 / 39 — the ordering the header claims, and the
+  same counts the production solve takes. The gate's iteration-agreement checks
+  now measure the path the product runs.
+- The header's sample counts, `44 / 51 / 63`, matched neither and are replaced
+  with the measured `32 / 38 / 39`. The A5 ladder counts beside them are marked
+  as 1e-6-era rather than restated as current; that mesh is not in this package.
+
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind:
@@ -154,8 +199,8 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 | `hornlab_beat_bem/julia/tests/runtests.jl` | `src/blab/solvers/julia_local/tests/` |
 | `hornlab_beat_bem/julia/scripts/*.jl`, except the five listed below and `validate_analytic_exterior.jl`, which is new here | `src/blab/solvers/julia_local/scripts/` |
 
-Six of those files are taken from the two 2026-09-03 branches above rather than
-from the `3ebc90a` sync commit; they are verbatim copies of *those* commits.
+Seven of those files are taken from the three later branches above rather than
+from the `cd50b3c` sync commit; they are verbatim copies of *those* commits.
 
 Every numerical result this package produces comes from those files, and they
 are unmodified. That is deliberate: it is what lets the extraction be verified
