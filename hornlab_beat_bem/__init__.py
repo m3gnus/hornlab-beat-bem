@@ -44,7 +44,7 @@ from .sweep import (
     solve_frequencies,
     warm_up,
 )
-from .worker import shutdown_workers
+from .worker import detach_workers, shutdown_workers
 
 __all__ = [
     "BEAT_BACKENDS",
@@ -67,6 +67,7 @@ __all__ = [
     "beat_engine_status",
     "beat_image_mode",
     "beat_symmetry_mode",
+    "detach_workers",
     "discover_julia",
     "ground_plane_enabled",
     "generated_frequency_grid",

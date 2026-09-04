@@ -5,6 +5,23 @@ a persistent stdin/stdout JSON-lines worker per (executable, project, threads,
 sysimage) key, a one-shot subprocess fallback, file-based cooperative
 cancellation, and warm-up. The asset-staging layer is gone -- callers here
 always hand the solver an on-disk mesh path directly.
+
+Since 0.3.2 that worker is, by default, **not a child of this process**. The
+pipe worker below is still exactly what talks to Julia, but it normally runs
+inside a detached host process (``worker_host``) that a later application
+launch can adopt over a socket (``worker_client``), because the cold start it
+saves cannot be cached: GPUCompiler has no disk cache, so a Metal worker pays
+~15 s of kernel compilation once per *process* no matter how warm the depot
+is. ``HORNLAB_BEAT_PERSISTENT_HOST=0`` restores the child-process behaviour.
+
+The lifetime contract for an embedding application:
+
+``shutdown_workers()``
+    stops the host, and with it the Julia runtime. The next launch pays the
+    full cold start.
+``detach_workers()`` (or ``shutdown_workers(detach=True)``)
+    lets go of the host and leaves it running. An application's quit hook
+    wants this one; the host retires itself after its idle timeout.
 """
 
 from __future__ import annotations
@@ -20,13 +37,20 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from . import worker_registry as _registry
 from .config import BEAT_CUDA, BEAT_METAL, BEAT_ROCM
-from .runtime import DEFAULT_SOLVER_SCRIPT, default_project
+from .runtime import (
+    DEFAULT_SOLVER_SCRIPT,
+    default_project,
+    package_fingerprint,
+    package_version,
+)
+from .worker_client import HostedBeatWorker, keyed_environment
 
 StatusCallback = Callable[[str], None]
 
 _WORKERS_LOCK = threading.Lock()
-_WORKERS: dict[tuple[str, str, str, str, str], BeatWorkerProcess] = {}
+_WORKERS: dict[str, BeatWorkerProcess | HostedBeatWorker] = {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -143,6 +167,21 @@ class BeatWorkerProcess:
         self._stderr_thread: threading.Thread | None = None
         self._status_callback: StatusCallback | None = None
 
+    @property
+    def pid(self) -> int | None:
+        """The Julia process id, or None when no runtime is loaded.
+
+        Reported to clients so an adoption can be verified against the
+        *runtime*, not merely against the host that owns it -- a host whose
+        Julia child was retired and replaced is warm again, but it is not the
+        same compilation.
+        """
+
+        process = self._process
+        if process is None or process.poll() is not None:
+            return None
+        return process.pid
+
     def submit(
         self,
         request_path: Path,
@@ -178,6 +217,22 @@ class BeatWorkerProcess:
                 self._status_callback = previous
 
     def terminate(self) -> None:
+        self._kill_process()
+        if self._lock.locked():
+            try:
+                self._lock.release()
+            except RuntimeError:
+                pass
+
+    def _kill_process(self) -> None:
+        """Stop the Julia child and forget it, without touching the lock.
+
+        ``terminate`` cannot be reused for this: it also releases the
+        submission lock, and the startup path below runs with that lock held
+        by ``ensure_started``, so releasing it there would leave the next
+        release unbalanced.
+        """
+
         process = self._process
         self._process = None
         if process is not None and process.poll() is None:
@@ -187,11 +242,6 @@ class BeatWorkerProcess:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2.0)
-        if self._lock.locked():
-            try:
-                self._lock.release()
-            except RuntimeError:
-                pass
 
     def _ensure_started(self) -> None:
         if self._process is not None and self._process.poll() is None:
@@ -233,13 +283,22 @@ class BeatWorkerProcess:
                 self._emit_status("BEAT Engine ready")
                 return
             if event_type == "failed":
+                # Drop the corpse before reporting. Leaving it in place used
+                # to make the *next* ``ensure_started`` see a process that had
+                # not been polled yet, take the fast path above, and report a
+                # worker that was already dead -- harmless while a failed
+                # start-up ended the process, and not harmless at all now that
+                # a host retries.
+                self._kill_process()
                 raise RuntimeError(
                     friendly_julia_error(
                         str(event.get("error", "BEAT Engine solver failed during startup.")),
                         julia_project=self.julia_project,
                     )
                 )
-        raise RuntimeError(self._process_error("Warm BEAT Engine solver ended before startup completed."))
+        message = self._process_error("Warm BEAT Engine solver ended before startup completed.")
+        self._kill_process()
+        raise RuntimeError(message)
 
     def _iter_events_for_submission(self) -> Iterator[dict]:
         try:
@@ -297,6 +356,39 @@ class BeatWorkerProcess:
             self._status_callback(message)
 
 
+def worker_key(
+    *,
+    julia_executable: str,
+    solver_script: Path,
+    julia_threads: str | int,
+    julia_project: Path | None,
+    julia_sysimage: Path | None = None,
+) -> dict[str, Any]:
+    """The full identity of the worker a request needs.
+
+    Beyond the four paths and the thread count the in-process registry always
+    used, this adds the installed package version, a content fingerprint of
+    the wrapper and the vendored engine, and the Julia-relevant part of the
+    environment. All three matter only because a worker now outlives the
+    process that started it: adopting a runtime built from different code, or
+    with a different depot, produces correct-looking numbers from the wrong
+    solver and has no symptom at all. The fingerprint is what actually carries
+    that weight -- see ``runtime.package_fingerprint`` for why the version
+    number cannot, in a repository consumers pin by SHA.
+    """
+
+    return _registry.worker_key(
+        julia_executable=julia_executable,
+        solver_script=solver_script,
+        julia_project=julia_project,
+        julia_sysimage=julia_sysimage,
+        julia_threads=_resolve_julia_threads(julia_threads),
+        package_version=package_version(),
+        package_fingerprint=package_fingerprint(),
+        environment=keyed_environment(),
+    )
+
+
 def get_worker(
     *,
     julia_executable: str,
@@ -304,35 +396,78 @@ def get_worker(
     julia_threads: str | int,
     julia_project: Path | None,
     julia_sysimage: Path | None = None,
-) -> BeatWorkerProcess:
-    resolved_threads = _resolve_julia_threads(julia_threads)
-    key = (
-        julia_executable,
-        str(solver_script.resolve()),
-        "" if julia_project is None else str(Path(julia_project).resolve()),
-        "" if julia_sysimage is None else str(Path(julia_sysimage).resolve()),
-        resolved_threads,
+) -> BeatWorkerProcess | HostedBeatWorker:
+    """The worker for this configuration, adopting a running one where possible.
+
+    The returned object is a persistent host client by default and a plain
+    child process under ``HORNLAB_BEAT_PERSISTENT_HOST=0``. Both expose the
+    same ``ensure_started`` / ``submit`` / ``terminate`` surface, which is all
+    ``BeatSolveSession`` uses.
+    """
+
+    key = worker_key(
+        julia_executable=julia_executable,
+        solver_script=solver_script,
+        julia_threads=julia_threads,
+        julia_project=julia_project,
+        julia_sysimage=julia_sysimage,
     )
+    identifier = _registry.key_id(key)
+    hosted = _registry.persistent_host_enabled()
+    cache_key = f"{'host' if hosted else 'child'}:{identifier}"
     with _WORKERS_LOCK:
-        worker = _WORKERS.get(key)
+        worker = _WORKERS.get(cache_key)
         if worker is None:
-            worker = BeatWorkerProcess(
-                julia_executable=julia_executable,
-                solver_script=solver_script,
-                julia_threads=resolved_threads,
-                julia_project=julia_project,
-                julia_sysimage=julia_sysimage,
-            )
-            _WORKERS[key] = worker
+            if hosted:
+                worker = HostedBeatWorker(key)
+            else:
+                worker = BeatWorkerProcess(
+                    julia_executable=julia_executable,
+                    solver_script=solver_script,
+                    julia_threads=_resolve_julia_threads(julia_threads),
+                    julia_project=julia_project,
+                    julia_sysimage=julia_sysimage,
+                )
+            _WORKERS[cache_key] = worker
         return worker
 
 
-def shutdown_workers() -> None:
+def shutdown_workers(*, detach: bool = False) -> None:
+    """Release this process's workers.
+
+    ``detach=True`` is the one an application's quit hook wants: it closes the
+    connections and leaves the host processes running, so the next launch
+    adopts a warm Julia runtime instead of compiling one. The hosts retire
+    themselves after ``HORNLAB_BEAT_WORKER_IDLE_S`` (30 minutes by default),
+    so nothing accumulates.
+
+    The default still stops everything, because that is what a script, a test
+    and an explicit "stop the solver" request all mean. An in-process worker
+    (``HORNLAB_BEAT_PERSISTENT_HOST=0``) has nothing to detach from and is
+    terminated either way -- it dies with this process regardless.
+    """
+
     with _WORKERS_LOCK:
         workers = list(_WORKERS.values())
         _WORKERS.clear()
     for worker in workers:
-        worker.terminate()
+        if detach and isinstance(worker, HostedBeatWorker):
+            worker.detach()
+        elif isinstance(worker, HostedBeatWorker):
+            worker.shutdown()
+        else:
+            worker.terminate()
+
+
+def detach_workers() -> None:
+    """Let go of every persistent worker without stopping it.
+
+    The sibling of ``shutdown_workers`` named in the application contract: a
+    quit hook calls this so the Julia runtime survives the application and the
+    next launch skips the cold start.
+    """
+
+    shutdown_workers(detach=True)
 
 
 class BeatSolveSession:
@@ -370,7 +505,7 @@ class BeatSolveSession:
 
         self.julia_project = julia_project if julia_project is not None else default_project(beat_backend)
         self.beat_backend = beat_backend
-        self._worker: BeatWorkerProcess | None = None
+        self._worker: BeatWorkerProcess | HostedBeatWorker | None = None
         self._process: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
         self._events: Iterator[dict] | None = None
