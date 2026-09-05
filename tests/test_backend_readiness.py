@@ -863,3 +863,96 @@ def test_interrupted_metal_record_does_not_hide_a_functional_runtime(runtime_dir
     monkeypatch.setattr(runtime, "_julia_gpu_functional", lambda julia, backend: (True, "functional"))
     provision._write_state(runtime_dir, {"backend": BEAT_METAL, "status": "in_progress"})
     assert runtime.backend_status(BEAT_METAL)["available"] is True
+
+
+def _refuse_advisory_locking(monkeypatch, error: int = errno.ENOLCK) -> None:
+    """Make the kernel answer "this filesystem has no advisory locking".
+
+    ``ENOLCK`` is what ``flock`` returns on NFS with no running lock daemon;
+    several FUSE, overlay and SMB mounts answer ``EOPNOTSUPP`` or ``ENOSYS``
+    instead. All of them reach the same place, because :func:`_try_lock`
+    deliberately treats only ``EACCES``/``EAGAIN`` as contention.
+    """
+
+    if os.name == "nt":
+        import msvcrt as locking_module
+
+        name = "locking"
+    else:
+        import fcntl as locking_module
+
+        name = "flock"
+
+    def refuse(*_args):
+        raise OSError(error, "no locks available")
+
+    monkeypatch.setattr(locking_module, name, refuse)
+
+
+@pytest.mark.parametrize("backend", [BEAT_CPU, BEAT_CUDA])
+def test_a_directory_without_advisory_locking_is_recorded_not_raised(
+    runtime_dir, fake_julia, julia_steps, cuda_host, monkeypatch, backend
+):
+    """The other half of only retrying contention.
+
+    Refusing to poll forever on a filesystem with no advisory locking is the
+    point of that change; letting the ``OSError`` out of ``provision_cpu`` or
+    ``provision_gpu`` is not. Both document a returned state dict, the CLI
+    turns it into an exit code, and the application turns it into the sentence
+    a user acts on -- so unhandled, this configuration answers a setup hook
+    with a traceback and the interface with "not provisioned, run this
+    command", naming the command that just produced the traceback.
+    """
+
+    _refuse_advisory_locking(monkeypatch)
+    messages: list[str] = []
+
+    if backend == BEAT_CPU:
+        state = provision.provision_cpu(runtime_dir, status_cb=messages.append)
+    else:
+        state = provision.provision_gpu(
+            runtime_dir, backend=BEAT_CUDA, status_cb=messages.append
+        )
+
+    assert state["status"] == "failed"
+    assert state["backend"] == backend
+    assert state["step"] == "lock"
+    assert str(runtime_dir) in state["error"]
+    assert provision.RUNTIME_DIR_ENV_VAR in state["error"]
+    assert any("provisioning failed" in message for message in messages)
+    # Nothing was instantiated or probed: the run stopped at the lock.
+    assert julia_steps == []
+    # And the failure is readable back, so the consumer's row explains itself
+    # instead of reporting an unprovisioned runtime with a command that fails.
+    recorded = provision.read_state(runtime_dir, backend=backend)
+    assert recorded["status"] == "failed"
+    assert recorded["step"] == "lock"
+
+
+def test_a_lock_failure_the_directory_cannot_record_is_still_returned(
+    runtime_dir, fake_julia, julia_steps, no_gpu, monkeypatch
+):
+    """A failure to report a failure must not replace it with another one."""
+
+    _refuse_advisory_locking(monkeypatch, errno.EOPNOTSUPP)
+
+    def refuse_write(*_args, **_kwargs):
+        raise OSError(errno.EROFS, "read-only file system")
+
+    monkeypatch.setattr(provision, "_write_state", refuse_write)
+
+    state = provision.provision_cpu(runtime_dir, status_cb=lambda _message: None)
+
+    assert state["status"] == "failed"
+    assert state["step"] == "lock"
+
+
+def test_the_cli_exits_nonzero_rather_than_traceback_without_locking(
+    runtime_dir, fake_julia, julia_steps, no_gpu, monkeypatch, capsys
+):
+    """``python -m hornlab_beat_bem.provision --backend cpu``, on such a host."""
+
+    _refuse_advisory_locking(monkeypatch)
+
+    assert provision.main(["--backend", "cpu", "--dir", str(runtime_dir)]) == 1
+    assert "cannot carry the provisioning lock" in capsys.readouterr().out

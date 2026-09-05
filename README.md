@@ -53,7 +53,7 @@ the portable CPU runtime provisioned as well, and a box with an NVIDIA and an
 AMD card gets a separate verdict for each rather than one answer naming the
 first. Each entry carries `available`, a machine-readable `state` (`ready`,
 `no-hardware`, `not-functional`, `provisioning`, `failed`, `unprovisioned`,
-`forced`, `no-julia`) and the sentence a user reads.
+`forced`, `no-julia`, `no-solver-script`) and the sentence a user reads.
 
 **Reproducibility.** The regular `pair_gather` kernel is bit-reproducible —
 one owner per matrix entry, fixed summation order, no atomics — and measures
@@ -169,6 +169,10 @@ releases it when the holder exits; the lock file is never unlinked and there
 is no timeout-based takeover of a live holder. A second
 run waits and says what it is waiting for, then re-reads the record under the
 lock, so a queued duplicate becomes a no-op instead of a second instantiate.
+Only contention waits: a runtime directory whose filesystem has no advisory
+locking at all — NFS without a lock daemon, some FUSE and SMB mounts — is a
+recorded `failed` state naming the directory, not an indefinite wait and not a
+traceback.
 
 `--dir` writes wherever you point it, but discovery only ever reads
 `HORNLAB_BEAT_RUNTIME_DIR` (or its per-platform default), so the command

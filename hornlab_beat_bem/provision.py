@@ -83,7 +83,7 @@ import time
 import urllib.request
 import zipfile
 from collections.abc import Callable
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -407,6 +407,60 @@ def _unlock(descriptor: int) -> None:
 
     with suppress(OSError):
         fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _lock_failure_state(
+    runtime_dir: Path,
+    *,
+    backend: str,
+    project: Path,
+    fingerprint: str,
+    exc: OSError,
+    status_cb: StatusCallback,
+) -> dict[str, Any]:
+    """Record a run that could not take the runtime directory's lock.
+
+    The other half of :func:`_try_lock` re-raising everything that is not
+    contention. Refusing to poll for ever on a filesystem with no advisory
+    locking is right; letting the resulting ``OSError`` leave through
+    ``provision_cpu``/``provision_gpu`` is not, because both document that they
+    *return* a state dict whose ``status`` is ``ready`` or ``failed``, and both
+    are called from places that read that dict: the CLI turns it into an exit
+    code, and a consumer turns it into the sentence a user acts on. Unhandled,
+    the same configuration answers a setup hook with a traceback and answers
+    the application with "not provisioned -- run this command", which is the
+    command that just produced the traceback.
+
+    Reachable wherever ``HORNLAB_BEAT_RUNTIME_DIR`` can point: ``flock``
+    answers ``ENOLCK`` on NFS without a running lock daemon, and
+    ``EOPNOTSUPP``/``ENOSYS`` on several FUSE, overlay and SMB mounts.
+
+    The record is best effort. The directory that could not carry a lock file
+    may not take this write either, and a failure to *report* a failure must
+    not replace it with a different exception.
+    """
+
+    error = (
+        f"the BEAT runtime directory {runtime_dir} cannot carry the "
+        f"provisioning lock ({LOCK_FILENAME}): {exc}. Provisioning is "
+        "serialised through a kernel advisory lock because it unpacks one "
+        f"shared Julia. Point {RUNTIME_DIR_ENV_VAR} at local storage and run "
+        "the command again."
+    )
+    state = {
+        "status": "failed",
+        "backend": backend,
+        "project": str(project),
+        "package_fingerprint": fingerprint,
+        "step": "lock",
+        "julia_version": JULIA_VERSION,
+        "error": error,
+    }
+    with suppress(OSError):
+        _write_state(runtime_dir, state)
+    label = "CPU" if backend == BEAT_CPU else _GPU_BACKENDS[backend]["label"]
+    status_cb(f"BEAT {label} runtime provisioning failed: {error}")
+    return state
 
 
 @contextmanager
@@ -796,7 +850,22 @@ def provision_gpu(
         return previous
 
     module = facts["module"]
-    with _provisioning_lock(directory, backend=backend, status_cb=status_cb):
+    # Acquired through an ExitStack so the one step outside the recorded
+    # try/except below -- taking the lock -- can answer its own failure with a
+    # state dict rather than a traceback. See :func:`_lock_failure_state`.
+    held = ExitStack()
+    try:
+        held.enter_context(_provisioning_lock(directory, backend=backend, status_cb=status_cb))
+    except OSError as exc:
+        return _lock_failure_state(
+            directory,
+            backend=backend,
+            project=project,
+            fingerprint=fingerprint,
+            exc=exc,
+            status_cb=status_cb,
+        )
+    with held:
         # Asked again under the lock: whatever we waited for may have been this
         # very backend being provisioned by another process, and instantiating
         # a runtime that is already ready is pure cost.
@@ -974,7 +1043,19 @@ def provision_cpu(
         status_cb("BEAT CPU runtime is already provisioned.")
         return previous
 
-    with _provisioning_lock(directory, backend=BEAT_CPU, status_cb=status_cb):
+    held = ExitStack()
+    try:
+        held.enter_context(_provisioning_lock(directory, backend=BEAT_CPU, status_cb=status_cb))
+    except OSError as exc:
+        return _lock_failure_state(
+            directory,
+            backend=BEAT_CPU,
+            project=project,
+            fingerprint=fingerprint,
+            exc=exc,
+            status_cb=status_cb,
+        )
+    with held:
         previous = read_state(directory, backend=BEAT_CPU)
         if not force and _ready_for(previous, BEAT_CPU, project, fingerprint):
             assert previous is not None
