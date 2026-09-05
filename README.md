@@ -176,6 +176,31 @@ Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
 `xy` (quarter, x >= 0 and y >= 0). A y-only `xz` half domain is not
 representable and is rejected by `reject_unsupported_native_symmetry`.
 
+### Asking what this package supports
+
+```python
+report = beat.capability_report()                  # every backend
+report = beat.capability_report(backend="metal")   # one of them
+```
+
+A versioned, JSON-serialisable statement of what a caller may ask for, per
+backend and per solve mode: conventions and units, formulation, requested
+against actual precision, symmetry modes, ground normals, source profiles,
+observation features, quadrature and completion statuses. Every unsupported
+capability carries a `reason` rather than being absent, so a consumer can tell
+"this package refuses it" from "this report is older than the field you are
+looking for". `schema_version` is the shape; check it and refuse a shape you
+do not know.
+
+Two properties are worth relying on. It is built from constants and probes
+nothing, so the same commit produces byte-identical output on every machine —
+`beat_engine_status()` remains the separate question of whether *this host*
+can run it. And a capability the vendored Julia engine has but the Python API
+cannot reach is reported **unsupported, with that as its reason** — coupled
+FEM-BEM-LEM, multiple source channels and post-solve field replay all read
+that way today, because the report describes this package rather than the
+engine inside it.
+
 ### What comes back, and what it is normalised to
 
 `spl_db` is absolute SPL in dB re 20 uPa. `directivity_db` (alias
@@ -297,9 +322,20 @@ normally; until then a re-sync must re-apply it.**
 the same single-cache argument and have the same gap, but no machine available
 to this project has an NVIDIA GPU, so a CUDA edit here could not be executed,
 let alone verified -- and the correction is exactly the kind of change whose
-error is a plausible wrong number rather than a crash. `near_correction` is
-therefore accepted on the CPU backend and must not be trusted on `cuda` until
-someone with the hardware ports and measures it.
+error is a plausible wrong number rather than a crash.
+
+**No accelerator backend has the correction at all.** ROCm has no near-pair
+kernel; neither does Metal, whose assembly entry point takes no
+near-correction cache and whose branch in `BeatEngineCore` forwards none.
+Until 2026-09-05 `near_correction=True` was accepted on `metal` and did
+nothing: an A/B at 2 kHz on a 320-face sphere put the flag's whole effect at
+1.8e-7 relative -- that backend's own run-to-run atomics noise -- against
+1.4e-4 on the CPU backend, while the Metal run's status line still announced a
+near-singular correction over 25,740 self-domain pairs. `SolveConfig` now
+refuses the flag on `cuda`, `rocm` and `metal`, and the capability report
+reads the same table. `near_correction` is therefore a **CPU-backend option**.
+Implementing it on Metal is engine work: it belongs upstream in `boundary-lab`
+and arrives here through a re-sync, not through a patch to a vendored file.
 
 ## Cold start
 
@@ -727,6 +763,16 @@ The controls are also not asserted on a relative-error percentage, because that
 tracks ka rather than the presence of the defect: 21.7% at 400 Hz, 142.5% at
 1000 Hz, 136.2% at 2000 Hz, so a floor calibrated at one frequency silently
 stops controlling at another.
+
+**That script fixes the engine's answer, and it stops at the Julia boundary.**
+A conjugated unpacking of the solver's wire rows, or the acceleration rescale
+`1/(-i omega)` written the other way round, lives in `sweep.py` and would leave
+every Julia gate green. So the package repeats the case one level up:
+`tests/conformance/` scores a breathing sphere through `solve_frequencies()`
+against the same closed form, with the same two controls, and asserts that the
+conjugated control's level error is identical to the correct one's to 1e-12 —
+the invisibility above, measured through the Python wire rather than assumed
+from it.
 
 ### Gates in this repository
 

@@ -146,6 +146,55 @@ def test_near_correction_validation():
     # device-side edit on.
     with pytest.raises(NotImplementedError, match="CUDA"):
         SolveConfig(near_correction=True, beat_backend="cuda")
+    # Metal has no near-pair kernel either, and unlike ROCm it used to accept
+    # the flag: BeatEngineCore's :metal branch forwards no near-correction
+    # cache and the Metal assembly takes none, so the solve announced a
+    # correction it never applied. Measured 2026-09-05 on a 320-face sphere at
+    # 2 kHz: flag on against flag off agreed to 1.8e-7 relative -- that
+    # backend's own atomics noise -- while the CPU backend moved by 1.4e-4.
+    with pytest.raises(NotImplementedError, match="Metal"):
+        SolveConfig(near_correction=True, beat_backend="metal")
+    # Off, it is not a refusal on any backend: the flag is what is refused.
+    for backend in ("cpu", "cuda", "rocm", "metal"):
+        SolveConfig(near_correction=False, beat_backend=backend)
+
+
+def test_quadrature_order_is_restricted_to_the_orders_the_engine_has():
+    """`triangle_rule` has three rules; every other order is the middle one.
+
+    Orders 1, 2 and 4 select the 1-, 3- and 6-point rules. Everything else
+    falls through to the 3-point rule, so `quadrature_order=6` was accepted,
+    passed to the solver, and solved *less* accurately than the default while
+    reading like a refinement.
+    """
+
+    from hornlab_beat_bem.config import SUPPORTED_QUADRATURE_ORDERS
+
+    assert SUPPORTED_QUADRATURE_ORDERS == (1, 2, 4)
+    for order in SUPPORTED_QUADRATURE_ORDERS:
+        assert _request_payload_config(SolveConfig(quadrature_order=order))[
+            "quadrature_order"
+        ] == order
+    for order in (0, -1, 3, 5, 6, 8, 2.5):
+        with pytest.raises(ValueError, match="quadrature_order"):
+            SolveConfig(quadrature_order=order)
+
+
+def test_a_complex_source_amplitude_is_the_documented_refusal_not_a_typeerror():
+    """The report declares complex drives refused, so refuse them as one.
+
+    `float(amplitude)` turned a complex amplitude into a bare TypeError while
+    every other refusal here raises NotImplementedError, so a caller catching
+    the documented type caught nothing.
+    """
+
+    with pytest.raises(NotImplementedError, match="complex"):
+        SolveConfig(velocity_sources={2: 1.0 + 0.5j})
+    with pytest.raises(NotImplementedError, match="complex"):
+        SolveConfig(velocity_sources={2: complex(1.0, 0.0)})
+    with pytest.raises(ValueError, match="real number"):
+        SolveConfig(velocity_sources={2: "1.0j"})
+    assert SolveConfig(velocity_sources={2: 1}).source_tag == 2
 
 
 def test_solve_precision_is_cpu_only():

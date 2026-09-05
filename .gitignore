@@ -7,3 +7,7 @@ dist/
 .DS_Store
 .metadata_never_index
 pytest-report.xml
+# `python -m conformance` writes records carrying interpreter paths, a worker
+# registry directory and environment overrides. They are local evidence, and
+# this repository is public.
+conformance-results/

@@ -22,6 +22,69 @@ BEAT_BACKENDS = (BEAT_CPU, BEAT_CUDA, BEAT_ROCM, BEAT_METAL)
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
 GroundPlaneAxis = Literal["x", "y", "z"]
 
+#: The regular quadrature orders the vendored engine actually distinguishes.
+#: ``BeatEngineCore.triangle_rule`` has three rules -- 1 point for order <= 1,
+#: 6 points for order 4, and a 3-point rule for *everything else* -- so an
+#: order of 3, 6 or 8 is not a finer rule, it is the order-2 rule under
+#: another name. Anything outside this set is refused rather than solved at a
+#: quietly different accuracy; see ``SolveConfig.quadrature_order``.
+SUPPORTED_QUADRATURE_ORDERS: tuple[int, ...] = (1, 2, 4)
+
+#: Backends where ``near_correction`` is refused, and the published reason.
+#: :mod:`hornlab_beat_bem.capabilities` reads this table rather than restating
+#: it, because the failure the table exists to prevent is exactly a capability
+#: report that promises a correction the solve never runs.
+#:
+#: **ROCm** has no near-pair kernel at all in the vendored assembly.
+#:
+#: **Metal** has none either. Its assembly entry point
+#: (``assemble_regular_galerkin_operators_metal_regular``) takes no
+#: near-correction cache, and ``BeatEngineCore``'s ``:metal`` branch does not
+#: forward the ``near_correction_cache``/``image_near_correction_cache`` it
+#: forwards on ``:cpu`` and ``:cuda``. Measured on a 2026-09-05 A/B at 2 kHz
+#: on a 320-face sphere: with the flag on and off, Metal agreed to 1.8e-7
+#: relative -- its own run-to-run atomics noise -- while the CPU backend moved
+#: by 1.4e-4, and the Metal run still announced a near-singular correction
+#: over 25740 self-domain pairs in its status line. Accepting the flag there
+#: was the B2 defect in its purest form: an option accepted, reported as
+#: applied, and with no effect. Implementing it is engine work and belongs
+#: upstream in boundary-lab, not in this packaging repository.
+#:
+#: **CUDA** is refused for a narrower and more dangerous reason: it *has* the
+#: kernel, but upstream's device path still takes a single image-near cache.
+#: Under ``yz+xz`` that leaves two of the three mirror transforms integrating
+#: a near-singular kernel with the plain regular rule and says nothing about
+#: it -- a plausible wrong number rather than a crash. The CPU assembly in
+#: this package carries the multi-cache patch; the CUDA path deliberately does
+#: not, because no machine available to this project has an NVIDIA GPU, so the
+#: change could not be executed or measured. Lift that one once someone with
+#: the hardware ports and validates it.
+NEAR_CORRECTION_REFUSALS: dict[str, str] = {
+    BEAT_CUDA: (
+        "the CUDA device path carries a single image-near cache, so under a "
+        "multi-image symmetry two of three mirror transforms would integrate "
+        "a near-singular kernel with the plain regular rule and say nothing "
+        "about it; refused rather than silently wrong"
+    ),
+    BEAT_ROCM: (
+        "the vendored ROCm assembly has no near-pair kernel at all, so the "
+        "flag would report a corrected solve that never ran the correction"
+    ),
+    BEAT_METAL: (
+        "the vendored Metal assembly has no near-pair kernel and its "
+        "assembly call takes no near-correction cache, so the flag would "
+        "report a corrected solve that never ran the correction"
+    ),
+}
+
+#: How each backend is spelled in a refusal message.
+_BACKEND_LABELS: dict[str, str] = {
+    BEAT_CPU: "CPU",
+    BEAT_CUDA: "CUDA",
+    BEAT_ROCM: "ROCm",
+    BEAT_METAL: "Metal",
+}
+
 #: WG native-symmetry plane -> BEAT Engine symmetry mode. BEAT mirrors across
 #: x=0 (``x``) or across both x=0 and y=0 (``xy``); it has no y-only mirror, so
 #: WG's ``xz`` half-domain (quadrants "12") is not representable without an
@@ -305,7 +368,11 @@ class SolveConfig:
     air_density: float = AIR_DENSITY
     sound_speed: float = SPEED_OF_SOUND
 
-    # Quadrature (BEAT-native orders: Gauss point counts 1/3/6 for 1/2/4).
+    #: Regular-pair triangle rule. BEAT-native orders only: Gauss point counts
+    #: 1/3/6 for orders 1/2/4, and nothing else exists -- ``triangle_rule``
+    #: returns the 3-point rule for every other value, so an order of 6 is
+    #: silently *less* accurate than the default. Refused rather than accepted;
+    #: see ``SUPPORTED_QUADRATURE_ORDERS``.
     quadrature_order: int = 4
     #: Duffy 1-D Gauss order for coincident and edge/vertex-adjacent pairs.
     #: Cost per singular pair grows as order^4. Orders above 4 need a solver
@@ -328,8 +395,8 @@ class SolveConfig:
     #: ratio (Bernstein-ellipse convergence), floored at 4 and capped at
     #: ``near_correction_order``. Under a symmetry mode it also covers
     #: mirror-image pairs, one cache per image transform. Off reproduces the
-    #: uncorrected solve bit-for-bit. CPU and Metal only -- see the
-    #: validation below for why CUDA and ROCm refuse it.
+    #: uncorrected solve bit-for-bit. **CPU only** -- see
+    #: ``NEAR_CORRECTION_REFUSALS`` for why every accelerator refuses it.
     near_correction: bool = False
     near_correction_cutoff: float = 2.0
     near_correction_order: int = 8
@@ -398,7 +465,25 @@ class SolveConfig:
         ((tag, amplitude),) = self.velocity_sources.items()
         if not _is_integral_value(tag):
             raise ValueError("velocity_sources tag must be an integer")
-        if float(amplitude) != 1.0:
+        # A complex amplitude is refused as a *refusal*, not as a TypeError out
+        # of float(): the capability report declares complex drives refused and
+        # every other refusal here raises NotImplementedError, so a caller that
+        # catches the documented type must not be surprised by the built-in.
+        if isinstance(amplitude, complex) or getattr(amplitude, "imag", 0) != 0:
+            raise NotImplementedError(
+                "hornlab-beat-bem supports a real unit source amplitude only; "
+                f"the complex amplitude {amplitude!r} would carry a drive "
+                "phase this package's single synthesised source channel "
+                "cannot express"
+            )
+        try:
+            amplitude_value = float(amplitude)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                "velocity_sources amplitude must be a real number, got "
+                f"{amplitude!r}"
+            ) from None
+        if amplitude_value != 1.0:
             raise NotImplementedError(
                 "hornlab-beat-bem supports unit source amplitude only"
             )
@@ -410,8 +495,19 @@ class SolveConfig:
             self.ground_plane = GroundPlane(**self.ground_plane)
         if not isinstance(self.ground_plane, (GroundPlane, type(None))):
             raise ValueError("ground_plane must be a GroundPlane, a dict, or None")
-        if not _is_integral_value(self.quadrature_order) or int(self.quadrature_order) < 1:
-            raise ValueError("quadrature_order must be a positive integer")
+        if (
+            not _is_integral_value(self.quadrature_order)
+            or int(self.quadrature_order) not in SUPPORTED_QUADRATURE_ORDERS
+        ):
+            raise ValueError(
+                "quadrature_order must be one of "
+                f"{list(SUPPORTED_QUADRATURE_ORDERS)}: the vendored triangle "
+                "rule has three rules (1, 3 and 6 Gauss points for orders 1, "
+                "2 and 4) and silently returns the 3-point rule for anything "
+                f"else, so {self.quadrature_order!r} would solve at order 2 "
+                "while reading like a refinement"
+            )
+        self.quadrature_order = int(self.quadrature_order)
         if not _is_integral_value(self.singular_order) or not 1 <= int(self.singular_order) <= 12:
             raise ValueError("singular_order must be between 1 and 12")
         if self.regular_quadrature_mode not in {None, "fixed", "wavelength"}:
@@ -428,24 +524,17 @@ class SolveConfig:
         if not _is_integral_value(self.near_correction_order) or int(self.near_correction_order) < 4:
             raise ValueError("near_correction_order must be an integer >= 4")
         self.near_correction_order = int(self.near_correction_order)
-        if self.near_correction and self.beat_backend in {BEAT_ROCM, BEAT_CUDA}:
-            # ROCm's vendored assembly has no near-pair kernel at all, so
-            # accepting the flag there would report a corrected solve that
-            # never ran the correction.
-            #
-            # CUDA is refused for a narrower and more dangerous reason: it has
-            # the kernel, but upstream's device path still takes a *single*
-            # image-near cache. Under `yz+xz` that leaves two of the three
-            # mirror transforms integrating a near-singular kernel with the
-            # plain regular rule and says nothing about it -- a plausible wrong
-            # number rather than a crash. The CPU assembly in this package
-            # carries the multi-cache patch; the CUDA path deliberately does
-            # not, because no machine available to this project has an NVIDIA
-            # GPU, so the change could not be executed or measured. Lift this
-            # once someone with the hardware ports and validates it.
-            label = "ROCm" if self.beat_backend == BEAT_ROCM else "CUDA"
+        # One table, read here and by the capability report, so the published
+        # contract and the refusal cannot drift. Each backend's reason is in
+        # NEAR_CORRECTION_REFUSALS above; all three accelerators are refused at
+        # construction rather than at solve time, so a caller learns before a
+        # worker is started.
+        near_refusal = NEAR_CORRECTION_REFUSALS.get(self.beat_backend)
+        if self.near_correction and near_refusal is not None:
+            label = _BACKEND_LABELS[self.beat_backend]
             raise NotImplementedError(
-                f"near_correction is not implemented for the BEAT {label} backend"
+                f"near_correction is not implemented for the BEAT {label} "
+                f"backend: {near_refusal}"
             )
         if not isinstance(self.surface_traces, bool):
             raise ValueError("surface_traces must be a bool")

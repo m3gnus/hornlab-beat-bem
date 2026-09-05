@@ -258,3 +258,41 @@ def test_the_returned_result_carries_the_normalized_directivity(run, config):
     absolute = 20.0 * np.log10(np.abs(result.pressure_complex) / 20e-6)
     assert result.spl_db == pytest.approx(absolute)
     assert result.spl_db[0, 0, 0] == pytest.approx(24.0364026333)
+
+
+def test_an_ineffective_named_origin_is_refused_before_a_session_is_built(
+    monkeypatch, mesh_path, config
+):
+    """The B2 guard at the sweep entry point, not only at construction.
+
+    ``SolveConfig.__post_init__`` refuses a named observation origin without a
+    frame, and ``tests/test_config.py`` covers that plus the helper being
+    re-callable after mutation. What is only covered here is the ordering:
+    ``solve_frequencies`` re-checks, and it must do so before it resolves
+    Julia or constructs a session, or a caller who dropped the frame after
+    construction pays for a worker start to be told no.
+    """
+
+    from hornlab_beat_bem import ObservationFrame
+
+    # Construct the way a caller legitimately can, then drop the frame: this
+    # is the mutation the constructor cannot see.
+    config.observation.origin = "throat"
+    config.frame_override = ObservationFrame(
+        axis=np.array([0.0, 0.0, 1.0]),
+        origin=np.zeros(3),
+        u=np.array([1.0, 0.0, 0.0]),
+        v=np.array([0.0, 1.0, 0.0]),
+    )
+    config.frame_override = None
+
+    def refuse_to_discover(*args, **kwargs):
+        raise AssertionError("Julia was resolved before the origin was checked")
+
+    def refuse_to_build(*args, **kwargs):
+        raise AssertionError("a session was built before the origin was checked")
+
+    monkeypatch.setattr(sweep, "discover_julia", refuse_to_discover)
+    monkeypatch.setattr(sweep, "BeatSolveSession", refuse_to_build)
+    with pytest.raises(NotImplementedError, match="needs an explicit frame_override"):
+        solve_frequencies(mesh_path, [500.0], config)
