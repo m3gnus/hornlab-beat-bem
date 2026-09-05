@@ -205,6 +205,78 @@ makes one pass has broken the gate even when every assertion is green. Note
 particularly that the controls are asserted on phase, because a globally
 conjugated kernel is invisible in level; do not "simplify" them onto SPL.
 
+### The capability report and the conformance harness
+
+`hornlab_beat_bem.capability_report()` is the versioned, machine-readable
+statement of what this package supports and what it refuses, per backend and
+solve mode. It is built from constants and probes nothing, so two machines on
+the same commit produce identical bytes; `beat_engine_status()` is the separate
+host probe. A capability that exists in the vendored Julia engine but has no
+path through the supported Python API is reported **unsupported with a reason**
+rather than reported true -- that rule is what keeps the report from becoming a
+description of the engine instead of the package.
+
+`tests/conformance/` runs named cases against the package and writes one JSON
+record per case: explicit frequency list, mesh checksum, backend, package git
+SHA and content fingerprint, interpreter and environment prefix, Julia version,
+cold/warm worker state, wall timing and solver diagnostics. Each record also
+carries a comparison against `hornlab-metal-bem` -- run when that package is
+importable and its solve can start here, and otherwise recorded with an
+explicit `skip_reason`. That is never a pytest skip: a CI runner without
+metal-bem is a normal run, and this suite's zero-skip invariant is real.
+
+The cases run inside `pytest` (the solve cases under `-m slow`), and also
+standalone:
+
+```bash
+PYTHONPATH="$PWD:$PWD/tests" python -m conformance --list
+PYTHONPATH="$PWD:$PWD/tests" python -m conformance --out <local results directory>
+```
+
+**The repository root is on that path, absolutely, for a reason.** An
+uninstalled checkout gets `hornlab_beat_bem` from `python -m`'s implicit
+working directory -- but the persistent worker host is a *subprocess*, spawned
+with its cwd set to the registry directory, so it inherits `PYTHONPATH` and
+nothing else. With `PYTHONPATH=tests` alone the runner imports the package,
+starts a host that cannot, and reports a worker that exited before it became
+reachable. A relative `.` fails the same way for the same reason. An installed
+copy of the package needs only `PYTHONPATH=tests`.
+
+Records carry interpreter paths and environment overrides, so they belong in a
+local evidence directory and not in anything committed.
+
+**Every refusal the report declares is walked, and the walk finds them by
+shape.** The report spells a refusal two ways, and `capability_refusals`
+collects both rather than a transcribed list: a `refused` / `refused_*` /
+`*_refused` key, and a `supported: False` entry beside the `reason` that says
+why. So a refusal you add to `capabilities.py` in either spelling is exercised
+without anybody remembering to exercise it: if no call raises for it, the case
+fails. When a refusal genuinely has no call behind it -- the formulation
+refusals are the absence of a switch, not a rejection, and most of the
+`supported: False` entries are the absence of an argument or a result field --
+put it in `UNEXERCISABLE_REFUSALS` with the reason. That table is checked in
+both directions, so an excuse cannot outlive the report entry it excuses, and
+the exercisers are keyed on the collected path so a walked refusal is always
+recorded at a path the report declares. The counts the case reports are
+path-instances (one declared refusal on one backend) throughout, and declared
+= exercised + excused is asserted, not described.
+
+A `supported: False` with **no** reason is deliberately not collected, so
+"unsupported with a reason" stays the report's only way to say no. The point
+is the B2 defect: a report that says "refused" over something the package
+quietly accepts is worse than no report, and `near_correction` on `metal` was
+exactly that until 2026-09-05.
+
+`analytic_pulsating_sphere_phase` is the convention gate. It scores a real
+solve against the closed form for a breathing sphere and then scores the same
+measurement against `conj(p)` and `-p`, both of which must miss by a wide
+margin. A real-velocity drive makes a conjugated field **bitwise identical in
+magnitude**, so no level tolerance can catch a conjugation; the case asserts
+that equality rather than assuming it. This is the package-level counterpart of
+`validate_analytic_exterior.jl`, which cannot see a convention defect
+introduced above the Julia boundary -- a conjugated wire unpacking or an
+acceleration rescale written the other way round.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on pull requests and on pushes to `main`. It

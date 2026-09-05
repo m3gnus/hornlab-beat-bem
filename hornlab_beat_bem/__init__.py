@@ -8,6 +8,13 @@ scaffolding and CI coverage; the CUDA and ROCm backends are the product.
 
 from __future__ import annotations
 
+from .capabilities import (
+    CAPABILITY_SCHEMA_VERSION,
+    REQUEST_SCHEMA_VERSION,
+    SOLVE_MODES,
+    backend_capabilities,
+    capability_report,
+)
 from .config import (
     BEAT_BACKENDS,
     BEAT_CPU,
@@ -53,6 +60,7 @@ __all__ = [
     "BEAT_CUDA",
     "BEAT_METAL",
     "BEAT_ROCM",
+    "CAPABILITY_SCHEMA_VERSION",
     "FORCE_CPU_ENV_VAR",
     "GROUND_PLANE_AXES",
     "GROUND_PLANE_AXIS_INDEX",
@@ -63,11 +71,15 @@ __all__ = [
     "MeshInfo",
     "ObservationConfig",
     "ObservationFrame",
+    "REQUEST_SCHEMA_VERSION",
+    "SOLVE_MODES",
     "SolveConfig",
     "SolveResult",
+    "backend_capabilities",
     "beat_engine_status",
     "beat_image_mode",
     "beat_symmetry_mode",
+    "capability_report",
     "detach_workers",
     "discover_julia",
     "ground_plane_enabled",

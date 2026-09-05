@@ -76,10 +76,15 @@ jobs:
 
       # Exit code alone does not distinguish "everything passed" from
       # "everything that mattered skipped". Without a Julia executable this
-      # suite reports 3 skipped, 60 passed and exits 0.
+      # suite reported 3 skipped, 60 passed and exited 0.
+      #
+      # The floor is well under the real count and well over any single
+      # directory, so it catches tests/conformance/ failing to collect --
+      # which an exit code cannot -- without turning every added test into a
+      # workflow edit. Raise it when the count grows past it again.
       - name: Check the report is not a vacuous green
         if: always()
-        run: python .github/scripts/check_pytest_report.py pytest-report.xml --min-tests 60
+        run: python .github/scripts/check_pytest_report.py pytest-report.xml --min-tests 200
 
   julia:
     name: Julia CPU suite (${{ matrix.os }})
