@@ -14,7 +14,8 @@ the solver, which ``test_solve_smoke.py`` and the slow marker already cover.
 Knobs, read from the environment because that is what the host inherits:
 ``FAKE_BEAT_BOOT_S`` delays the ready event (a slow cold start),
 ``FAKE_BEAT_SOLVE_S`` delays each frequency (a long job to interrupt),
-``FAKE_BEAT_FAIL`` makes startup fail.
+``FAKE_BEAT_FAIL`` makes startup fail, ``FAKE_BEAT_CANCEL_WAIT_S`` sets how
+long ``fake_wait_for_cancel`` waits before giving up (5 s by default).
 
 Two more are read from the *request* rather than the environment, because
 they describe one submission and the session lifecycle tests need the same
@@ -70,7 +71,13 @@ def solve(request: dict) -> None:
             },
         )
         if request.get("fake_wait_for_cancel") and frequency == frequencies[0]:
-            deadline = time.monotonic() + 5.0
+            # The fallback exists so a test that never cancels ends in a
+            # failure rather than a hang. Its length is a knob because a test
+            # that cancels only after a *third* party has done something needs
+            # the window to be a deadlock guard rather than a race it can lose.
+            deadline = time.monotonic() + float(
+                os.environ.get("FAKE_BEAT_CANCEL_WAIT_S", "5")
+            )
             while not (cancel_path and Path(cancel_path).exists()):
                 if time.monotonic() >= deadline:
                     emit(type="failed", error="test client did not cancel")

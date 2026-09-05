@@ -19,7 +19,10 @@ Three behaviours are worth reading the code for:
 *Ownership.* One job runs at a time, exactly as the in-process worker's lock
 enforced. A second client is queued rather than refused, because refusing
 would turn a benign overlap -- an app's warm-up and its first solve -- into an
-error the caller has no way to retry sensibly.
+error the caller has no way to retry sensibly. The same ownership decides who
+may end a runtime: a ``retire`` frame is declined while another client's job
+is running, since a request that has already finished must not kill the
+engine a later one is solving on.
 
 *Abandonment.* A client that vanishes mid-solve leaves Julia solving into a
 pipe nobody reads. The host notices the dead connection, writes the request's
@@ -157,6 +160,11 @@ class WorkerHost:
         if self._server is not None:
             with contextlib.suppress(OSError):
                 self._server.close()
+        # Before the kill, not after: a background warm-up parked on the
+        # engine's submission slot would otherwise be admitted the moment the
+        # running job let go and start a fresh Julia child behind this
+        # shutdown, which nothing would then be left to stop.
+        self._engine.refuse_submissions()
         self._engine.terminate()
 
     def _install_signal_handlers(self) -> None:
@@ -312,8 +320,10 @@ class WorkerHost:
         if operation == "submit":
             return self._submit(connection, message)
         if operation == "retire":
-            self._retire()
-            send_frame(connection, {"type": "retired"})
+            send_frame(
+                connection,
+                {"type": "retired", "engine_retired": self._retire_for_client()},
+            )
             return True
         if operation == "shutdown":
             send_frame(connection, {"type": "shutdown_ok"})
@@ -380,16 +390,22 @@ class WorkerHost:
             except (BrokenPipeError, ConnectionResetError, OSError):
                 # The client is gone. Julia is still solving; stop it and
                 # replace it, or the next adopter reads this job's events.
+                # Retire before closing the stream, not after: the kill has to
+                # happen while this job still owns the engine's submission
+                # slot, or the replacement warm-up that ``_retire`` starts can
+                # be admitted to the runtime being destroyed. Closing the
+                # stream below is what returns that slot, and so what lets the
+                # warm-up in.
                 _log("client vanished mid-solve; cancelling and retiring the worker")
                 _request_cancel(cancel_path)
-                self._close_events(events)
                 self._retire()
+                self._close_events(events)
                 return False
             except Exception as exc:  # noqa: BLE001 - the client renders it
                 with contextlib.suppress(OSError):
                     send_frame(connection, {"type": "failed", "error": str(exc)})
-                self._close_events(events)
                 self._retire()
+                self._close_events(events)
             finally:
                 self._end_job()
         return True
@@ -403,7 +419,56 @@ class WorkerHost:
             with contextlib.suppress(Exception):
                 close()
 
+    def _retire_for_client(self) -> bool:
+        """Retire on a client's say-so -- unless another client is solving.
+
+        A ``retire`` frame means "I am finished with this runtime and do not
+        trust it". It always arrives on a connection whose own job has ended:
+        a connection is inside ``_submit`` or reading frames, never both. So a
+        job running when this arrives belongs to *another* client, and there
+        is exactly one host serving both of them. Killing the engine there
+        would fail a solve that has nothing to do with the request being
+        retired -- and two applications adopting one host is not a corner
+        case, it is what the host is for.
+
+        The job lock is therefore taken without blocking, and a retirement
+        that cannot have it is declined rather than queued. Waiting would hold
+        this client's shutdown for as long as somebody else's solve takes, and
+        the distrust that motivates a retirement is already spent: the engine
+        has been handed on, in order, to a request the host admitted after
+        this one finished. That request retires it itself if it goes wrong,
+        through its own abandonment path.
+
+        Returns whether the engine was actually retired. The answer travels
+        back in the ``engine_retired`` field of the ``retired`` frame, and
+        ``HostedBeatWorker.terminate`` hands it to its caller, so a client can
+        tell a retirement from a declined one rather than assuming.
+        """
+
+        if not self._job_lock.acquire(blocking=False):
+            _log("declined a retire: another client's job is running")
+            return False
+        try:
+            self._retire()
+        finally:
+            self._job_lock.release()
+        return True
+
     def _retire(self) -> None:
+        """Stop this host's engine and start warming its replacement.
+
+        ``terminate`` is the unconditional retirement, and that is the right
+        one here: the host owns its engine outright, so there is no other
+        claimant whose submission it could be ending. It leaves the engine's
+        submission slot alone, and which caller this is decides who gives that
+        slot back. From ``_submit`` it is the caller itself, by closing the
+        stream on the next line -- which is also what admits the warm-up
+        thread started below. From ``_retire_for_client`` nobody holds it,
+        because that path retires only when no job is running.
+
+        The caller must hold ``_job_lock``.
+        """
+
         self._engine.terminate()
         if not self._stopping.is_set():
             self._start_background_warm()

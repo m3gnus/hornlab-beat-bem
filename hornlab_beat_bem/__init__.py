@@ -38,6 +38,7 @@ from .runtime import (
     package_version,
     probe_gpu_functional_cache_clear,
 )
+from .submission import SubmissionClosed
 from .sweep import (
     BeatUnavailableError,
     generated_frequency_grid,
@@ -65,6 +66,7 @@ __all__ = [
     "ObservationFrame",
     "SolveConfig",
     "SolveResult",
+    "SubmissionClosed",
     "beat_engine_status",
     "beat_image_mode",
     "beat_symmetry_mode",

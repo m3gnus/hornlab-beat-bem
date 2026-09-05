@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from . import worker_registry as registry
+from .submission import Submission, SubmissionSlot, SubmissionStream
 from .worker_registry import receive_frame, send_frame
 
 StatusCallback = Callable[[str], None]
@@ -79,7 +80,10 @@ class HostedBeatWorker:
         self.key = key
         self.identifier = registry.key_id(key)
         self.directory = directory if directory is not None else registry.worker_dir()
-        self._lock = threading.Lock()
+        # The same submission slot the in-process worker uses, and for the
+        # same reason: the retirement paths below have to be able to say which
+        # request they are ending, not merely that one is under way.
+        self._lock = SubmissionSlot()
         self._connection: socket.socket | None = None
         self.host_pid: int | None = None
         #: The Julia process id behind the host, as of the last handshake or
@@ -90,7 +94,7 @@ class HostedBeatWorker:
     # -- public surface, mirroring BeatWorkerProcess ------------------------
 
     def ensure_started(self, *, status_callback: StatusCallback | None = None) -> None:
-        with self._lock:
+        with self._lock.held():
             connection = self._connect()
             send_frame(connection, {"op": "ensure_started"})
             for event in self._read_until(connection, {"ready", "failed"}):
@@ -109,8 +113,8 @@ class HostedBeatWorker:
         request_path: Path,
         *,
         status_callback: StatusCallback | None = None,
-    ) -> Iterator[dict]:
-        self._lock.acquire()
+    ) -> SubmissionStream:
+        submission = self._lock.acquire()
         try:
             connection = self._connect()
             # The host reads the cancel path out of the staged request; this
@@ -124,22 +128,27 @@ class HostedBeatWorker:
                 },
             )
         except BaseException:
-            self._lock.release()
+            self._lock.release(submission)
             raise
-        return self._iter_submission(connection, status_callback)
+        return SubmissionStream(
+            self._lock,
+            submission,
+            self._iter_submission(connection, status_callback, submission),
+        )
 
-    def terminate(self) -> None:
+    def terminate(self) -> bool:
         """Retire the Julia child; the host survives and warms a replacement.
 
-        This is what an abandoned or failed solve calls, and the change from
-        the in-process worker is that it no longer costs the *next* solve a
-        cold start: the host starts a fresh runtime immediately, so the
-        compilation happens while nobody is waiting for it.
+        This is the unconditional retirement -- an application shutting down,
+        or a caller that owns this worker outright. A request ending *its own*
+        solve wants ``retire`` below, which will not act once the worker has
+        moved on to somebody else.
 
-        It deliberately takes no lock. The failure path calls it from *inside*
-        the submission generator, with the lock still held -- the in-process
-        worker had the same contract, and taking the lock here would deadlock
-        exactly when a solve has already gone wrong.
+        It deliberately takes no lock, and no longer releases one either. The
+        release used to be unconditional on finding the slot held, which on
+        this path meant releasing whichever request had taken the worker after
+        the caller let go of it -- and then closing the connection that
+        request was reading. The slot is now given back by its owner alone.
 
         Either half of the sequence below is sufficient on its own: the host
         retires on an explicit ``retire``, and it also retires when a
@@ -148,12 +157,47 @@ class HostedBeatWorker:
         the host is mid-send, the ``retire`` frame waits behind a full socket
         buffer and only the close is heard; when the host is idle, only the
         frame is.
+
+        The explicit half is honoured only while the host has no other
+        client's job running -- see ``WorkerHost._retire_for_client``. That is
+        not a hole in this contract but the same rule one level out: a runtime
+        the host has already handed to somebody else is no longer ours to end.
+
+        Returns what the host said it did: ``True`` if the engine was retired,
+        ``False`` if the retirement was declined because another client is
+        solving on it -- and ``False`` too when there was nobody to ask or the
+        reply did not arrive, since in both of those the caller has learned
+        nothing that would let it claim the engine went down.
         """
 
-        self._say_and_close({"op": "retire"}, "retired")
-        if self._lock.locked():
-            with contextlib.suppress(RuntimeError):
-                self._lock.release()
+        reply = self._say_and_close({"op": "retire"}, "retired")
+        return bool(reply is not None and reply.get("engine_retired"))
+
+    def retire(self, submission: Submission | None) -> bool:
+        """Retire the runtime on behalf of the submission that holds it.
+
+        The slot is held for the whole of it, so the ``retire`` frame and the
+        connection close cannot land on a request that was admitted halfway
+        through. Refused once this submission no longer owns the worker.
+        """
+
+        return self._lock.retire(submission, self.terminate)
+
+    def release_submission(self, submission: Submission | None) -> bool:
+        """Hand the slot back, if this submission still holds it."""
+
+        return self._lock.release(submission)
+
+    def refuse_submissions(self) -> None:
+        """Take no further work, and unblock whoever is waiting for some.
+
+        The client's copy of the in-process worker's method, called for the
+        same reason and by the same caller: ``shutdown_workers`` is dropping
+        this object, and a thread parked on a submission that will never be
+        released has no other way out -- only its owner may free the slot.
+        """
+
+        self._lock.close()
 
     def shutdown(self) -> None:
         """Stop the host process itself, ending the persistence."""
@@ -166,27 +210,42 @@ class HostedBeatWorker:
         self._close_connection()
 
     def ping(self) -> dict[str, Any]:
-        with self._lock:
+        with self._lock.held():
             return self._request({"op": "ping"}, {"pong"}, timeout=10.0)
 
     # -- plumbing ----------------------------------------------------------
 
-    def _say_and_close(self, message: dict[str, Any], terminal: str) -> None:
+    def _say_and_close(
+        self, message: dict[str, Any], terminal: str
+    ) -> dict[str, Any] | None:
+        """Say one thing, wait briefly for its answer, and hang up.
+
+        Returns the terminal frame if one arrived, and ``None`` otherwise --
+        a host that had already gone, a connection that was never made, a
+        reply that did not come inside the two seconds. The callers treat a
+        missing answer as no news rather than as a failure, which is the whole
+        reason this path swallows its errors: it runs on shutdown, where the
+        thing it is talking to is allowed to be gone already.
+        """
+
         connection = self._connection
         if connection is None:
-            return
+            return None
         deadline = time.monotonic() + 2.0
         try:
             send_frame(connection, message)
             connection.settimeout(2.0)
             while time.monotonic() < deadline:
                 event = receive_frame(connection)
-                if event is None or str(event.get("type", "")) == terminal:
+                if event is None:
                     break
+                if str(event.get("type", "")) == terminal:
+                    return event
         except (OSError, RuntimeError, ValueError):
             pass
         finally:
             self._close_connection()
+        return None
 
     def _request(
         self, message: dict[str, Any], terminal: set[str], *, timeout: float
@@ -216,7 +275,10 @@ class HostedBeatWorker:
                 return
 
     def _iter_submission(
-        self, connection: socket.socket, status_callback: StatusCallback | None
+        self,
+        connection: socket.socket,
+        status_callback: StatusCallback | None,
+        submission: Submission,
     ) -> Iterator[dict]:
         try:
             while True:
@@ -233,9 +295,7 @@ class HostedBeatWorker:
                 if event_type in {"completed", "cancelled", "failed"}:
                     return
         finally:
-            if self._lock.locked():
-                with contextlib.suppress(RuntimeError):
-                    self._lock.release()
+            self._lock.release(submission)
 
     def _close_connection(self) -> None:
         connection, self._connection = self._connection, None

@@ -441,6 +441,15 @@ shutdown hook and nothing else changes: `get_worker`, `solve_frequencies` and
 `warm_up` keep their signatures, and a solve is streamed through the host
 exactly as it was through the pipe.
 
+Both of them end this process's claim on the worker, so a solve that is queued
+behind another one at that moment is not re-adopted afterwards: it raises
+`SubmissionClosed` (importable from the package root) rather than waiting for a
+worker this process has let go of. A solve already running is untouched — it
+still owns the worker and streams to its end. Calling either from a quit hook
+while solves are still in flight is therefore a decision to fail the queued
+ones, which is the intended reading of "we are shutting down"; an application
+that wants them to finish waits for them first.
+
 Nothing accumulates. A host with no connected client and no running job retires
 itself after `HORNLAB_BEAT_WORKER_IDLE_S` (30 minutes by default), and every
 way a host can be gone — a dead pid in the registry, a socket file nobody
@@ -453,7 +462,11 @@ handing a mid-job worker to the next adopter.
 **Retiring is no longer expensive.** A failed or abandoned solve still retires
 the Julia child — after an accelerator failure the runtime may be in any state
 — but the host immediately starts its replacement, so the compilation happens
-while nobody is waiting rather than in front of the next solve.
+while nobody is waiting rather than in front of the next solve. A retirement
+reaches only the runtime the caller was using: when two applications share a
+host, one that arrives while the other client's job is running is declined
+rather than applied, because the runtime it distrusts has already been handed
+on in good order and the request now using it retires it itself if it fails.
 
 **Transport.** A Unix domain socket where one is available and the path fits in
 `sun_path` (about 100 bytes), and a loopback TCP port otherwise. The fallback

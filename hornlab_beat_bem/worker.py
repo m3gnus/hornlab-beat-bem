@@ -46,6 +46,7 @@ from .runtime import (
     package_fingerprint,
     package_version,
 )
+from .submission import Submission, SubmissionSlot, SubmissionStream
 from .worker_client import HostedBeatWorker, keyed_environment
 
 StatusCallback = Callable[[str], None]
@@ -146,7 +147,15 @@ def _julia_command(
 
 
 class BeatWorkerProcess:
-    """One persistent Julia worker; one submission at a time."""
+    """One persistent Julia worker; one submission at a time.
+
+    "One at a time" is enforced by a :class:`~.submission.SubmissionSlot`
+    rather than a plain lock, because every caller that ends a job here is an
+    unwind path and unwind paths run out of order. The slot records which
+    submission holds it, so a release or a retirement arriving from a request
+    that has already finished is refused instead of being applied to whoever
+    holds the worker now.
+    """
 
     def __init__(
         self,
@@ -162,7 +171,7 @@ class BeatWorkerProcess:
         self.julia_threads = julia_threads
         self.julia_project = julia_project
         self.julia_sysimage = julia_sysimage
-        self._lock = threading.Lock()
+        self._lock = SubmissionSlot()
         self._process: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
         self._stderr_thread: threading.Thread | None = None
@@ -188,10 +197,13 @@ class BeatWorkerProcess:
         request_path: Path,
         *,
         status_callback: StatusCallback | None = None,
-    ) -> Iterator[dict]:
-        self._lock.acquire()
-        self._status_callback = status_callback
+    ) -> SubmissionStream:
+        submission = self._lock.acquire()
         try:
+            # Inside the try, not between it and the acquire: everything that
+            # happens after the slot is taken has to be covered by the unwind
+            # that gives it back.
+            self._status_callback = status_callback
             self._ensure_started()
             process = self._process
             if process is None or process.stdin is None:
@@ -202,14 +214,16 @@ class BeatWorkerProcess:
                 + "\n"
             )
             process.stdin.flush()
-            return self._iter_events_for_submission()
+            return SubmissionStream(
+                self._lock, submission, self._iter_events_for_submission(submission)
+            )
         except BaseException:
             self._status_callback = None
-            self._lock.release()
+            self._lock.release(submission)
             raise
 
     def ensure_started(self, *, status_callback: StatusCallback | None = None) -> None:
-        with self._lock:
+        with self._lock.held():
             previous = self._status_callback
             self._status_callback = status_callback
             try:
@@ -217,22 +231,62 @@ class BeatWorkerProcess:
             finally:
                 self._status_callback = previous
 
-    def terminate(self) -> None:
+    def terminate(self) -> bool:
+        """Stop the Julia child, whoever is using it.
+
+        This is the *unconditional* retirement: the application shutting down,
+        or the host replacing a runtime it owns outright. It deliberately does
+        not touch the submission slot. It used to release the slot whenever it
+        found it held, which is how an earlier request came to free a later
+        one's submission -- a plain lock cannot tell the two apart, and by the
+        time an abandoned session reached here it had already let go. A caller
+        that is ending its *own* submission wants ``retire`` below.
+
+        An in-flight submission is not left stranded by the silence: the
+        stream it is reading ends with the process, and the owner releases the
+        slot on its way out.
+
+        Returns whether the runtime was retired, which in process is always:
+        the child is this object's to kill and there is no second client to
+        decline for. The hosted worker's answer is the one that varies.
+        """
+
         self._kill_process()
-        if self._lock.locked():
-            try:
-                self._lock.release()
-            except RuntimeError:
-                pass
+        return True
+
+    def retire(self, submission: Submission | None) -> bool:
+        """Stop the Julia child on behalf of the submission that holds it.
+
+        Refused, and a no-op, once this submission no longer owns the worker.
+        That case is real rather than defensive: a stream that ended because
+        the runtime died has already released the slot, and by then the
+        process this would kill belongs to somebody else.
+        """
+
+        return self._lock.retire(submission, self._kill_process)
+
+    def release_submission(self, submission: Submission | None) -> bool:
+        """Hand the slot back, if this submission still holds it."""
+
+        return self._lock.release(submission)
+
+    def refuse_submissions(self) -> None:
+        """Take no further work, and unblock whoever is waiting for some.
+
+        Ownership means a submission can only be released by its owner, which
+        is the property that makes a lost owner unrecoverable: nobody else may
+        free the slot, and ``acquire`` waits without a deadline because a
+        queued solve is meant to wait for the one ahead of it. This is the way
+        out, and it belongs to the process rather than to a request --
+        ``shutdown_workers`` calls it on a worker it is dropping, so a thread
+        parked on a solve that will now never end is told so instead of
+        waiting for a runtime that is being stopped underneath it.
+        """
+
+        self._lock.close()
 
     def _kill_process(self) -> None:
-        """Stop the Julia child and forget it, without touching the lock.
-
-        ``terminate`` cannot be reused for this: it also releases the
-        submission lock, and the startup path below runs with that lock held
-        by ``ensure_started``, so releasing it there would leave the next
-        release unbalanced.
-        """
+        """Stop the Julia child and forget it, without touching the slot."""
 
         process = self._process
         self._process = None
@@ -301,7 +355,7 @@ class BeatWorkerProcess:
         self._kill_process()
         raise RuntimeError(message)
 
-    def _iter_events_for_submission(self) -> Iterator[dict]:
+    def _iter_events_for_submission(self, submission: Submission) -> Iterator[dict]:
         try:
             for event in self._read_events():
                 yield event
@@ -310,8 +364,7 @@ class BeatWorkerProcess:
             raise RuntimeError(self._process_error("Warm BEAT Engine solver ended before job completion."))
         finally:
             self._status_callback = None
-            if self._lock.locked():
-                self._lock.release()
+            self._lock.release(submission)
 
     def _read_events(self) -> Iterator[dict]:
         process = self._process
@@ -446,18 +499,40 @@ def shutdown_workers(*, detach: bool = False) -> None:
     and an explicit "stop the solver" request all mean. An in-process worker
     (``HORNLAB_BEAT_PERSISTENT_HOST=0``) has nothing to detach from and is
     terminated either way -- it dies with this process regardless.
+
+    Either way the worker's submission slot is closed first. These worker
+    objects are being dropped from the cache, so nothing may be admitted to
+    one afterwards -- and a thread already queued behind a request that has
+    stopped making progress has, until it is told, no way out at all: only the
+    owner may free the slot, and the owner is the request being abandoned.
+    Closing the slot makes that thread raise where it would otherwise wait for
+    a worker this process no longer holds.
     """
 
     with _WORKERS_LOCK:
         workers = list(_WORKERS.values())
         _WORKERS.clear()
     for worker in workers:
-        if detach and isinstance(worker, HostedBeatWorker):
-            worker.detach()
-        elif isinstance(worker, HostedBeatWorker):
-            worker.shutdown()
-        else:
-            worker.terminate()
+        with contextlib.suppress(Exception):
+            worker.refuse_submissions()
+    # Every worker is stopped even if one of them refuses to die, and the
+    # first failure is re-raised afterwards. They have already been dropped
+    # from the cache, so a stop abandoned half way through leaves runtimes
+    # nothing can reach.
+    failure: BaseException | None = None
+    for worker in workers:
+        try:
+            if detach and isinstance(worker, HostedBeatWorker):
+                worker.detach()
+            elif isinstance(worker, HostedBeatWorker):
+                worker.shutdown()
+            else:
+                worker.terminate()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            if failure is None:
+                failure = exc
+    if failure is not None:
+        raise failure
 
 
 def detach_workers() -> None:
@@ -485,9 +560,16 @@ class BeatSolveSession:
     the initial handshake all happen here. Each of those runs inside
     ``__init__``'s unwind (``_abort_start``), because a session that raised is
     unreachable -- nobody can close it, and whatever it had taken (the staged
-    directory, a one-shot child, the worker's submission lock) would be held
-    until the garbage collector happened to run, which for the lock means the
+    directory, a one-shot child, the worker's submission slot) would be held
+    until the garbage collector happened to run, which for the slot means the
     *next* request blocks on a solve that no longer exists.
+
+    What the session owns of the worker is one :class:`~.submission.Submission`
+    and nothing else. Both ends of the lifetime follow from that: retirement
+    happens *before* the event stream is closed, because closing it is what
+    gives the submission back, and a session that has already given it back
+    retires nothing. That ordering is the difference between a worker this
+    session condemned and one the next request is already solving on.
     """
 
     def __init__(
@@ -520,6 +602,10 @@ class BeatSolveSession:
         #: True once a request is actually in flight. Until then a failure is
         #: this request's alone and must leave the worker to the next one.
         self._submitted = False
+        #: This session's claim on the persistent worker, and the only thing
+        #: that entitles it to release or retire one. ``None`` means the
+        #: worker is not ours -- never taken, or already given back.
+        self._submission: Submission | None = None
         self._retire_worker = False
         self._closed = False
 
@@ -545,13 +631,30 @@ class BeatSolveSession:
                     julia_project=self.julia_project,
                     julia_sysimage=julia_sysimage,
                 )
-                events = self._worker.submit(request_path, status_callback=self._emit_status)
-                # ``submit`` holds the worker's submission lock from here until
-                # the stream is closed, and only from here: it releases the lock
-                # itself if it raises. This is the instruction that makes the
-                # worker ours to cancel and retire, and not one earlier.
+                # ``submit`` holds the worker's submission slot from here until
+                # the stream is closed, and only from here: it releases the
+                # slot itself if it raises. This is the instruction that makes
+                # the worker ours to cancel and retire, and not one earlier --
+                # and the submission it hands back is the proof we hold when
+                # we say so.
+                #
+                # The submission is stored *first*, and the stream second,
+                # because an asynchronous exception can land between the two
+                # stores and the unwind reads them in that order: with only
+                # the stream stored, ``_abort_start`` would close it -- giving
+                # the slot back -- without ever cancelling the job that is
+                # still running on the far side. With only the submission
+                # stored it cancels, retires and releases, which is the
+                # correct handling of a request that is in flight and whose
+                # events nobody will read. The one window neither store covers
+                # -- the instant between ``submit`` returning and the first
+                # assignment -- is the stream's finalizer's, best-effort.
+                stream = self._worker.submit(
+                    request_path, status_callback=self._emit_status
+                )
+                self._submission = stream.submission
+                self._events = stream
                 self._submitted = True
-                self._events = events
             else:
                 self._emit_status("Initializing BEAT Engine")
                 try:
@@ -626,18 +729,40 @@ class BeatSolveSession:
         if self._closed:
             return
         self._closed = True
-        events, self._events = self._events, None
-        self._close_events(events)
         if not self._finished:
             # Abandoned mid-solve: ask the solver to stop, and retire a
             # persistent worker instead of handing it over mid-job.
             self.request_cancel()
             self._retire_worker = True
-        if self._retire_worker and self._worker is not None:
-            self._retire_worker = False
-            self._worker.terminate()
-        self._terminate_process()
-        self._cleanup_temp_dir()
+        # Retirement first, and the stream second. Closing the stream is what
+        # releases the submission, so the other order would publish the worker
+        # to whoever is waiting and only then kill it.
+        #
+        # Every step runs even when an earlier one raises, and the first
+        # failure is re-raised once they all have. Retirement is the step that
+        # can genuinely fail -- a Julia child that survives both a SIGTERM and
+        # a SIGKILL for two seconds raises ``TimeoutExpired`` out of the kill
+        # -- and letting that skip the release would strand the submission for
+        # the lifetime of the process: this session is already ``_closed``, so
+        # nothing will call it again, and only the holder may free the slot.
+        # A runtime that would not stop is still worth reporting; it is simply
+        # not worth a leaked worker as well.
+        events, self._events = self._events, None
+        failure: BaseException | None = None
+        for step in (
+            self._retire_submission,
+            functools.partial(self._close_events, events),
+            self._release_submission,
+            self._terminate_process,
+            self._cleanup_temp_dir,
+        ):
+            try:
+                step()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
     def _abort_start(self) -> None:
         """Give back everything a failed ``__init__`` had taken.
@@ -656,34 +781,69 @@ class BeatSolveSession:
         """
 
         self._closed = True
+        if (self._submitted or self._submission is not None) and not self._finished:
+            # The worker may still be mid-job on our request: same contract as
+            # an abandoned solve. Holding the submission counts as having
+            # submitted even when the flag says otherwise -- an asynchronous
+            # exception can land between those two stores, and the half that
+            # matters here is the one that says a job is running.
+            self.request_cancel()
+            self._retire_worker = True
+        with contextlib.suppress(BaseException):
+            self._retire_submission()
         events, self._events = self._events, None
         with contextlib.suppress(BaseException):
             self._close_events(events)
-        if self._submitted and not self._finished:
-            # The worker may still be mid-job on our request: same contract as
-            # an abandoned solve.
-            self.request_cancel()
-            self._retire_worker = True
-        if self._retire_worker and self._worker is not None:
-            self._retire_worker = False
-            with contextlib.suppress(BaseException):
-                self._worker.terminate()
+        with contextlib.suppress(BaseException):
+            self._release_submission()
         with contextlib.suppress(BaseException):
             self._terminate_process()
         with contextlib.suppress(BaseException):
             self._cleanup_temp_dir()
 
+    def _retire_submission(self) -> None:
+        """Retire the worker, while this session still owns its submission.
+
+        Both halves of that sentence carry weight. *While*: the submission is
+        still held here, because the stream has not been closed yet, so no
+        waiting request can be admitted between the decision and the kill.
+        *Owns*: a session whose stream already ended -- a runtime that died
+        under it, say -- released the submission when the stream did, and the
+        slot refuses the retirement rather than applying it to whoever took
+        the worker next.
+        """
+
+        if not self._retire_worker:
+            return
+        self._retire_worker = False
+        if self._worker is None:
+            return
+        self._worker.retire(self._submission)
+
+    def _release_submission(self) -> None:
+        """Give the submission back, if closing the stream has not already.
+
+        Normally it has -- ``SubmissionStream.close`` releases whether or not
+        its generator ever ran. This is the backstop for the paths where that
+        close does not happen or does not finish: an unwind that suppressed an
+        exception out of it, or a session that never reached a stream at all.
+        Releasing twice is safe by construction, because the slot only honours
+        a release from the submission that still holds it.
+        """
+
+        submission, self._submission = self._submission, None
+        if self._worker is not None:
+            self._worker.release_submission(submission)
+
     @staticmethod
     def _close_events(events: Iterator[dict] | None) -> None:
-        """Close the event stream before anything else touches the worker.
+        """Close the event stream, which is what releases the submission.
 
-        Both worker implementations release the submission lock in their
-        generator's ``finally``, and both ``terminate`` methods release it too
-        if they find it held. Closing the generator first avoids a delayed
-        generator release after retirement: the other way round,
-        the generator's later close finds the lock held again by whichever
-        request came next and releases *that* one, letting two solves into a
-        worker that can serve one.
+        It runs *after* ``_retire_submission`` for that reason. The order used
+        to be the other way, to keep a late generator close from releasing a
+        lock that had been re-taken by the next request -- a hazard the
+        submission slot removes outright, since a release from a submission
+        that no longer holds the slot is now a no-op rather than a hand-over.
         """
 
         if events is None:
