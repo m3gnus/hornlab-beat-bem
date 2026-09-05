@@ -398,14 +398,24 @@ class WorkerHost:
                 # warm-up in.
                 _log("client vanished mid-solve; cancelling and retiring the worker")
                 _request_cancel(cancel_path)
-                self._retire()
-                self._close_events(events)
+                try:
+                    self._retire()
+                finally:
+                    # Retirement may fail even after kill(). Release the
+                    # stream explicitly, while preserving the original error
+                    # and the retirement-before-release ordering.
+                    self._close_events(events)
                 return False
             except Exception as exc:  # noqa: BLE001 - the client renders it
                 with contextlib.suppress(OSError):
                     send_frame(connection, {"type": "failed", "error": str(exc)})
-                self._retire()
-                self._close_events(events)
+                try:
+                    self._retire()
+                finally:
+                    # Retirement may fail even after kill(). Release the
+                    # stream explicitly, while preserving the original error
+                    # and the retirement-before-release ordering.
+                    self._close_events(events)
             finally:
                 self._end_job()
         return True

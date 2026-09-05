@@ -712,3 +712,67 @@ def test_a_dropped_streams_finalizer_gives_up_rather_than_wait_for_the_mutex():
     ours = slot.acquire()
     SubmissionStream(slot, ours, events()).__del__()
     assert not slot.locked(), "an uncontended finalizer kept the slot"
+
+
+@pytest.mark.parametrize("send_error", [BrokenPipeError, RuntimeError])
+def test_host_closes_submission_when_retirement_raises(tmp_path, monkeypatch, send_error):
+    """Both host error paths release explicitly, even if Julia will not die."""
+    from hornlab_beat_bem.submission import SubmissionSlot, SubmissionStream
+    from hornlab_beat_bem.worker_host import WorkerHost
+
+    slot = SubmissionSlot()
+    cleanup = threading.Event()
+    retirement_error = subprocess.TimeoutExpired("Julia termination", 2.0)
+
+    class Engine:
+        stream = None
+
+        def submit(self, request_path, *, status_callback):
+            def events():
+                try:
+                    yield {"type": "status", "message": "solving"}
+                    yield {"type": "completed"}
+                finally:
+                    cleanup.set()
+
+            self.stream = SubmissionStream(slot, slot.acquire(), events())
+            return self.stream
+
+        def terminate(self):
+            assert slot.holds(self.stream.submission), "released before retirement"
+            raise retirement_error
+
+    engine = Engine()
+    monkeypatch.setattr(WorkerHost, "_build_engine", lambda self: engine)
+    host = WorkerHost(key=fake_key(), directory=tmp_path, idle_timeout=120)
+    request = request_file(tmp_path / "request", [100.0])
+    sent = []
+
+    def send(connection, event):
+        if event["type"] == "status":
+            raise send_error("failed to deliver the solve event")
+        sent.append(event)
+
+    monkeypatch.setattr("hornlab_beat_bem.worker_host.send_frame", send)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as raised:
+            host._submit(object(), {"request": str(request)})
+        assert raised.value is retirement_error
+        assert cleanup.is_set(), "host left explicit cleanup to garbage collection"
+        assert not slot.locked(), "failed retirement leaked the submission slot"
+        assert not host._job_running
+        assert host._job_lock.acquire(blocking=False)
+        host._job_lock.release()
+        # A subsequent job can take the engine slot without relying on the
+        # stream being collected; Engine deliberately retains it above.
+        with slot.held():
+            pass
+        if send_error is RuntimeError:
+            assert sent == [{"type": "failed", "error": "failed to deliver the solve event"}]
+        else:
+            assert (request.parent / "cancel").exists()
+    finally:
+        # Do not leak the deliberately retained stream when the regression
+        # test is run against the old implementation and fails as intended.
+        if engine.stream is not None:
+            engine.stream.close()
