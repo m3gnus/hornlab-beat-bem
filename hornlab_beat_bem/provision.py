@@ -16,7 +16,7 @@ is unchanged for everyone who does not ask. ``--backend cpu`` is the CLI form,
 ``--backend auto`` never selects it, and combining it with a GPU gate flag is
 refused rather than resolved (see ``main``).
 
-Steps, each idempotent and recorded in ``<runtime_dir>/state.json``:
+Steps, each idempotent and recorded in ``<runtime_dir>/state-<backend>.json``:
 
 1. Resolve a Julia executable -- an existing install (env var/PATH/previous
    provisioning, including this runtime directory's own record) wins; only
@@ -33,11 +33,33 @@ Steps, each idempotent and recorded in ``<runtime_dir>/state.json``:
    for*). Either way a recorded "ready" means the first real solve computes
    instead of downloading or compiling.
 
-The state file records the backend, project and content fingerprint it was
+Each state file records the backend, project and content fingerprint it was
 provisioned for, and both entry points refuse to reuse a "ready" record that
 does not match what is being asked for: a CPU-ready runtime is never reported
 as satisfying a GPU request, or the other way round, and an in-place package
 update is instantiated and probed again.
+
+**One record per backend.** Readiness used to live in a single
+``state.json`` with one ``backend`` field, so the file could attest to one
+backend at a time and provisioning the CPU on a GPU host overwrote the record
+that said the GPU stack was ready. Two backends can be provisioned on one host
+-- a CUDA box that also wants the portable CPU path for comparison is the
+ordinary case, not a corner -- so each backend now owns
+``state-<backend>.json``, and :func:`read_state` answers per backend.
+``state.json`` is still written as a mirror of the most recent record so a
+consumer pinned to an older commit keeps reading the shape it knows; see
+:func:`read_state` for exactly what that means in both directions.
+
+**One provisioning at a time.** Provisioning mutates shared state that is not
+per backend: it unpacks a portable Julia into the runtime directory, and
+``_extract_julia`` removes an existing unpack before replacing it. Two
+provisionings racing there can delete a Julia the other is executing, so the
+whole run holds the kernel's advisory lock on ``<runtime_dir>/provision.lock``
+(``fcntl.flock``, ``msvcrt.locking`` on Windows). The operating system releases
+it when the holding process dies, so there is no lease to renew and no stale
+lock to take over; the file itself is never removed, because unlinking a lock
+under a waiter is how two processes come to hold two different inodes. A second
+provisioning waits and says what it is waiting for rather than interleaving.
 
 Failures never raise past the CLI: they are written to the state file,
 reported through ``beat_engine_status`` as honest unavailability reasons, and
@@ -47,6 +69,7 @@ turned into a nonzero exit code.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -60,6 +83,7 @@ import time
 import urllib.request
 import zipfile
 from collections.abc import Callable
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +123,34 @@ _REQUIRED_FREE_BYTES = 6 * 1024**3
 _CPU_REQUIRED_FREE_BYTES = 2 * 1024**3
 
 RUNTIME_DIR_ENV_VAR = "HORNLAB_BEAT_RUNTIME_DIR"
+#: The legacy single-slot record. Still written, as a mirror; never the only
+#: copy. See :func:`read_state`.
 STATE_FILENAME = "state.json"
+
+#: Per-backend record. ``{}`` takes the backend name, which is one of
+#: ``config.BEAT_BACKENDS`` and therefore already filename-safe.
+BACKEND_STATE_FILENAME = "state-{}.json"
+
+#: Layout version stamped into every record this module writes. 1 is the
+#: single-slot ``state.json`` that predates per-backend records; a reader that
+#: finds no ``state_schema`` key at all is reading a version-1 record.
+STATE_SCHEMA_VERSION = 2
+
+#: The provisioning lock, one per runtime directory. A persistent file that is
+#: **created once and never removed**: the exclusion is the kernel's advisory
+#: lock on it, not the file's existence, so there is nothing to go stale and
+#: nothing to unlink under a waiter. Removing it while another process waits on
+#: it would leave two holders locking two different inodes.
+LOCK_FILENAME = "provision.lock"
+
+#: Who holds it, for the waiter's message only. A separate file because the lock
+#: file's own bytes are locked on Windows, and because nothing may *depend* on
+#: this: it is prose, and a lock's correctness must not rest on prose.
+LOCK_HOLDER_FILENAME = "provision.holder.json"
+
+#: How often a waiter retries. Polling rather than a blocking lock call so the
+#: wait is interruptible on both platforms and looks the same on each.
+_LOCK_POLL_S = 0.25
 
 StatusCallback = Callable[[str], None]
 
@@ -119,8 +170,7 @@ def default_runtime_dir() -> Path:
     return Path(base) / "hornlab-beat" / "runtime"
 
 
-def read_state(runtime_dir: Path | None = None) -> dict[str, Any] | None:
-    path = (runtime_dir or default_runtime_dir()) / STATE_FILENAME
+def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -128,26 +178,295 @@ def read_state(runtime_dir: Path | None = None) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
-def _write_state(runtime_dir: Path, state: dict[str, Any]) -> None:
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    state = dict(state)
-    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    path = runtime_dir / STATE_FILENAME
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+def backend_state_path(runtime_dir: Path | None, backend: str) -> Path:
+    """Where one backend's readiness record lives."""
+
+    return (runtime_dir or default_runtime_dir()) / BACKEND_STATE_FILENAME.format(backend)
 
 
-def provisioned_julia(runtime_dir: Path | None = None) -> str | None:
-    """Return the provisioned Julia executable when it is recorded and real."""
+def read_state(
+    runtime_dir: Path | None = None, *, backend: str | None = None
+) -> dict[str, Any] | None:
+    """One readiness record: a named backend's, or the most recent write.
 
-    state = read_state(runtime_dir)
-    if not state or state.get("status") != "ready":
-        return None
-    executable = state.get("julia_executable")
-    if isinstance(executable, str) and executable and Path(executable).exists():
-        return executable
+    ``backend`` is the question worth asking, and the only one that cannot be
+    answered wrongly. It reads ``state-<backend>.json``, and falls back to the
+    legacy ``state.json`` **only when that file names this same backend** --
+    which is what carries a host provisioned before per-backend records existed
+    across the upgrade without re-downloading anything, and what stops a
+    record about CUDA from being read as an answer about the CPU.
+
+    Called without ``backend`` it returns the legacy mirror, i.e. the most
+    recently written record whatever backend it describes. That signature is
+    kept because a consumer pinned to an older commit calls it that way, and
+    the mirror is what makes that consumer's own backend comparison keep
+    working: it matches on ``backend``/``project``/``package_fingerprint``, so
+    a mirror describing a different backend fails its test and reports
+    unprovisioned -- under-declaring, never over-promising. New callers should
+    pass ``backend`` and get a definite answer.
+    """
+
+    directory = runtime_dir or default_runtime_dir()
+    if backend is None:
+        return _read_json(directory / STATE_FILENAME)
+    recorded = _read_json(backend_state_path(directory, backend))
+    if recorded is not None:
+        return recorded
+    legacy = _read_json(directory / STATE_FILENAME)
+    if legacy is not None and legacy.get("backend") == backend:
+        return legacy
     return None
+
+
+def read_backend_states(runtime_dir: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Every backend's record, keyed by backend.
+
+    The per-backend files win over the legacy mirror, which is only consulted
+    for a backend that has no file of its own -- exactly one backend can be in
+    that position, and only until it is next provisioned.
+
+    The presence of this function is also how a consumer detects that the
+    installed package records readiness per backend at all: with it, asking for
+    the CPU runtime cannot disturb a provisioned GPU one, and provisioning both
+    is representable. Without it, the consumer is talking to a single-slot
+    record and should not overwrite a GPU's.
+    """
+
+    from .config import BEAT_BACKENDS
+
+    directory = runtime_dir or default_runtime_dir()
+    states: dict[str, dict[str, Any]] = {}
+    for backend in BEAT_BACKENDS:
+        recorded = _read_json(backend_state_path(directory, backend))
+        if recorded is not None:
+            states[backend] = recorded
+    legacy = _read_json(directory / STATE_FILENAME)
+    if legacy is not None:
+        backend = legacy.get("backend")
+        if isinstance(backend, str) and backend not in states:
+            states[backend] = legacy
+    return states
+
+
+def _preserve_legacy_record(runtime_dir: Path) -> None:
+    """Migrate a version-1 ``state.json`` to its own per-backend file, once.
+
+    This runs before the first write of a provisioning run, and it is what stops
+    the upgrade from *losing* readiness rather than merely reorganising it. The
+    sequence it protects is the ordinary one: a host provisioned CUDA long ago,
+    so the only record it has is the legacy file; the new code then provisions
+    the CPU, whose first write is ``in_progress`` and whose mirror overwrites
+    that file. If that attempt fails -- offline, out of disk -- the CUDA
+    readiness and the Julia executable it names are simply gone, and the next
+    GPU hook re-resolves multi-gigabyte artifacts to rediscover them.
+
+    Copying rather than moving: the legacy file stays as the mirror an older
+    consumer reads until the next write replaces it.
+    """
+
+    legacy = _read_json(runtime_dir / STATE_FILENAME)
+    if legacy is None:
+        return
+    from .config import BEAT_BACKENDS
+
+    backend = legacy.get("backend")
+    if not isinstance(backend, str) or backend not in BEAT_BACKENDS:
+        return
+    target = backend_state_path(runtime_dir, backend)
+    if target.exists():
+        return
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(legacy, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+    finally:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def _write_state(runtime_dir: Path, state: dict[str, Any]) -> None:
+    """Record one backend's state, and mirror it for a legacy reader.
+
+    Two files, one write each, both atomic: the per-backend record is the
+    authority and ``state.json`` is a copy of the newest one for consumers that
+    predate the split. The temporary file carries this process's pid so two
+    provisionings -- which the lock keeps out of each other's way, but which a
+    ``--dir`` override can still put in different directories -- cannot write
+    the same scratch path.
+
+    Any version-1 record found here is migrated to its own per-backend file
+    first, because this write is what would otherwise destroy it; see
+    :func:`_preserve_legacy_record`.
+    """
+
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    _preserve_legacy_record(runtime_dir)
+    state = dict(state)
+    state["state_schema"] = STATE_SCHEMA_VERSION
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    payload = json.dumps(state, indent=2)
+    backend = state.get("backend")
+    targets = [runtime_dir / STATE_FILENAME]
+    if isinstance(backend, str) and backend:
+        targets.insert(0, backend_state_path(runtime_dir, backend))
+    for path in targets:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+
+
+def provisioned_julia(
+    runtime_dir: Path | None = None, *, backend: str | None = None
+) -> str | None:
+    """The provisioned Julia executable, when one is recorded and real.
+
+    Any *ready* record answers this, because a Julia is not per backend: the
+    same executable runs the CPU project and the CUDA one. ``backend`` narrows
+    it to one record for a caller that wants to know whether *that* backend is
+    provisioned -- but a caller only after a Julia to run should leave it out,
+    or a machine whose CPU runtime is ready would look like it has no Julia
+    just because the most recent write was a failed GPU attempt.
+    """
+
+    if backend is not None:
+        candidates = [read_state(runtime_dir, backend=backend)]
+    else:
+        candidates = list(read_backend_states(runtime_dir).values())
+    for state in candidates:
+        if not state or state.get("status") != "ready":
+            continue
+        executable = state.get("julia_executable")
+        if isinstance(executable, str) and executable and Path(executable).exists():
+            return executable
+    return None
+
+
+def _lock_holder(runtime_dir: Path) -> dict[str, Any]:
+    """What the last acquirer said about itself, for a waiter's message only.
+
+    Advisory, in the ordinary sense of the word: nothing decides anything on
+    it. It may be absent, or left behind by a process that has since died --
+    which is precisely why the exclusion itself is a kernel lock and not a
+    record like this one. A stale sentence in a status message costs a slightly
+    vague "waiting for another provisioning"; a stale *lock* costs a Julia
+    deleted mid-unpack.
+    """
+
+    return _read_json(runtime_dir / LOCK_HOLDER_FILENAME) or {}
+
+
+def _try_lock(descriptor: int) -> bool:
+    """Take the kernel's exclusive advisory lock on an open file, or fail fast.
+
+    ``fcntl.flock`` on POSIX and ``msvcrt.locking`` on Windows. Both are held by
+    the *open file* and both are released by the operating system when the
+    holding process dies -- which is the whole reason for using them: there is
+    no lease to renew, no staleness to estimate, and nothing to take over. A
+    process suspended for a minute inside a native call keeps its lock, and a
+    process that is killed loses it immediately.
+
+    Both also conflict between two open files in the *same* process, so two
+    threads racing here serialise for the same reason two processes do.
+
+    Windows note: no signal is involved anywhere in this module. ``os.kill`` on
+    Windows terminates the target for every signal other than CTRL_C/CTRL_BREAK,
+    so it is not a liveness query there and is never used as one.
+    """
+
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI hosts
+        import msvcrt
+
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        raise
+    return True
+
+
+def _unlock(descriptor: int) -> None:
+    """Release the advisory lock. Closing the file would do it too."""
+
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI hosts
+        import msvcrt
+
+        with suppress(OSError):
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    with suppress(OSError):
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _provisioning_lock(
+    runtime_dir: Path, *, backend: str, status_cb: StatusCallback
+) -> Any:
+    """Hold the runtime directory's provisioning lock for one run.
+
+    Provisioning is per backend in what it records and *not* per backend in what
+    it touches: it unpacks one shared portable Julia, and ``_extract_julia``
+    removes an existing unpack before replacing it, through a staging directory
+    and a ``.part`` download that are named per directory rather than per run.
+    Two runs interleaving there can delete a Julia the other is executing, and
+    no amount of atomic JSON writing addresses that -- so the whole run is
+    serialised.
+
+    Waits rather than refusing: the caller has been asked to provision, and the
+    thing in its way is a provisioning that is about to finish. It says what it
+    is waiting for once, so a consumer that surfaces status messages can show
+    that instead of an unexplained pause.
+
+    The lock file is created once and never removed. Unlinking it would be the
+    classic advisory-lock bug: a waiter blocked on the old inode and the next
+    acquirer locking a new one, two holders, no error anywhere.
+    """
+
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    path = runtime_dir / LOCK_FILENAME
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    announced = False
+    try:
+        while not _try_lock(descriptor):
+            if not announced:
+                announced = True
+                other = _lock_holder(runtime_dir).get("backend") or "another"
+                status_cb(
+                    f"Waiting for the BEAT {other} runtime provisioning already "
+                    "running on this machine to finish."
+                )
+            time.sleep(_LOCK_POLL_S)
+        # Written under the lock, so it describes the current holder rather than
+        # racing with one. Best effort: a read-only runtime directory would fail
+        # here, and a message is not worth failing a provisioning for.
+        with suppress(OSError):
+            (runtime_dir / LOCK_HOLDER_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "backend": backend,
+                        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+        try:
+            yield
+        finally:
+            _unlock(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _download(url: str, destination: Path, *, expected_sha256: str | None, status_cb: StatusCallback) -> None:
@@ -368,6 +687,11 @@ def _ready_for(
     the key is re-provisioned: dependency and source identity cannot be
     inferred safely from an old record.
 
+    The backend check stays even though the record is now per backend, because
+    a version-1 ``state.json`` is still accepted for the backend it names (see
+    :func:`read_state`) -- and because a check that is redundant is cheaper
+    than one that was load-bearing and got removed.
+
     The fingerprint is content-based and cached for the Python process
     lifetime. An installed-package update starts a new process; tests that
     simulate one in place must clear ``runtime.package_fingerprint`` first.
@@ -383,6 +707,30 @@ def _ready_for(
     if previous.get("package_fingerprint") != fingerprint:
         return False
     return _recorded_julia(previous) is not None
+
+
+def backend_ready(backend: str, runtime_dir: Path | None = None) -> bool:
+    """Whether a record proves *this* backend's runtime is provisioned here.
+
+    The same three-field comparison the provisioning entry points make before
+    they decide to short-circuit, exported so a caller asking "is this backend
+    usable" does not have to reimplement it -- two copies of this test would be
+    one rename away from a capability row that reads *ready* about a package
+    that moved.
+    """
+
+    from .runtime import default_project, package_fingerprint
+
+    try:
+        project = default_project(backend)
+    except ValueError:
+        return False
+    return _ready_for(
+        read_state(runtime_dir, backend=backend),
+        backend,
+        project,
+        package_fingerprint(project),
+    )
 
 
 def detect_gpu_backend() -> str | None:
@@ -441,61 +789,70 @@ def provision_gpu(
 
     project = default_project(backend)
     fingerprint = package_fingerprint(project)
-    previous = read_state(directory)
+    previous = read_state(directory, backend=backend)
     if not force and _ready_for(previous, backend, project, fingerprint):
         assert previous is not None
         status_cb(f"BEAT {facts['label']} runtime is already provisioned.")
         return previous
 
     module = facts["module"]
-    state: dict[str, Any] = {
-        "status": "in_progress",
-        "backend": backend,
-        "project": str(project),
-        "package_fingerprint": fingerprint,
-        "step": "resolve_julia",
-        "julia_version": JULIA_VERSION,
-    }
-    _write_state(directory, state)
-    try:
-        julia = _ensure_julia(
-            directory, status_cb, previous_executable=_recorded_julia(previous)
-        )
-        state.update(julia_executable=julia, step="instantiate")
+    with _provisioning_lock(directory, backend=backend, status_cb=status_cb):
+        # Asked again under the lock: whatever we waited for may have been this
+        # very backend being provisioned by another process, and instantiating
+        # a runtime that is already ready is pure cost.
+        previous = read_state(directory, backend=backend)
+        if not force and _ready_for(previous, backend, project, fingerprint):
+            assert previous is not None
+            status_cb(f"BEAT {facts['label']} runtime is already provisioned.")
+            return previous
+        state: dict[str, Any] = {
+            "status": "in_progress",
+            "backend": backend,
+            "project": str(project),
+            "package_fingerprint": fingerprint,
+            "step": "resolve_julia",
+            "julia_version": JULIA_VERSION,
+        }
         _write_state(directory, state)
-        _run_julia_step(
-            julia,
-            'using Pkg; Pkg.instantiate()',
-            project=project,
-            env_backend=backend,
-            label=(
-                f"Instantiating the Julia {facts['label']} environment"
-                + facts.get("instantiate_note", " (first run downloads several GB)")
-            ),
-            status_cb=status_cb,
-        )
-        state["step"] = "gpu_probe"
-        _write_state(directory, state)
-        # versioninfo() forces artifact resolution, so a "ready" state means
-        # the first solve starts computing instead of downloading.
-        _run_julia_step(
-            julia,
-            f'import {module}; {module}.versioninfo(); exit({module}.functional() ? 0 : 1)',
-            project=project,
-            env_backend=backend,
-            label=f"Resolving {facts['label']} artifacts and probing the device",
-            status_cb=status_cb,
-        )
-        state.update(status="ready", step="done", error=None)
-        _write_state(directory, state)
-        runtime.probe_gpu_functional_cache_clear()
-        status_cb(f"BEAT {facts['label']} runtime is ready.")
-        return state
-    except Exception as exc:  # noqa: BLE001 - recorded, reported, never silent
-        state.update(status="failed", error=str(exc))
-        _write_state(directory, state)
-        status_cb(f"BEAT {facts['label']} runtime provisioning failed: {exc}")
-        return state
+        try:
+            julia = _ensure_julia(
+                directory, status_cb, previous_executable=_recorded_julia(previous)
+            )
+            state.update(julia_executable=julia, step="instantiate")
+            _write_state(directory, state)
+            _run_julia_step(
+                julia,
+                'using Pkg; Pkg.instantiate()',
+                project=project,
+                env_backend=backend,
+                label=(
+                    f"Instantiating the Julia {facts['label']} environment"
+                    + facts.get("instantiate_note", " (first run downloads several GB)")
+                ),
+                status_cb=status_cb,
+            )
+            state["step"] = "gpu_probe"
+            _write_state(directory, state)
+            # versioninfo() forces artifact resolution, so a "ready" state means
+            # the first solve starts computing instead of downloading.
+            _run_julia_step(
+                julia,
+                f'import {module}; {module}.versioninfo(); exit({module}.functional() ? 0 : 1)',
+                project=project,
+                env_backend=backend,
+                label=f"Resolving {facts['label']} artifacts and probing the device",
+                status_cb=status_cb,
+            )
+            state.update(status="ready", step="done", error=None)
+            _write_state(directory, state)
+            runtime.probe_gpu_functional_cache_clear()
+            status_cb(f"BEAT {facts['label']} runtime is ready.")
+            return state
+        except Exception as exc:  # noqa: BLE001 - recorded, reported, never silent
+            state.update(status="failed", error=str(exc))
+            _write_state(directory, state)
+            status_cb(f"BEAT {facts['label']} runtime provisioning failed: {exc}")
+            return state
 
 
 #: The CPU probe: instantiating is not evidence, so solve something.
@@ -594,6 +951,14 @@ def provision_cpu(
     hand -- ``discover_julia`` reads the recorded runtime, so a *ready* state
     here is what makes that tier live on a machine that has no GPU.
 
+    **A GPU host may ask for this too, and nothing is traded away.** The
+    record is per backend, so a provisioned CUDA, ROCm or Metal runtime is
+    still ready afterwards and is not re-instantiated: that is why an interface
+    can put this command in a "BEAT CPU is not provisioned here" message on a
+    GPU machine without sending the user to break the GPU engine they have.
+    Before per-backend records the same command overwrote the one slot, which
+    is what that guidance had to be read against.
+
     Returns the resulting state dict; ``status`` is ``ready`` or ``failed``.
     There is no ``skipped``: nothing here can decline on the caller's behalf.
     """
@@ -603,59 +968,65 @@ def provision_cpu(
     directory = (runtime_dir or default_runtime_dir()).expanduser()
     project = default_project(BEAT_CPU)
     fingerprint = package_fingerprint(project)
-    previous = read_state(directory)
+    previous = read_state(directory, backend=BEAT_CPU)
     if not force and _ready_for(previous, BEAT_CPU, project, fingerprint):
         assert previous is not None
         status_cb("BEAT CPU runtime is already provisioned.")
         return previous
 
-    state: dict[str, Any] = {
-        "status": "in_progress",
-        "backend": BEAT_CPU,
-        "project": str(project),
-        "package_fingerprint": fingerprint,
-        "step": "resolve_julia",
-        "julia_version": JULIA_VERSION,
-    }
-    _write_state(directory, state)
-    try:
-        julia = _ensure_julia(
-            directory,
-            status_cb,
-            required_bytes=_CPU_REQUIRED_FREE_BYTES,
-            purpose="CPU runtime",
-            previous_executable=_recorded_julia(previous),
-        )
-        state.update(julia_executable=julia, step="instantiate")
+    with _provisioning_lock(directory, backend=BEAT_CPU, status_cb=status_cb):
+        previous = read_state(directory, backend=BEAT_CPU)
+        if not force and _ready_for(previous, BEAT_CPU, project, fingerprint):
+            assert previous is not None
+            status_cb("BEAT CPU runtime is already provisioned.")
+            return previous
+        state: dict[str, Any] = {
+            "status": "in_progress",
+            "backend": BEAT_CPU,
+            "project": str(project),
+            "package_fingerprint": fingerprint,
+            "step": "resolve_julia",
+            "julia_version": JULIA_VERSION,
+        }
         _write_state(directory, state)
-        _run_julia_step(
-            julia,
-            "using Pkg; Pkg.instantiate()",
-            project=project,
-            env_backend=BEAT_CPU,
-            label="Instantiating the Julia CPU environment (no GPU artifacts)",
-            status_cb=status_cb,
-        )
-        state["step"] = "cpu_probe"
-        _write_state(directory, state)
-        _run_julia_step(
-            julia,
-            _CPU_PROBE_CODE,
-            project=project,
-            env_backend=BEAT_CPU,
-            label="Precompiling the CPU engine bundle and solving a probe frequency",
-            status_cb=status_cb,
-            extra_env={_CPU_PROBE_ENGINE_DIR_ENV_VAR: str(PACKAGE_DIR / "julia")},
-        )
-        state.update(status="ready", step="done", error=None)
-        _write_state(directory, state)
-        status_cb("BEAT CPU runtime is ready.")
-        return state
-    except Exception as exc:  # noqa: BLE001 - recorded, reported, never silent
-        state.update(status="failed", error=str(exc))
-        _write_state(directory, state)
-        status_cb(f"BEAT CPU runtime provisioning failed: {exc}")
-        return state
+        try:
+            julia = _ensure_julia(
+                directory,
+                status_cb,
+                required_bytes=_CPU_REQUIRED_FREE_BYTES,
+                purpose="CPU runtime",
+                previous_executable=_recorded_julia(previous),
+            )
+            state.update(julia_executable=julia, step="instantiate")
+            _write_state(directory, state)
+            _run_julia_step(
+                julia,
+                "using Pkg; Pkg.instantiate()",
+                project=project,
+                env_backend=BEAT_CPU,
+                label="Instantiating the Julia CPU environment (no GPU artifacts)",
+                status_cb=status_cb,
+            )
+            state["step"] = "cpu_probe"
+            _write_state(directory, state)
+            _run_julia_step(
+                julia,
+                _CPU_PROBE_CODE,
+                project=project,
+                env_backend=BEAT_CPU,
+                label="Precompiling the CPU engine bundle and solving a probe frequency",
+                status_cb=status_cb,
+                extra_env={_CPU_PROBE_ENGINE_DIR_ENV_VAR: str(PACKAGE_DIR / "julia")},
+            )
+            state.update(status="ready", step="done", error=None)
+            _write_state(directory, state)
+            status_cb("BEAT CPU runtime is ready.")
+            return state
+        except Exception as exc:  # noqa: BLE001 - recorded, reported, never silent
+            state.update(status="failed", error=str(exc))
+            _write_state(directory, state)
+            status_cb(f"BEAT CPU runtime provisioning failed: {exc}")
+            return state
 
 
 def provision_cuda(
@@ -697,7 +1068,8 @@ def main(argv: list[str] | None = None) -> int:
         description="Provision a BEAT Engine runtime. The default is the GPU "
         "stack this host's hardware suggests, and it is a no-op without a "
         "supported GPU; --backend cpu explicitly provisions the CPU runtime "
-        "instead, on any host.",
+        "as well, on any host. Readiness is recorded per backend, so asking "
+        "for one never un-provisions another.",
     )
     parser.add_argument(
         "--if-gpu",
@@ -714,7 +1086,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=["auto", BEAT_CPU, BEAT_CUDA, BEAT_ROCM, BEAT_METAL],
         default="auto",
         help="which stack to provision; auto follows the GPU hardware "
-        f"inventory and never selects {BEAT_CPU!r}, which is opt-in only",
+        f"inventory and never selects {BEAT_CPU!r}, which is opt-in only and "
+        "can be provisioned alongside a GPU backend rather than instead of it",
     )
     parser.add_argument("--force", action="store_true", help="re-provision even when ready")
     parser.add_argument("--dir", type=Path, default=None, help="runtime directory override")
