@@ -101,10 +101,31 @@ julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_exteri
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_symmetry.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_coupled.jl
 julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_fused_burton_miller.jl
+julia --project=hornlab_beat_bem/julia_metal    $J/scripts/validate_metal_singular_summation.jl
 julia -t auto --project=hornlab_beat_bem/julia  $J/scripts/validate_gmres_burton_miller.jl
 pytest
 pytest -m slow          # a real Julia solve; needs a Julia executable
 ```
+
+`validate_metal_fused_burton_miller.jl` takes `BLAB_VALIDATE_SYMMETRY` as a
+comma-separated **arm list** and its default is now `off,x,ground` — three arms
+in one invocation, failing if any of them fails. It was a single arm defaulting
+to `off` before the singular-fusion re-sync. `xy` is deliberately not in that
+default: it fails non-deterministically on the bundled fixture for a reason
+that predates the fusion and is not an operator defect, recorded under "Known
+issue" in `docs/beat-engine-metal.md`. Ask for it by name
+(`BLAB_VALIDATE_SYMMETRY=xy`) when working on it, and do not close it by
+widening the tolerance.
+
+`validate_metal_singular_summation.jl` is the new gate that comes with the
+fused singular pair. It evaluates the same singular pairs three ways on the
+host — the four-operator accumulation order in Float32, the fused
+per-quadrature-point order in Float32, and both in Float64 — and asserts that
+the two orders are the same algebra, that neither Float32 order exceeds the
+stated bound against the Float64 reference, and that the fused order is not
+systematically worse. It needs a Metal device only to build the caches it reads
+the pair data back from, and is otherwise bit-deterministic: no atomics, a
+fixed pair selection, a fixed frequency set.
 
 `pytest -m slow` includes the bundle probe, which skips rather than fails when
 the CPU project has not been instantiated. Instantiate it first, or the check
@@ -316,8 +337,17 @@ at once, comparing the paravirtualised runner against a local M1 Max: the
 different accumulation order. An equality assertion on those would fail for
 the reason the design says it would.
 
-`validate_metal_coupled.jl` and the ROCm scripts are not in CI: the first has
-not had a green hosted run yet, and the second needs an AMD host.
+`validate_metal_coupled.jl`, `validate_metal_singular_summation.jl` and the
+ROCm scripts are not in CI: the first has not had a green hosted run yet, the
+second arrived with the singular-fusion re-sync and has only been run locally
+on an M1 Max, and the third needs an AMD host.
+
+**The fused Burton-Miller job's workload changed without its workflow line
+changing.** `ci.yml` invokes `validate_metal_fused_burton_miller.jl` with no
+`BLAB_VALIDATE_SYMMETRY`, and that script's default moved from the single arm
+`off` to `off,x,ground` in the same re-sync. So the hosted macOS job now runs
+three arms in one step, and a failure there names the arm rather than the
+script. Read the arm before assuming the assembly moved.
 
 ### The condensed-assembly disagreement on AVX-512 hosts
 

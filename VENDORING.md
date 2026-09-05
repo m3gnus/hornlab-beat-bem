@@ -30,6 +30,7 @@ below**, and everything not listed is a byte-for-byte copy.
 | Current sync (2026-09-02) | `cd50b3c64771b242d681aaf440a5b786757ba35a` | `feat/beat-cold-start-adaptive` |
 | Cherry-pick (2026-09-03) | `1f90433` on `fix/condensed-entrywise-floor` | the :off condensed comparison becomes an entrywise absolute floor; decided by Magnus after the AVX-512 experiment |
 | Driver sync (2026-09-03) | `724d573d596b60db521a7ba618d04557ed7727d2` | `feat/beat-metal-pipeline-size-aware`, cut from `cd50b3c`: the Metal sweep overlap becomes a per-solve decision from the dof count |
+| Singular Burton-Miller fusion (2026-09-05) | `02364b595230db5b73c225c5271a34128bcf7880` | `perf/metal-singular-bm-fusion`, on the `fix/beat-krylov-gate-tolerance` (`531d99fd`) stack and **unlanded upstream**: the singular Burton-Miller pair is combined per quadrature point rather than per pair |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`
@@ -206,6 +207,124 @@ Their SHA-256 values are respectively
 and `5999489fcbee66390ce3dc9d4b4628d16ef13523c60edd6e54ed6444515b765f`.
 No fixture-path adaptation is needed for either file.
 
+## The singular Burton-Miller fusion re-sync, 2026-09-05
+
+The three files below are copied verbatim from fork commit
+`02364b595230db5b73c225c5271a34128bcf7880`, the tip of
+`perf/metal-singular-bm-fusion`.
+
+**That branch is unlanded upstream, and it is not on the fork's `main`.** It
+sits on the `fix/beat-krylov-gate-tolerance` stack (`531d99fd`), which is the
+branch this package's Krylov gate already came from and whose ancestor
+`cd50b3c` is the sync commit recorded above. The fork's default branch, `main`
+at `4331b8cb` (2026-07-04), predates the whole BEAT Metal backend and carries
+no `BeatEngineMetalBurtonMiller.jl` at all, so it is not a base this file may
+claim the sync came from. Anyone auditing provenance should fetch the branch,
+not the default.
+
+The regular fused kernel already formed the Burton-Miller combination inside
+its accumulation loop; the singular kernel did not. It called
+`_metal_singular_pair_blocks` — shared with the four-operator path — which
+accumulates slp/adj/dlp/hb and `g_total` over the whole Duffy rule, 50 live
+accumulator floats, expanding the rank-1 outer product four times per
+quadrature point pair, and combined only afterwards. The combination is linear,
+so `_metal_singular_pair_fused_bm_blocks` applies it to the per-point scalars
+before the expansion and hoists the loop-invariant hypersingular curl term out
+of the loop: two 3x3 expansions instead of four, one 3x1 instead of two, 26
+live floats instead of 50. Same signature, same scratch buffers, same launch
+geometry, same scatter kernel, no new device buffer.
+`_metal_singular_pair_blocks` itself is untouched, so the four-operator path
+stays an independent reference rather than a copy of the code under test.
+
+This package copies these three files byte for byte from that upstream commit:
+
+| here | upstream | SHA-256 |
+|---|---|---|
+| `hornlab_beat_bem/julia/src/BeatEngineMetalBurtonMiller.jl` | `src/blab/solvers/julia_local/src/BeatEngineMetalBurtonMiller.jl` | `874875ed50f50e1c61a5e4b65a10e7ba008ae7318fa86605c852e98eacdf9c22` |
+| `hornlab_beat_bem/julia/scripts/validate_metal_fused_burton_miller.jl` | `src/blab/solvers/julia_local/scripts/validate_metal_fused_burton_miller.jl` | `5717651ea5a8e2ccb51b0156660159ee6c05aee7b99315d6283ddd4946450fbf` |
+| `hornlab_beat_bem/julia/scripts/validate_metal_singular_summation.jl` | `src/blab/solvers/julia_local/scripts/validate_metal_singular_summation.jl` | `bda12085b9c9cf273d25ed85b8525a4ec8a1bcf3429ebf650c2e4c57cf7a9efb` |
+
+No fixture-path adaptation is needed for any of the three. The new script
+resolves its mesh as `joinpath(@__DIR__, "..", "test_meshes", ...)`, which is
+the same relative shape in this layout as in upstream's, so it is not added to
+the repointed-path table below. Nothing in `pyproject.toml` moved either: the
+`julia/scripts/*.jl` package-data glob already carries it into the wheel.
+
+**The base was identical, so this pick is exactly its own change.** Before this
+re-sync the vendored copies of the two modified files were byte-for-byte equal
+to `531d99f`, the commit `02364b5` is built on —
+`src/BeatEngineMetalBurtonMiller.jl` at
+`2ade503a7ba770a144f86a06474a45cf2fa820e81b21ecea18a8470f78f2f725` and
+`scripts/validate_metal_fused_burton_miller.jl` at
+`f276557ee1b324881c330ce4ecfce649a4173dc88cf113248eba6993d12834da`. No merge
+was needed for either.
+
+Measured upstream on an M1 Max, minimum of 9-11 repeats per cell, and
+re-verified here by the gates at this commit:
+
+| | before | after | |
+|---|---:|---:|---|
+| singular block kernel, 1,209-dof symmetry-reduced mesh | 20.7 ms | 7.7 ms | -63% |
+| singular block kernel, 4,552-dof full mesh | 84.1 ms | 30.9 ms | -63% |
+| assembly wall | | | -17.1% / -14.2% |
+| 40-frequency sweep | | | -13.8% median quarter, -10.7% full |
+| device memory high-water | | | +0 bytes |
+
+The evidence, its predeclaration and the independent adversarial review are in
+the HornLab workspace at `archive/260905-beat-singular-fusion-prototype/`. The
+review's verdict was PROMOTE with three packaging corrections, all of which are
+already applied in `02364b5`: the prototype's `BLAB_METAL_SINGULAR_BM_FUSION`
+runtime switch is gone (the fused-at-quadrature form replaces the
+block-accumulate fused kernel outright rather than becoming a second selectable
+kernel), the `BLAB_METAL_SINGULAR_STAGE_SPLIT` stage instrumentation is gone,
+and the now-dead `_metal_fused_pair_combination` is removed. **No tolerance was
+changed**, here or upstream.
+
+### The two script changes that a caller can see
+
+`validate_metal_fused_burton_miller.jl` takes `BLAB_VALIDATE_SYMMETRY` as a
+comma-separated **arm list**, and its default moved from the single arm `off`
+to `off,x,ground`; every arm runs and the script fails if any of them fails.
+`ci.yml` invokes it with no environment, so that job's workload widened without
+its workflow line changing — recorded in `AGENTS.md` under *Continuous
+integration* so a failure there is read as an arm rather than as the script.
+
+`xy` is deliberately absent from that default. On the bundled `sample.msh` it
+fails `pressure_relative_error` at about 1e-5 against the script's 5e-6
+tolerance, and it fails **non-deterministically**: three runs of the same tree
+spread 1.27e-5 to 2.29e-5 while their `lhs` and `rhs` errors match to three
+digits at 1e-7. The operators agree, so it is not an operator defect; the LU of
+the symmetry-reduced matrix at that fixture amplifies the atomic-accumulation
+non-determinism of the singular scatter into the pressure
+(`BLAB_METAL_SINGULAR_MODE=host` removes the atomics). The review reproduced it
+on a pristine `a46b2ba` tree, 3/3 failing at a 2.03x spread, so it predates this
+change entirely. Closing it means a better-conditioned `xy` fixture or a
+deterministic singular scatter — **not a wider tolerance**.
+
+`validate_metal_singular_summation.jl` is new and has no predecessor here. It
+bounds the summation-order difference directly, per singular pair: it evaluates
+the same pairs three ways on the host — the four-operator accumulation order in
+Float32, the fused per-quadrature-point order in Float32, and both in Float64 —
+and gates that the two orders are the same algebra (they must agree in
+Float64), that neither Float32 order exceeds the stated bound against the
+Float64 reference, and that the fused order is not systematically worse. It is
+bit-deterministic: no atomics, a fixed pair selection, a fixed frequency set. It
+is a script, not a CI job — the fork's `ci.yml` has no Metal job, and nothing
+was wired into this repository's CI by this re-sync.
+
+### `docs/beat-engine-metal.md`
+
+Upstream changed its own `docs/advanced/beat-engine-metal.md` in the same
+commit, and this package's copy of that page has local edits of its own (the
+source-path rewrites, and the per-solve sweep-pipelining text from the
+`267512c` driver sync). The page was therefore three-way merged —
+base `531d99f`, ours the vendored copy, theirs `02364b5` — with no conflicts.
+The result adds upstream's four additions verbatim: the singular-fusion
+paragraph, the note that `_metal_singular_pair_blocks` is deliberately
+untouched, the two validator table rows, and the "Known issue: the fused
+Burton-Miller gate at symmetry `xy`" section. None of the added prose names an
+upstream source path, so no rewrite was needed inside it.
+
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind:
@@ -223,8 +342,12 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 | `hornlab_beat_bem/julia/tests/runtests.jl` | `src/blab/solvers/julia_local/tests/` |
 | `hornlab_beat_bem/julia/scripts/*.jl`, except the five listed below and `validate_analytic_exterior.jl`, which is new here | `src/blab/solvers/julia_local/scripts/` |
 
-Seven of those files are taken from the three later branches above rather than
-from the `cd50b3c` sync commit; they are verbatim copies of *those* commits.
+Ten of those files are taken from the later branches above rather than from the
+`cd50b3c` sync commit; they are verbatim copies of *those* commits. Three of the
+ten — `src/BeatEngineMetalBurtonMiller.jl`,
+`scripts/validate_metal_fused_burton_miller.jl` and the new
+`scripts/validate_metal_singular_summation.jl` — come from `02364b5`, which is
+**unlanded upstream**; see the singular-fusion section above.
 
 Every numerical result this package produces comes from those files, and they
 are unmodified. That is deliberate: it is what lets the extraction be verified
