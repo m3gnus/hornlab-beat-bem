@@ -37,12 +37,23 @@ individually and keeps the four-operator path.
 | `cuda` | `julia_cuda/` | CUDA.jl | on device |
 | `rocm` | `julia_rocm/` | AMDGPU.jl | on device |
 
-`beat_engine_status()` reports *available* only when a functional accelerator
-exists — a CUDA device, a ROCm runtime, or Apple Silicon with a working
-Metal.jl. The CPU backend is the reference and CI path and is reported
-available only under `HORNLAB_BEAT_FORCE_CPU=1`; that gate is about which
-backend a *consumer application* should offer, not about whether the CPU path
-works. Call it directly with `beat_backend="cpu"` and it runs.
+`beat_engine_status()` answers "which one backend would a solve use here": a
+functional accelerator first — a CUDA device, a ROCm runtime, or Apple Silicon
+with a working Metal.jl — and then the CPU runtime, when
+[provisioning](#cpu-by-explicit-opt-in) has instantiated it and proved it with
+a 1 kHz solve. `HORNLAB_BEAT_FORCE_CPU=1` reports the CPU backend available
+*without* that record, for CI and regression runs on a host that has
+provisioned nothing. Call the CPU path directly with `beat_backend="cpu"` and
+it runs regardless.
+
+`backend_status(backend)` and `beat_backend_statuses()` answer the other
+question — what is true of *each* backend, independently. That is what a
+selector offering the four backends as four engines needs: a CUDA host can have
+the portable CPU runtime provisioned as well, and a box with an NVIDIA and an
+AMD card gets a separate verdict for each rather than one answer naming the
+first. Each entry carries `available`, a machine-readable `state` (`ready`,
+`no-hardware`, `not-functional`, `provisioning`, `failed`, `unprovisioned`,
+`forced`, `no-julia`) and the sentence a user reads.
 
 **Reproducibility.** The regular `pair_gather` kernel is bit-reproducible —
 one owner per matrix entry, fixed summation order, no atomics — and measures
@@ -93,10 +104,11 @@ override with `HORNLAB_BEAT_RUNTIME_DIR`), instantiate the matching project,
 and force artifact resolution ending in a `functional()` check, so a recorded
 *ready* state means the first solve computes instead of downloading. Windows,
 Linux x86-64 and macOS arm64 have portable downloads configured. Progress and
-failures are recorded in `state.json` and surface as `beat_engine_status()`
-reasons; retry with `--force`. CUDA's first run pulls several GB (CUDA.jl ships
-its own toolkit artifacts; users need only the driver); Metal pulls a small
-package, because the driver is the operating system's.
+failures are recorded in `state-<backend>.json` and surface as
+`beat_engine_status()` reasons; retry with `--force`. CUDA's first run pulls
+several GB (CUDA.jl ships its own toolkit artifacts; users need only the
+driver); Metal pulls a small package, because the driver is the operating
+system's.
 
 #### CPU, by explicit opt-in
 
@@ -119,7 +131,7 @@ precompiled `BeatEngineCpuBundle`, checks that it resolved **this** package's
 engine directory, and solves one 1 kHz frequency of the bundle's own workload
 mesh, requiring a finite non-zero pressure row. That is the only check that
 distinguishes a live bundle from the silent compile-from-source fallback (see
-[Cold start](#cold-start)). A failure is recorded in `state.json` like any
+[Cold start](#cold-start)). A failure is recorded in `state-cpu.json` like any
 other and the CLI exits non-zero.
 
 Two contradictions are refused rather than resolved. `--backend cpu` with
@@ -129,7 +141,34 @@ should learn that when it is written, not from a runtime that is sometimes
 provisioned. And a recorded *ready* names the backend, project and content
 fingerprint it was provisioned for, so a CPU-ready runtime never answers a GPU
 request or the reverse, and an in-place dependency/source update is
-provisioned again — the runtime directory holds one backend's state at a time.
+provisioned again.
+
+#### One record per backend, and one provisioning at a time
+
+Readiness lives in `state-<backend>.json`, one file per backend, so **asking
+for the CPU runtime on a GPU host does not un-provision the GPU one**. It used
+to: a single `state.json` with one `backend` field could attest to one backend
+at a time, so a consumer offering the backends as separate engines had a row
+that could never light up on a GPU machine, and the command that would have
+fixed it overwrote the record saying the accelerator was ready.
+
+`state.json` is still written, as a mirror of the most recent record, for a
+consumer pinned to a commit that predates the split. Such a consumer matches
+`backend`/`project`/`package_fingerprint` itself, so a mirror describing
+another backend fails its test and reports unprovisioned — it under-declares
+and cannot over-promise. `read_state(backend=...)` is the definite answer;
+`read_backend_states()` returns all of them, and its presence is how a consumer
+detects that this package records readiness per backend at all. A version-1
+`state.json` is still honoured for the backend it names, so a host provisioned
+before the split re-downloads nothing.
+
+Provisioning is not per backend in one respect: it unpacks a shared portable
+Julia and replaces an existing unpack. So one run at a time per runtime
+directory, guarded by a kernel advisory lock on `provision.lock`. The kernel
+releases it when the holder exits; the lock file is never unlinked and there
+is no timeout-based takeover of a live holder. A second
+run waits and says what it is waiting for, then re-reads the record under the
+lock, so a queued duplicate becomes a no-op instead of a second instantiate.
 
 `--dir` writes wherever you point it, but discovery only ever reads
 `HORNLAB_BEAT_RUNTIME_DIR` (or its per-platform default), so the command
@@ -818,7 +857,7 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_METAL_PIPELINE` | by mesh size | Overlaps the next frequency's GPU assembly with this one's CPU solve. Unset, the solver decides per solve — on at **1,900 P1 dofs** and above. `0` forces sequential, `1` forces the overlap; see below |
 | `BLAB_BEAT_ENGINE_BUNDLE` | `1` | `0` ignores the precompiled bundle and includes the engine from source: bit-identical to the pre-bundle package, at the old cold start |
 | `HORNLAB_BEAT_JULIA` | — | explicit Julia executable |
-| `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available |
+| `HORNLAB_BEAT_FORCE_CPU` | — | `1` reports the CPU backend as available without a provisioning record |
 | `HORNLAB_BEAT_PERSISTENT_HOST` | `1` | `0` runs the worker as a child of this process again — it dies with the application, and every launch pays the cold start |
 | `HORNLAB_BEAT_WORKER_IDLE_S` | `1800` | how long a host with no connected client and no job stays alive |
 | `HORNLAB_BEAT_WORKER_DIR` | per-user | where the registry (key files, sockets, host logs) lives |

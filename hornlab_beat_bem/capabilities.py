@@ -662,10 +662,14 @@ def backend_capabilities(backend: str) -> dict[str, Any]:
         "backend": backend,
         "julia_project": _BACKEND_PROJECTS[backend],
         "device_class": "cpu" if backend == BEAT_CPU else "gpu",
-        "user_facing": backend != BEAT_CPU,
+        "user_facing": True,
         "user_facing_note": (
-            "the CPU backend is internal scaffolding and the regression path; "
-            "it is reported available only under HORNLAB_BEAT_FORCE_CPU=1"
+            "the CPU backend is a selectable engine wherever its runtime has "
+            "been provisioned (provision --backend cpu instantiates the project "
+            "and proves it with a 1 kHz solve); HORNLAB_BEAT_FORCE_CPU=1 only "
+            "skips that evidence for CI and regression runs. Readiness is "
+            "recorded per backend, so a host can have this and an accelerator "
+            "provisioned at the same time"
         )
         if backend == BEAT_CPU
         else "",

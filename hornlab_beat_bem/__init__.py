@@ -40,6 +40,8 @@ from .result import MeshInfo, SolveResult
 from .runtime import (
     FORCE_CPU_ENV_VAR,
     JULIA_ENV_VAR,
+    backend_status,
+    beat_backend_statuses,
     beat_engine_status,
     discover_julia,
     package_version,
@@ -78,6 +80,8 @@ __all__ = [
     "SolveResult",
     "SubmissionClosed",
     "backend_capabilities",
+    "backend_status",
+    "beat_backend_statuses",
     "beat_engine_status",
     "beat_image_mode",
     "beat_symmetry_mode",

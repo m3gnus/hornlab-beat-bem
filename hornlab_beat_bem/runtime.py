@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .config import BEAT_CPU, BEAT_CUDA, BEAT_METAL, BEAT_ROCM
+from .config import BEAT_BACKENDS, BEAT_CPU, BEAT_CUDA, BEAT_METAL, BEAT_ROCM
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_SOLVER_SCRIPT = PACKAGE_DIR / "julia" / "solver.jl"
@@ -23,10 +23,14 @@ METAL_PROJECT = PACKAGE_DIR / "julia_metal"
 
 #: Full path to a Julia executable; wins over PATH discovery.
 JULIA_ENV_VAR = "HORNLAB_BEAT_JULIA"
-#: "1" reports the CPU backend as available. Internal/testing only: WG's
-#: user-facing BEAT engine is GPU-only, and this is the switch its CI and
-#: this package's own validation use to exercise the full plumbing without
-#: accelerator hardware.
+#: "1" reports the CPU backend as available **without consulting the
+#: provisioning record**. It is the switch CI and this package's own validation
+#: use to exercise the full plumbing on a host that has provisioned nothing and
+#: has no accelerator.
+#:
+#: It is no longer the only way the CPU backend is reported available: a host
+#: that has run ``provision --backend cpu`` has instantiated the project and
+#: solved a 1 kHz probe, which is evidence this variable deliberately skips.
 FORCE_CPU_ENV_VAR = "HORNLAB_BEAT_FORCE_CPU"
 
 _PROBE_TIMEOUT_S = 300.0
@@ -238,151 +242,303 @@ def probe_gpu_functional_cache_clear() -> None:
     _julia_gpu_functional.cache_clear()
 
 
+def provision_command(backend: str) -> str:
+    """The provisioning command for one backend, for an unavailable reason.
+
+    Deliberately spelled ``python`` rather than resolved: the interpreter that
+    has to run this is the one this package is installed into, which a consumer
+    embedding the package knows and this module does not -- a packaged
+    application keeps its Python off PATH entirely, so a resolved path here
+    would be right in a checkout and wrong in the product. A consumer that can
+    name its interpreter should say so in its own message.
+    """
+
+    return f"python -m hornlab_beat_bem.provision --backend {backend}"
+
+
+#: How each GPU family is detected, in the words of an unavailable reason.
+_GPU_INVENTORY: dict[str, tuple[str, str]] = {
+    BEAT_CUDA: ("an NVIDIA GPU", "nvidia-smi -L reported no device"),
+    BEAT_ROCM: (
+        "an AMD ROCm runtime",
+        "no rocminfo/hipinfo on PATH and no ROCM_PATH-style variable set",
+    ),
+    BEAT_METAL: ("an Apple Silicon GPU", "this host is not Apple Silicon"),
+}
+
+_GPU_HARDWARE_PRESENT: dict[str, Any] = {
+    BEAT_CUDA: lambda: _nvidia_gpu_present(),
+    BEAT_ROCM: lambda: _rocm_present(),
+    BEAT_METAL: lambda: _apple_gpu_present(),
+}
+
+
+def _gpu_backend_status(backend: str, julia: str) -> tuple[bool, str, str]:
+    """One accelerator's own verdict: available, reason, machine-readable state.
+
+    Asked per backend rather than derived from a single "which backend would a
+    solve use" answer. Those are different questions, and the difference is
+    visible on any host with two accelerator families -- an NVIDIA card and an
+    AMD card in one box -- where the single answer names one and says nothing
+    true about the other.
+    """
+
+    from .provision import read_state
+
+    hardware, how = _GPU_INVENTORY[backend]
+    if not _GPU_HARDWARE_PRESENT[backend]():
+        return False, f"No {hardware} was detected ({how}).", "no-hardware"
+
+    provisioning = read_state(backend=backend) or {}
+    if provisioning.get("status") == "in_progress" and backend != BEAT_METAL:
+        return (
+            False,
+            (
+                f"BEAT {backend} runtime provisioning is in progress "
+                f"(step: {provisioning.get('step', 'unknown')}). The engine "
+                "becomes available when it finishes."
+            ),
+            "provisioning",
+        )
+    functional, detail = _julia_gpu_functional(julia, backend)
+    if functional:
+        return True, f"{hardware.capitalize()} detected and {detail}", "ready"
+    if provisioning.get("status") == "failed":
+        detail = (
+            f"provisioning failed earlier: {provisioning.get('error')}. "
+            f"Retry with: {provision_command(backend)} --force"
+        )
+    return (
+        False,
+        f"{hardware.capitalize()} is present but the {backend} path is not usable: {detail}",
+        "not-functional",
+    )
+
+
+def _cpu_backend_status(julia: str) -> tuple[bool, str, str]:
+    """Whether a CPU solve can start here, from the provisioning record.
+
+    A Julia executable and the bundled project on disk are not evidence: the
+    project's checked-in Manifest names packages nothing may have downloaded,
+    and the precompiled engine bundle may be absent, in which case the solve
+    still answers correctly at three to five times the cold start with nothing
+    logged (see ``AGENTS.md``). ``provision.provision_cpu`` instantiates the
+    project and then *solves a 1 kHz probe* before recording ``ready``, so that
+    record is the honest answer and this reads it rather than re-deriving one.
+
+    ``HORNLAB_BEAT_FORCE_CPU=1`` still forces availability. It is what CI and
+    this package's own validation use to exercise the plumbing on a host that
+    has provisioned nothing.
+    """
+
+    from .provision import backend_ready, read_state
+
+    if os.environ.get(FORCE_CPU_ENV_VAR, "").strip() == "1":
+        return (
+            True,
+            (
+                f"CPU backend forced by {FORCE_CPU_ENV_VAR}=1 (regression and "
+                "CI path: no provisioning record was consulted)"
+            ),
+            "forced",
+        )
+    if backend_ready(BEAT_CPU):
+        return (
+            True,
+            (
+                "The BEAT CPU runtime is provisioned: its Julia project was "
+                "instantiated and proved with a 1 kHz solve through the "
+                f"precompiled engine bundle ({julia}). No accelerator needed."
+            ),
+            "ready",
+        )
+    recorded = read_state(backend=BEAT_CPU) or {}
+    status = recorded.get("status")
+    if status == "in_progress":
+        return (
+            False,
+            (
+                "BEAT CPU runtime provisioning is in progress (step: "
+                f"{recorded.get('step', 'unknown')}). The engine becomes "
+                "available when it finishes."
+            ),
+            "provisioning",
+        )
+    if status == "failed":
+        return (
+            False,
+            (
+                "BEAT CPU runtime provisioning failed here: "
+                f"{recorded.get('error') or 'no reason was recorded'}. Retry "
+                f"with: {provision_command(BEAT_CPU)} --force"
+            ),
+            "failed",
+        )
+    return (
+        False,
+        (
+            "The BEAT CPU runtime has not been instantiated and probed here, "
+            "and a Julia executable alone is not evidence that a solve would "
+            "run -- an uninstantiated or offline depot fails at the first solve "
+            f"instead. Run: {provision_command(BEAT_CPU)}. Readiness is "
+            "recorded per backend, so this does not disturb a provisioned GPU "
+            "runtime."
+        ),
+        "unprovisioned",
+    )
+
+
+def _no_julia_status(version: str | None) -> dict[str, Any]:
+    return {
+        "available": False,
+        "reason": (
+            "No Julia executable was found. Run: python -m "
+            "hornlab_beat_bem.provision --backend cpu for the CPU runtime, "
+            "or omit --backend cpu to provision a detected GPU. "
+            f"Alternatively install Julia >= 1.10 and put it on PATH or set {JULIA_ENV_VAR}."
+        ),
+        "version": version,
+        "backend": None,
+        "julia_executable": None,
+        "state": "no-julia",
+    }
+
+
+def _no_solver_script_status(version: str | None, julia: str) -> dict[str, Any]:
+    return {
+        "available": False,
+        "reason": f"Bundled BEAT solver script is missing: {DEFAULT_SOLVER_SCRIPT}",
+        "version": version,
+        "backend": None,
+        "julia_executable": julia,
+        "state": "no-solver-script",
+    }
+
+
+def backend_status(backend: str, *, julia_executable: str | None = None) -> dict[str, Any]:
+    """Whether *this* backend could run a solve here, and why not when it cannot.
+
+    One backend, one answer, independent of every other backend. That
+    independence is the point: a CUDA host can have a provisioned CPU runtime
+    as well, and did not use to be able to say so -- readiness was one record
+    with one ``backend`` field, so the two backends could not both be ready and
+    an interface offering them as separate engines had to leave one permanently
+    greyed out.
+
+    ``state`` is the machine-readable half (``ready``, ``no-hardware``,
+    ``not-functional``, ``provisioning``, ``failed``, ``unprovisioned``,
+    ``forced``, ``no-julia``, ``no-solver-script``); ``reason`` is the sentence
+    a user reads.
+    """
+
+    if backend not in BEAT_BACKENDS:
+        raise ValueError(
+            f"unknown BEAT backend {backend!r}; expected one of {', '.join(BEAT_BACKENDS)}"
+        )
+    version = package_version()
+    julia = discover_julia(julia_executable)
+    if julia is None:
+        return {**_no_julia_status(version), "backend": backend}
+    if not DEFAULT_SOLVER_SCRIPT.exists():
+        return {**_no_solver_script_status(version, julia), "backend": backend}
+    if backend == BEAT_CPU:
+        available, reason, state = _cpu_backend_status(julia)
+    else:
+        available, reason, state = _gpu_backend_status(backend, julia)
+    return {
+        "available": available,
+        "reason": reason,
+        "state": state,
+        "version": version,
+        "backend": backend,
+        "julia_executable": julia,
+    }
+
+
+def beat_backend_statuses(*, julia_executable: str | None = None) -> dict[str, Any]:
+    """Every backend's own verdict, in the order a selector should show them.
+
+    A GPU probe is a Julia startup, so this is not free -- but it is only paid
+    for a family whose hardware the cheap inventory found, and
+    ``_julia_gpu_functional`` caches its answer for the process lifetime.
+    """
+
+    return {backend: backend_status(backend, julia_executable=julia_executable) for backend in BEAT_BACKENDS}
+
+
 def beat_engine_status(*, julia_executable: str | None = None) -> dict[str, Any]:
     """Report whether a BEAT solve can run here, and on which backend.
 
-    The user-facing answer is GPU-only: the CPU path exists as internal
-    scaffolding and is reported available only under ``HORNLAB_BEAT_FORCE_CPU``.
+    The *one* backend an unqualified solve would use, which is a different
+    question from :func:`backend_status`'s. It prefers a working accelerator,
+    and falls back to the CPU runtime when one has been provisioned -- so a
+    machine whose CUDA install is broken reports the CPU path it can actually
+    solve on instead of reporting BEAT unavailable. ``HORNLAB_BEAT_FORCE_CPU=1``
+    still short-circuits to the CPU backend.
     """
 
     version = package_version()
     julia = discover_julia(julia_executable)
     if julia is None:
-        return {
-            "available": False,
-            "reason": (
-                "No Julia executable was found. Run: python -m "
-                "hornlab_beat_bem.provision --backend cpu for the CPU runtime, "
-                "or omit --backend cpu to provision a detected GPU. "
-                f"Alternatively install Julia >= 1.10 and put it on PATH or set {JULIA_ENV_VAR}."
-            ),
-            "version": version,
-            "backend": None,
-            "julia_executable": None,
-        }
+        return _no_julia_status(version)
     if not DEFAULT_SOLVER_SCRIPT.exists():
-        return {
-            "available": False,
-            "reason": f"Bundled BEAT solver script is missing: {DEFAULT_SOLVER_SCRIPT}",
-            "version": version,
-            "backend": None,
-            "julia_executable": julia,
-        }
+        return _no_solver_script_status(version, julia)
 
     if os.environ.get(FORCE_CPU_ENV_VAR, "").strip() == "1":
+        available, reason, state = _cpu_backend_status(julia)
         return {
-            "available": True,
-            "reason": (
-                f"CPU backend forced by {FORCE_CPU_ENV_VAR}=1 (internal "
-                "scaffolding/regression path; not a user-facing WG backend)"
-            ),
+            "available": available,
+            "reason": reason,
+            "state": state,
             "version": version,
             "backend": BEAT_CPU,
             "julia_executable": julia,
         }
 
-    if _nvidia_gpu_present():
-        from .provision import read_state
-
-        provisioning = read_state() or {}
-        if provisioning.get("status") == "in_progress":
-            return {
-                "available": False,
-                "reason": (
-                    "BEAT CUDA runtime provisioning is in progress "
-                    f"(step: {provisioning.get('step', 'unknown')}). The engine "
-                    "becomes available when it finishes."
-                ),
-                "version": version,
-                "backend": None,
-                "julia_executable": julia,
-            }
-        functional, detail = _julia_gpu_functional(julia, BEAT_CUDA)
-        if functional:
+    accelerator_reasons: list[str] = []
+    for backend in (BEAT_CUDA, BEAT_ROCM, BEAT_METAL):
+        available, reason, state = _gpu_backend_status(backend, julia)
+        if available:
             return {
                 "available": True,
-                "reason": f"NVIDIA GPU detected and {detail}",
+                "reason": reason,
+                "state": state,
                 "version": version,
-                "backend": BEAT_CUDA,
+                "backend": backend,
                 "julia_executable": julia,
             }
-        if provisioning.get("status") == "failed":
-            detail = (
-                f"provisioning failed earlier: {provisioning.get('error')}. "
-                "Retry with: python -m hornlab_beat_bem.provision --force"
-            )
+        if state != "no-hardware":
+            # This host has the hardware and cannot use it. That is the reason
+            # worth reporting; an absent family's is noise.
+            accelerator_reasons.append(reason)
+
+    cpu_available, cpu_reason, cpu_state = _cpu_backend_status(julia)
+    if cpu_available:
+        return {
+            "available": True,
+            "reason": cpu_reason,
+            "state": cpu_state,
+            "version": version,
+            "backend": BEAT_CPU,
+            "julia_executable": julia,
+        }
+    if accelerator_reasons:
         return {
             "available": False,
-            "reason": f"An NVIDIA GPU is present but the CUDA path is not usable: {detail}",
+            "reason": " ".join(accelerator_reasons),
+            "state": "not-functional",
             "version": version,
             "backend": None,
             "julia_executable": julia,
         }
-
-    if _rocm_present():
-        from .provision import read_state
-
-        provisioning = read_state() or {}
-        if provisioning.get("status") == "in_progress":
-            return {
-                "available": False,
-                "reason": (
-                    "BEAT ROCm runtime provisioning is in progress "
-                    f"(step: {provisioning.get('step', 'unknown')}). The engine "
-                    "becomes available when it finishes."
-                ),
-                "version": version,
-                "backend": None,
-                "julia_executable": julia,
-            }
-        functional, detail = _julia_gpu_functional(julia, BEAT_ROCM)
-        if functional:
-            return {
-                "available": True,
-                "reason": f"AMD ROCm runtime detected and {detail}",
-                "version": version,
-                "backend": BEAT_ROCM,
-                "julia_executable": julia,
-            }
-        if provisioning.get("status") == "failed":
-            detail = (
-                f"provisioning failed earlier: {provisioning.get('error')}. "
-                "Retry with: python -m hornlab_beat_bem.provision --backend rocm --force"
-            )
-        return {
-            "available": False,
-            "reason": f"An AMD ROCm runtime is present but the path is not usable: {detail}",
-            "version": version,
-            "backend": None,
-            "julia_executable": julia,
-        }
-
-    if _apple_gpu_present():
-        functional, detail = _julia_gpu_functional(julia, BEAT_METAL)
-        if functional:
-            return {
-                "available": True,
-                "reason": f"Apple Silicon GPU detected and {detail}",
-                "version": version,
-                "backend": BEAT_METAL,
-                "julia_executable": julia,
-            }
-        return {
-            "available": False,
-            "reason": f"This is Apple Silicon but the Metal path is not usable: {detail}",
-            "version": version,
-            "backend": None,
-            "julia_executable": julia,
-        }
-
     return {
         "available": False,
         "reason": (
             "No supported GPU was detected (no NVIDIA CUDA device via "
-            "nvidia-smi, no AMD ROCm runtime, and not Apple Silicon). The BEAT "
-            "engine is GPU-only; the internal CPU path is enabled by "
-            f"{FORCE_CPU_ENV_VAR}=1 for tests and validation."
+            "nvidia-smi, no AMD ROCm runtime, and not Apple Silicon), and the "
+            f"portable CPU runtime is not provisioned here. {cpu_reason}"
         ),
+        "state": cpu_state,
         "version": version,
         "backend": None,
         "julia_executable": julia,
