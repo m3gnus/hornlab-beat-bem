@@ -26,6 +26,7 @@ The lifetime contract for an embedding application:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
@@ -202,7 +203,7 @@ class BeatWorkerProcess:
             )
             process.stdin.flush()
             return self._iter_events_for_submission()
-        except Exception:
+        except BaseException:
             self._status_callback = None
             self._lock.release()
             raise
@@ -478,6 +479,15 @@ class BeatSolveSession:
     the iterator mid-solve requests cooperative cancellation and, for a
     persistent worker, terminates it rather than handing a mid-job process to
     the next request.
+
+    Construction is where a solve can fail before the caller holds anything to
+    ``close``: staging the request, the worker look-up, the process launch and
+    the initial handshake all happen here. Each of those runs inside
+    ``__init__``'s unwind (``_abort_start``), because a session that raised is
+    unreachable -- nobody can close it, and whatever it had taken (the staged
+    directory, a one-shot child, the worker's submission lock) would be held
+    until the garbage collector happened to run, which for the lock means the
+    *next* request blocks on a solve that no longer exists.
     """
 
     def __init__(
@@ -493,61 +503,86 @@ class BeatSolveSession:
         persistent_worker: bool = True,
         status_callback: StatusCallback | None = None,
     ):
+        # Every attribute the unwind touches exists before anything that can
+        # fail runs, so ``_abort_start`` never has to guess how far the
+        # constructor got.
         self._status_callback = status_callback
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="hornlab-beat-")
-        job_dir = Path(self._temp_dir.name)
-        self._cancel_path = job_dir / "cancel"
-        payload = dict(request_payload)
-        payload["cancel_path"] = str(self._cancel_path)
-        payload["beat_engine_backend"] = beat_backend
-        request_path = job_dir / "request.json"
-        request_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-
-        self.julia_project = julia_project if julia_project is not None else default_project(beat_backend)
         self.beat_backend = beat_backend
+        self.julia_project = julia_project
+        self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._cancel_path: Path | None = None
         self._worker: BeatWorkerProcess | HostedBeatWorker | None = None
         self._process: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
         self._events: Iterator[dict] | None = None
         self.metadata: dict[str, Any] | None = None
         self._finished = False
+        #: True once a request is actually in flight. Until then a failure is
+        #: this request's alone and must leave the worker to the next one.
+        self._submitted = False
+        self._retire_worker = False
+        self._closed = False
 
-        if persistent_worker:
-            self._worker = get_worker(
-                julia_executable=julia_executable,
-                solver_script=solver_script,
-                julia_threads=julia_threads,
-                julia_project=self.julia_project,
-                julia_sysimage=julia_sysimage,
+        try:
+            if self.julia_project is None:
+                self.julia_project = default_project(beat_backend)
+            self._temp_dir = tempfile.TemporaryDirectory(prefix="hornlab-beat-")
+            job_dir = Path(self._temp_dir.name)
+            self._cancel_path = job_dir / "cancel"
+            payload = dict(request_payload)
+            payload["cancel_path"] = str(self._cancel_path)
+            payload["beat_engine_backend"] = beat_backend
+            request_path = job_dir / "request.json"
+            request_path.write_text(
+                json.dumps(payload, separators=(",", ":")), encoding="utf-8"
             )
-            self._events = self._worker.submit(request_path, status_callback=self._emit_status)
-        else:
-            self._emit_status("Initializing BEAT Engine")
-            try:
-                self._process = subprocess.Popen(
-                    _julia_command(
-                        julia_executable,
-                        solver_script,
-                        julia_project=self.julia_project,
-                        julia_sysimage=julia_sysimage,
-                        trailing=["--request", str(request_path)],
-                    ),
-                    cwd=str(job_dir),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=_julia_process_env(julia_threads, self.julia_project),
-                )
-            except FileNotFoundError as exc:
-                raise RuntimeError(
-                    "Julia executable was not found. Install Julia or set HORNLAB_BEAT_JULIA."
-                ) from exc
-            threading.Thread(target=self._collect_stderr, daemon=True).start()
-            self._events = self._iter_process_events()
 
-        self._consume_until_initialized()
+            if persistent_worker:
+                self._worker = get_worker(
+                    julia_executable=julia_executable,
+                    solver_script=solver_script,
+                    julia_threads=julia_threads,
+                    julia_project=self.julia_project,
+                    julia_sysimage=julia_sysimage,
+                )
+                events = self._worker.submit(request_path, status_callback=self._emit_status)
+                # ``submit`` holds the worker's submission lock from here until
+                # the stream is closed, and only from here: it releases the lock
+                # itself if it raises. This is the instruction that makes the
+                # worker ours to cancel and retire, and not one earlier.
+                self._submitted = True
+                self._events = events
+            else:
+                self._emit_status("Initializing BEAT Engine")
+                try:
+                    self._process = subprocess.Popen(
+                        _julia_command(
+                            julia_executable,
+                            solver_script,
+                            julia_project=self.julia_project,
+                            julia_sysimage=julia_sysimage,
+                            trailing=["--request", str(request_path)],
+                        ),
+                        cwd=str(job_dir),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        env=_julia_process_env(julia_threads, self.julia_project),
+                    )
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        "Julia executable was not found. Install Julia or set HORNLAB_BEAT_JULIA."
+                    ) from exc
+                self._submitted = True
+                threading.Thread(target=self._collect_stderr, daemon=True).start()
+                self._events = self._iter_process_events()
+
+            self._consume_until_initialized()
+        except BaseException:
+            self._abort_start()
+            raise
 
     def events(self) -> Iterator[dict]:
         assert self._events is not None
@@ -559,10 +594,11 @@ class BeatSolveSession:
                     continue
                 if event_type == "failed":
                     self._finished = True
-                    if self._worker is not None:
-                        # A failed accelerator job may leave the runtime or
-                        # allocator unhealthy; never reuse that worker.
-                        self._worker.terminate()
+                    # A failed accelerator job may leave the runtime or
+                    # allocator unhealthy; never reuse that worker. The
+                    # retirement itself happens in ``close`` below, once the
+                    # event stream has been closed -- see ``_close_events``.
+                    self._retire_worker = True
                     raise RuntimeError(
                         friendly_julia_error(
                             str(event.get("error", "BEAT Engine solver failed.")),
@@ -579,23 +615,86 @@ class BeatSolveSession:
             self.close()
 
     def request_cancel(self) -> None:
+        if self._cancel_path is None:
+            return
         try:
             self._cancel_path.write_text("cancel", encoding="utf-8")
         except OSError:
             pass
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         events, self._events = self._events, None
-        if events is not None:
-            close = getattr(events, "close", None)
-            if close is not None:
-                close()
+        self._close_events(events)
         if not self._finished:
             # Abandoned mid-solve: ask the solver to stop, and retire a
             # persistent worker instead of handing it over mid-job.
             self.request_cancel()
-            if self._worker is not None:
+            self._retire_worker = True
+        if self._retire_worker and self._worker is not None:
+            self._retire_worker = False
+            self._worker.terminate()
+        self._terminate_process()
+        self._cleanup_temp_dir()
+
+    def _abort_start(self) -> None:
+        """Give back everything a failed ``__init__`` had taken.
+
+        The caller of a constructor that raised has no object to ``close``, so
+        the unwind happens here, and it has to preserve the exception on its
+        way out: a secondary failure while releasing (a generator whose
+        ``finally`` throws, a child that will not die) is suppressed, because
+        the error being propagated is the one that explains the failure.
+
+        The worker is retired only when this session actually had it. A
+        failure before ``submit`` returned -- serialising the request, the
+        status callback, the worker look-up, a runtime that never started --
+        belongs to this request alone, and terminating on it would take down a
+        warm worker that the next request, or a concurrent one, is entitled to.
+        """
+
+        self._closed = True
+        events, self._events = self._events, None
+        with contextlib.suppress(BaseException):
+            self._close_events(events)
+        if self._submitted and not self._finished:
+            # The worker may still be mid-job on our request: same contract as
+            # an abandoned solve.
+            self.request_cancel()
+            self._retire_worker = True
+        if self._retire_worker and self._worker is not None:
+            self._retire_worker = False
+            with contextlib.suppress(BaseException):
                 self._worker.terminate()
+        with contextlib.suppress(BaseException):
+            self._terminate_process()
+        with contextlib.suppress(BaseException):
+            self._cleanup_temp_dir()
+
+    @staticmethod
+    def _close_events(events: Iterator[dict] | None) -> None:
+        """Close the event stream before anything else touches the worker.
+
+        Both worker implementations release the submission lock in their
+        generator's ``finally``, and both ``terminate`` methods release it too
+        if they find it held. Closing the generator first avoids a delayed
+        generator release after retirement: the other way round,
+        the generator's later close finds the lock held again by whichever
+        request came next and releases *that* one, letting two solves into a
+        worker that can serve one.
+        """
+
+        if events is None:
+            return
+        close = getattr(events, "close", None)
+        if close is None:
+            return
+        with contextlib.suppress(Exception):
+            close()
+
+    def _terminate_process(self) -> None:
         if self._process is not None and self._process.poll() is None:
             self._process.terminate()
             try:
@@ -603,10 +702,13 @@ class BeatSolveSession:
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait(timeout=2.0)
-        try:
-            self._temp_dir.cleanup()
-        except OSError:
-            pass
+
+    def _cleanup_temp_dir(self) -> None:
+        temp_dir, self._temp_dir = self._temp_dir, None
+        if temp_dir is None:
+            return
+        with contextlib.suppress(OSError):
+            temp_dir.cleanup()
 
     def _consume_until_initialized(self) -> None:
         assert self._events is not None
@@ -620,8 +722,8 @@ class BeatSolveSession:
                 return
             if event_type == "failed":
                 self._finished = True
-                if self._worker is not None:
-                    self._worker.terminate()
+                # Retired by the unwind, after the stream has been closed.
+                self._retire_worker = True
                 raise RuntimeError(
                     friendly_julia_error(
                         str(event.get("error", "BEAT Engine solver failed.")),
@@ -630,6 +732,10 @@ class BeatSolveSession:
                     )
                 )
             if event_type in {"completed", "cancelled"}:
+                # The submission is over -- there is no job to cancel and no
+                # reason to distrust the runtime, so the worker stays warm for
+                # the next request; only this session's own state is released.
+                self._finished = True
                 raise RuntimeError(f"BEAT Engine solver ended before initialization: {event_type}")
         raise RuntimeError("BEAT Engine solver ended before initialization.")
 

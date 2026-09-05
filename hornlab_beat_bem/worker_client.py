@@ -123,7 +123,7 @@ class HostedBeatWorker:
                     "cancel_path": str(Path(request_path).parent / "cancel"),
                 },
             )
-        except Exception:
+        except BaseException:
             self._lock.release()
             raise
         return self._iter_submission(connection, status_callback)

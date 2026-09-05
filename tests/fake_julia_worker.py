@@ -15,6 +15,12 @@ Knobs, read from the environment because that is what the host inherits:
 ``FAKE_BEAT_BOOT_S`` delays the ready event (a slow cold start),
 ``FAKE_BEAT_SOLVE_S`` delays each frequency (a long job to interrupt),
 ``FAKE_BEAT_FAIL`` makes startup fail.
+
+Two more are read from the *request* rather than the environment, because
+they describe one submission and the session lifecycle tests need the same
+warm worker to serve a failing request and then a healthy one:
+``fake_fail_before_initialized`` and ``fake_complete_before_initialized``
+end the job before the ``initialized`` event the client waits for.
 """
 
 from __future__ import annotations
@@ -32,6 +38,12 @@ def emit(**payload: object) -> None:
 
 
 def solve(request: dict) -> None:
+    if request.get("fake_fail_before_initialized"):
+        emit(type="failed", error="fake worker was told to fail this request")
+        return
+    if request.get("fake_complete_before_initialized"):
+        emit(type="completed", solved_count=0)
+        return
     frequencies = [float(value) for value in request.get("frequencies_hz", [1000.0])]
     config = request.get("config", {})
     cancel_path = request.get("cancel_path")
@@ -57,6 +69,13 @@ def solve(request: dict) -> None:
                 "source_tag": config.get("tag_throat"),
             },
         )
+        if request.get("fake_wait_for_cancel") and frequency == frequencies[0]:
+            deadline = time.monotonic() + 5.0
+            while not (cancel_path and Path(cancel_path).exists()):
+                if time.monotonic() >= deadline:
+                    emit(type="failed", error="test client did not cancel")
+                    return
+                time.sleep(0.001)
     emit(type="completed", solved_count=len(frequencies))
 
 
