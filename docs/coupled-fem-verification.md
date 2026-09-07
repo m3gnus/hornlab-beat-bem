@@ -200,7 +200,7 @@ here does not arise, and the reason the coupled path was never measured at eithe
 tolerance is that neither one applies to it.
 
 **The condensed-assembly assertion was settled by its owner, not here.** This
-measurement deliberately did not touch it. Magnus's decision landed as `f5efd5f`
+measurement deliberately did not touch it. The maintainer's decision landed as `f5efd5f`
 while these runs were in flight, replacing the `symmetry=:off` bitwise `==` with an
 entrywise absolute floor. Every figure in this file was re-measured afterwards at
 `284b397`, which carries it.

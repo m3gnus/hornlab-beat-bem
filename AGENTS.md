@@ -458,7 +458,7 @@ later, or Zen 4/5 with AVX-512 not hidden by the hypervisor. Until then, a
 Windows developer on an AVX-512 workstation should expect these four assertions
 red on correct code, and should read this section before "fixing" them.
 
-**The contract decision was taken by Magnus on 2026-09-03: the entrywise
+**The contract decision was taken by the maintainer on 2026-09-03: the entrywise
 absolute floor** (the recommended option below). It landed upstream first —
 fork commit `1f90433` on `fix/condensed-entrywise-floor` — and arrived here by
 cherry-pick, recorded in `VENDORING.md`. The four assertions now bound every
