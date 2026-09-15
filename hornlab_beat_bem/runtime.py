@@ -257,13 +257,16 @@ def provision_command(backend: str) -> str:
 
 
 #: How each GPU family is detected, in the words of an unavailable reason.
+#: The name is bare -- no article, vendor capitalisation kept -- because every
+#: sentence it is quoted in supplies its own grammar: "No NVIDIA GPU was
+#: detected", "NVIDIA GPU detected and ...". A consumer shows these verbatim.
 _GPU_INVENTORY: dict[str, tuple[str, str]] = {
-    BEAT_CUDA: ("an NVIDIA GPU", "nvidia-smi -L reported no device"),
+    BEAT_CUDA: ("NVIDIA GPU", "nvidia-smi -L reported no device"),
     BEAT_ROCM: (
-        "an AMD ROCm runtime",
+        "AMD ROCm runtime",
         "no rocminfo/hipinfo on PATH and no ROCM_PATH-style variable set",
     ),
-    BEAT_METAL: ("an Apple Silicon GPU", "this host is not Apple Silicon"),
+    BEAT_METAL: ("Apple Silicon GPU", "this host is not Apple Silicon"),
 }
 
 _GPU_HARDWARE_PRESENT: dict[str, Any] = {
@@ -302,7 +305,7 @@ def _gpu_backend_status(backend: str, julia: str) -> tuple[bool, str, str]:
         )
     functional, detail = _julia_gpu_functional(julia, backend)
     if functional:
-        return True, f"{hardware.capitalize()} detected and {detail}", "ready"
+        return True, f"{hardware} detected and {detail}", "ready"
     if provisioning.get("status") == "failed":
         detail = (
             f"provisioning failed earlier: {provisioning.get('error')}. "
@@ -310,7 +313,7 @@ def _gpu_backend_status(backend: str, julia: str) -> tuple[bool, str, str]:
         )
     return (
         False,
-        f"{hardware.capitalize()} is present but the {backend} path is not usable: {detail}",
+        f"{hardware} is present but the {backend} path is not usable: {detail}",
         "not-functional",
     )
 

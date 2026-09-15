@@ -15,7 +15,7 @@ import tomllib
 import pytest
 
 from hornlab_beat_bem import provision, runtime
-from hornlab_beat_bem.config import BEAT_CPU
+from hornlab_beat_bem.config import BEAT_CPU, BEAT_CUDA, BEAT_METAL, BEAT_ROCM
 from hornlab_beat_bem.runtime import PACKAGE_DIR
 
 
@@ -26,9 +26,18 @@ def runtime_dir(tmp_path, monkeypatch):
     return directory
 
 
-def test_no_gpu_means_no_download_and_no_state(runtime_dir, monkeypatch):
-    monkeypatch.setattr(runtime, "_nvidia_gpu_present", lambda: False)
-    monkeypatch.setattr(runtime, "_apple_gpu_present", lambda: False)
+@pytest.mark.parametrize(
+    ("backend", "hardware", "label"),
+    [
+        (BEAT_CUDA, "NVIDIA GPU", "CUDA"),
+        (BEAT_ROCM, "AMD ROCm runtime", "ROCm"),
+        (BEAT_METAL, "Apple Silicon GPU", "Metal"),
+    ],
+)
+def test_no_gpu_means_no_download_and_no_state(
+    runtime_dir, monkeypatch, backend, hardware, label
+):
+    monkeypatch.setattr(provision, "_gpu_hardware_present", lambda selected: False)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning attempted a download without a GPU")
@@ -36,8 +45,13 @@ def test_no_gpu_means_no_download_and_no_state(runtime_dir, monkeypatch):
     monkeypatch.setattr(provision, "_ensure_julia", forbidden)
     monkeypatch.setattr(provision, "_download", forbidden)
 
-    state = provision.provision_cuda(runtime_dir, status_cb=lambda _: None)
+    messages = []
+    state = provision.provision_gpu(runtime_dir, backend=backend, status_cb=messages.append)
     assert state["status"] == "skipped"
+    assert state["reason"] == f"no {hardware} detected"
+    assert messages == [
+        f"No {hardware} detected; skipping BEAT {label} runtime provisioning."
+    ]
     assert not runtime_dir.exists()
 
 

@@ -737,6 +737,59 @@ def test_two_accelerator_families_each_get_their_own_answer(
     assert "Apple Silicon" in statuses[BEAT_METAL]["reason"]
 
 
+@pytest.mark.parametrize(
+    ("backend", "reason"),
+    [
+        (BEAT_CUDA, "No NVIDIA GPU was detected (nvidia-smi -L reported no device)."),
+        (
+            BEAT_ROCM,
+            "No AMD ROCm runtime was detected (no rocminfo/hipinfo on PATH and no "
+            "ROCM_PATH-style variable set).",
+        ),
+        (
+            BEAT_METAL,
+            "No Apple Silicon GPU was detected (this host is not Apple Silicon).",
+        ),
+    ],
+)
+def test_an_absent_family_is_named_in_a_sentence_that_reads(
+    runtime_dir, no_gpu, fake_julia, backend, reason
+):
+    """A selector quotes this reason verbatim beside a greyed-out row.
+
+    It shipped as "No an NVIDIA GPU was detected": the family name carried its
+    own article into a sentence that already had one.
+    """
+
+    status = runtime.backend_status(backend)
+
+    assert status["state"] == "no-hardware"
+    assert status["reason"] == reason
+
+
+def test_a_present_family_keeps_its_vendor_capitalisation(
+    runtime_dir, cuda_host, fake_julia, monkeypatch
+):
+    """``str.capitalize`` lowercases the rest, so it read "An nvidia gpu"."""
+
+    monkeypatch.setattr(
+        runtime, "_julia_gpu_functional", lambda julia, backend: (True, "probe says yes")
+    )
+    assert runtime.backend_status(BEAT_CUDA)["reason"] == (
+        "NVIDIA GPU detected and probe says yes"
+    )
+
+    monkeypatch.setattr(
+        runtime,
+        "_julia_gpu_functional",
+        lambda julia, backend: (False, "CUDA.functional() is false (no driver)"),
+    )
+    assert runtime.backend_status(BEAT_CUDA)["reason"] == (
+        "NVIDIA GPU is present but the cuda path is not usable: "
+        "CUDA.functional() is false (no driver)"
+    )
+
+
 def test_the_cpu_row_reports_the_provisioning_record_not_the_presence_of_julia(
     runtime_dir, cuda_host, fake_julia, julia_steps, monkeypatch
 ):

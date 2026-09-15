@@ -689,17 +689,17 @@ _GPU_BACKENDS: dict[str, dict[str, Any]] = {
     BEAT_CUDA: {
         "label": "CUDA",
         "module": "CUDA",
-        "hardware": "an NVIDIA GPU",
+        "hardware": "NVIDIA GPU",
     },
     BEAT_ROCM: {
         "label": "ROCm",
         "module": "AMDGPU",
-        "hardware": "an AMD ROCm runtime",
+        "hardware": "AMD ROCm runtime",
     },
     BEAT_METAL: {
         "label": "Metal",
         "module": "Metal",
-        "hardware": "an Apple Silicon GPU",
+        "hardware": "Apple Silicon GPU",
         # Metal.jl ships no vendor toolkit: the driver is the operating
         # system's, so instantiating is a small package download rather than
         # the multi-gigabyte artifact pull CUDA and ROCm need.
