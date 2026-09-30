@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -58,7 +59,12 @@ def registry_dir(isolated_worker_registry, monkeypatch):
     monkeypatch.setenv(registry.WORKER_DIR_ENV_VAR, str(directory))
     yield directory
     for record in find_live_hosts(directory):
-        registry.terminate_pid(record.pid)
+        # A test may plant a record carrying this process's own pid. If it then
+        # fails before replacing that record, terminating "the host" would end
+        # the test run itself -- on Windows that is TerminateProcess -- and the
+        # failure would never be reported.
+        if record.pid != os.getpid():
+            registry.terminate_pid(record.pid)
 
 
 @pytest.fixture(params=TRANSPORTS)
@@ -505,15 +511,24 @@ def test_a_record_pointing_at_a_socket_nobody_answers_is_replaced(registry_dir):
 
     key = fake_key()
     identifier = registry.key_id(key)
-    orphan = registry_dir / "orphan.sock"
-    orphan.write_text("not a socket", encoding="utf-8")
+    if hasattr(socket, "AF_UNIX") and os.name == "posix":
+        orphan = registry_dir / "orphan.sock"
+        orphan.write_text("not a socket", encoding="utf-8")
+        endpoint: registry.Endpoint = registry.UnixEndpoint(orphan)
+    else:
+        # Windows has no Unix socket to orphan; its transport is loopback TCP.
+        # The equivalent record names a port that was bound once and closed,
+        # so the address is well formed and nobody answers on it.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as closed:
+            closed.bind(("127.0.0.1", 0))
+            endpoint = registry.TcpEndpoint(port=closed.getsockname()[1])
     registry.write_key_file(
         registry.KeyFile(
             identifier=identifier,
             key=key,
             pid=os.getpid(),
             token="stale",
-            endpoint=registry.UnixEndpoint(orphan),
+            endpoint=endpoint,
         ),
         registry_dir,
     )
