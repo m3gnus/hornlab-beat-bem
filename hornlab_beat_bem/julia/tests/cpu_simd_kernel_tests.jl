@@ -315,3 +315,85 @@ end
         )
     end
 end
+
+# A field point sums thousands of source terms, so as with the singular pass
+# the Float32 gate is against Float64: the vectorised Float32 field must be no
+# further from the Float64 result than the scalar Float32 field is. Float64 is
+# gated directly.
+@testset "CPU SIMD field evaluation" begin
+    for order in (2, 4), symmetry in (:off, :x, :xy)
+        points = vec([SVector{3,Float64}(0.3cos(t) * sin(s), 0.3sin(t) * sin(s), 0.3cos(s))
+                      for t in range(0, 2pi; length=13), s in range(0.05, pi; length=7)])
+        fields = Dict{Any,Any}()
+        for T in (Float32, Float64)
+            mesh = _beat_cpu_simd_test_mesh(T, symmetry)
+            cache = build_field_evaluation_cache(mesh, triangle_rule(T, order); symmetry_mode=symmetry)
+            pressure = Complex{T}[Complex{T}(sin(0.3 * i), cos(0.7 * i)) for i in eachindex(mesh.vertices)]
+            q = Complex{T}[Complex{T}(0.1 * sin(1.1 * i), 0.2 * cos(0.9 * i)) for i in eachindex(mesh.faces)]
+            # A point exactly on a source: the scalar loop skips it, the vectorised one masks it.
+            on_source = vcat(points, [SVector{3,Float64}(cache.source_points[1]...)])
+            k = T(2pi * 3000 / 343)
+            for kernel in (:scalar, :simd)
+                fields[(T, kernel)] = evaluate_galerkin_field_cpu(on_source, mesh, pressure, q, k, cache; kernel)
+            end
+            @test evaluate_galerkin_field_cpu(on_source, mesh, pressure, q, k, cache) == fields[(T, :scalar)]
+            @test all(isfinite, fields[(T, :simd)])
+            @test isempty(evaluate_galerkin_field_cpu(SVector{3,Float64}[], mesh, pressure, q, k, cache; kernel=:simd))
+        end
+        reference = fields[(Float64, :scalar)]
+        _beat_cpu_simd_test_entrywise(fields[(Float64, :simd)], reference, 1e-13)
+        error_of(field) = maximum(abs, ComplexF64.(field) .- reference) / maximum(abs, reference)
+        @test error_of(fields[(Float32, :simd)]) <= 1.5 * error_of(fields[(Float32, :scalar)]) + 1e-7
+    end
+    @test_throws ErrorException evaluate_galerkin_field_cpu(
+        [SVector(1.0, 0.0, 0.0)], _beat_cpu_simd_test_mesh(Float32, :off), ComplexF32[], ComplexF32[],
+        1.0f0, build_field_evaluation_cache(_beat_cpu_simd_test_mesh(Float32, :off), triangle_rule(Float32, 2));
+        kernel=:invalid,
+    )
+    withenv("BLAB_BEAT_CPU_FIELD_KERNEL" => nothing) do
+        @test BeatEngineCore.beat_cpu_field_kernel() === :simd
+    end
+    withenv("BLAB_BEAT_CPU_FIELD_KERNEL" => "scalar") do
+        @test BeatEngineCore.beat_cpu_field_kernel() === :scalar
+    end
+end
+
+# The Duffy rules sum up to 1,536 terms that grow like 1/r, so a changed
+# summation order moves a Float32 entry by more than it does in the regular
+# pass. The gate is therefore against Float64: the vectorised Float32 kernel
+# must be no further from the Float64 result than the scalar Float32 kernel is.
+@testset "CPU SIMD singular corrections" begin
+    for order in (2, 4), symmetry in (:off, :x, :xy, :ground), singular_order in (2, 4)
+        results = Dict{Any,Any}()
+        for T in (Float32, Float64)
+            mesh = _beat_cpu_simd_test_mesh(T, symmetry)
+            p1 = build_p1_space(mesh)
+            dp0 = build_dp0_space(mesh)
+            rule = triangle_rule(T, order)
+            k = T(2pi * 1500 / 343)
+            identity_p1_p1 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1; symmetry_mode=symmetry)
+            identity_p1_dp0 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0; symmetry_mode=symmetry)
+            q = Complex{T}[Complex{T}(sin(T(0.7) * row + drive), cos(T(0.4) * row - drive))
+                           for row in 1:dp0.global_dof_count, drive in 1:2]
+            indices = symmetry == :ground ? collect(eachindex(mesh.faces)) : collect(1:min(60, length(mesh.faces)))
+            for kernel in (:scalar, :simd)
+                results[(T, kernel)] = assemble_burton_miller_neumann_system_cpu(
+                    mesh, p1, dp0, q, k, rule; identity_p1_p1, identity_p1_dp0, element_indices=indices,
+                    singular_order, symmetry_mode=symmetry, regular_kernel=:scalar, singular_kernel=kernel,
+                )
+            end
+        end
+        @test results[(Float32, :simd)].singular_kernel === :simd
+        @test results[(Float32, :scalar)].singular_kernel === :scalar
+        reference = results[(Float64, :scalar)]
+        _beat_cpu_simd_test_entrywise(results[(Float64, :simd)].matrix, reference.matrix, 1e-13)
+        _beat_cpu_simd_test_entrywise(results[(Float64, :simd)].rhs, reference.rhs, 1e-13)
+        error_of(system, field) = maximum(abs, ComplexF64.(getproperty(system, field)) .- getproperty(reference, field)) /
+            maximum(abs, getproperty(reference, field))
+        for field in (:matrix, :rhs)
+            scalar_error = error_of(results[(Float32, :scalar)], field)
+            simd_error = error_of(results[(Float32, :simd)], field)
+            @test simd_error <= 1.5 * scalar_error + 1e-7
+        end
+    end
+end
