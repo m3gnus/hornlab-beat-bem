@@ -138,6 +138,14 @@ jobs:
       - name: Run the Julia CPU suite
         run: julia --project=hornlab_beat_bem/julia .github/scripts/run_julia_suite.jl --min-passes=300
 
+      # The suite above runs on one thread, where the vectorised regular
+      # kernel's chunked `Threads.@threads` driver is never entered and its
+      # serial-versus-threaded comparisons compare a path against itself.
+      # Run that file again threaded, so the path the product ships is the
+      # one gated against the scalar kernel.
+      - name: Run the vectorised-kernel gate threaded
+        run: julia -t auto --project=hornlab_beat_bem/julia hornlab_beat_bem/julia/tests/cpu_simd_kernel_tests.jl
+
       # The only gate in this repository that checks an absolute answer. Every
       # other exterior gate compares one BEAT code path against another, and an
       # equivalence test cannot see a globally conjugated kernel because both

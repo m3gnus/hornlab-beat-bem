@@ -1,5 +1,5 @@
-# Run the Julia CPU suite under one aggregate testset, and refuse a vacuous
-# green.
+# Run the upstream Julia CPU suite and HornLab-local SIMD tests under one
+# aggregate testset, and refuse a vacuous green.
 #
 # `runtests.jl` is a sequence of top-level testsets, so running it directly
 # gives an exit code and thirty separate summaries but no total. This wraps it
@@ -64,6 +64,7 @@ end
 counts = try
     testset = @testset "hornlab-beat-bem Julia CPU suite" verbose = true begin
         include(SUITE)
+        include(joinpath(dirname(SUITE), "cpu_simd_kernel_tests.jl"))
     end
     tally(testset)
 catch exception

@@ -23,6 +23,21 @@ three-way merge on every sync. `VENDORING.md` explains the three decisions in
 it. `solver.jl` used to be that file; since the cold-start sync it is a
 verbatim entry point and the body lives in the driver.
 
+**One owner-decided exception, 2026-09-30: the vectorised CPU regular
+kernel.** The owner decided that SIMD-vectorising the CPU assembly belongs in
+this package rather than upstream, because BEAT is not only used by Boundary
+Lab. That decision contradicts the rule above as it stood, so it is recorded
+here instead of being made silently. The kernel itself is a new local file,
+`src/BeatEngineCpuSimd.jl`; four upstream files carry small hooks that select
+it (`BeatEngineCpu.jl`, `BeatEngineCpuBurtonMiller.jl`,
+`BeatEngineCpuAssembly.jl`, `BeatEngineCore.jl`), and the CPU bundle's
+precompile workload has one added call. `VENDORING.md`, *The vectorised CPU
+regular kernel*, lists every changed line's purpose. The rule still holds for
+everything else: keep the hooks as small as they are, put new code in the local
+file, and re-apply the hooks on a re-sync. The scalar kernels are untouched and
+remain selectable (`BLAB_BEAT_CPU_REGULAR_KERNEL=scalar`), which is what keeps
+an identity check against upstream possible.
+
 ## The failure mode to watch for
 
 The engine is precompiled into a package per backend under `julia_engine/`,

@@ -327,7 +327,10 @@ upstream source path, so no rewrite was needed inside it.
 
 ## What is copied verbatim
 
-Byte-for-byte identical to the sync commit, with no edits of any kind:
+Byte-for-byte identical to the sync commit, with no edits of any kind --
+**except the five files named under *The vectorised CPU regular kernel* below**
+(four in `julia/src/`, and the CPU bundle), which carry local hooks since
+2026-09-30:
 
 | here | upstream |
 |---|---|
@@ -349,9 +352,124 @@ ten — `src/BeatEngineMetalBurtonMiller.jl`,
 `scripts/validate_metal_singular_summation.jl` — come from `02364b5`, which is
 **unlanded upstream**; see the singular-fusion section above.
 
-Every numerical result this package produces comes from those files, and they
-are unmodified. That is deliberate: it is what lets the extraction be verified
-by identity rather than by tolerance.
+Every numerical result this package produces came from those files,
+unmodified, until 2026-09-30. That was deliberate: it is what let the
+extraction be verified by identity rather than by tolerance. **It is no longer
+true of the CPU backend's default configuration**, whose regular element pairs
+are now integrated by a HornLab-local kernel; see the next section for exactly
+what differs, and for the switch that restores the upstream arithmetic.
+
+## The vectorised CPU regular kernel, 2026-09-30
+
+**This is a local modification of upstream sources, made on the owner's
+decision.** `AGENTS.md` said `julia/src/*.jl` is a verbatim copy that must not
+be edited here and that a fix belongs upstream. The owner decided on
+2026-09-30 that SIMD-vectorising the CPU assembly belongs in this package,
+because BEAT is not only used by Boundary Lab. The two statements conflict; the
+decision wins, `AGENTS.md` records the exception, and this section is the
+GPL-3 section 5(a) notice for it. Nothing here exists upstream, on any branch.
+
+### What differs from upstream, file by file
+
+| file | status | change |
+|---|---|---|
+| `hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl` | **new, local** | the vectorised regular-pair kernels for the fused Burton-Miller and the four-operator CPU assembly, their structure-of-arrays trial data, a polynomial `sincos`, and the `BLAB_BEAT_CPU_REGULAR_KERNEL` selector |
+| `hornlab_beat_bem/julia/src/BeatEngineCpu.jl` | modified | one added `include` of the file above |
+| `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl` | modified | `assemble_burton_miller_neumann_system_cpu` gains a `regular_kernel` keyword (default: the selector), routes the regular pass (base and symmetry images) to the new kernel when it is `:simd`, and returns the kernel name. The scalar code below the hook is byte-for-byte upstream's |
+| `hornlab_beat_bem/julia/src/BeatEngineCpuAssembly.jl` | modified | the same hook in `assemble_regular_galerkin_operators_cpu`, **default `:scalar`**, so a direct caller gets upstream's arithmetic |
+| `hornlab_beat_bem/julia/src/BeatEngineCore.jl` | modified | exports `beat_cpu_regular_kernel`; the `backend == :cpu` branch of `assemble_regular_galerkin_operators` passes the selector |
+| `hornlab_beat_bem/julia_engine/BeatEngineCpuBundle/src/BeatEngineCpuBundle.jl` | modified | the precompile workload also solves the request as `JSON.parse` returns it (see below) |
+| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | modified (already local) | reports `cpu_regular_kernel` in each frequency's diagnostics |
+| `hornlab_beat_bem/julia/tests/cpu_simd_kernel_tests.jl` | **new, local** | gates the new kernel against the scalar one; `runtests.jl` stays verbatim and `.github/scripts/run_julia_suite.jl` runs both |
+| `hornlab_beat_bem/julia/scripts/benchmark_cpu_regular_kernel.jl` | **new, local** | times both kernels and reports whether LLVM vectorised the loop on the host |
+
+The scalar kernels `_beat_cpu_bm_regular_pair_blocks` and
+`_beat_cpu_regular_pair_blocks` are not edited. They still integrate every
+singular, image-singular and near-pair correction, and
+`BLAB_BEAT_CPU_REGULAR_KERNEL=scalar` makes them integrate the regular pairs
+too -- at which point the CPU backend's arithmetic is upstream's again. That is
+the identity check this package still offers.
+
+**What is deliberately not changed.** No GPU path: the Metal and ROCm
+host-staged assemblies call `assemble_regular_galerkin_operators_cpu` directly
+and therefore keep the scalar kernel, as does the condensed coupled fork in
+`BeatEngineCondensedAssembly.jl`, which has its own copy of the loop. The
+singular Duffy kernels stay scalar. No dependency was added: `Project.toml` and
+`Manifest.toml` are untouched in every backend project.
+
+### What it does
+
+The regular pass is an all-pairs loop; per element pair the scalar kernel
+visits 9 (order 2) or 36 (order 4) quadrature-point pairs, each with a
+`sincos`, a reciprocal and 12 complex accumulations. The new kernel fixes the
+test element and batches **trial elements** along a structure-of-arrays layout,
+so the innermost loop is a plain `@simd ivdep` loop over trial elements that
+LLVM vectorises at whatever width the host has. Three things had to change for
+that loop to vectorise, and each is a difference from the scalar arithmetic:
+
+- `sincos` is a branch-free polynomial (three-part Cody-Waite reduction,
+  Cephes coefficients). Measured on [0, 2500] rad: maximum absolute error
+  0.78 `eps(T)` against Base's 0.25 (Float32) and 0.39 (Float64).
+- The zero-radius `continue` is a mask: a coincident point pair gets
+  `inv_radius = 0`, which zeroes every term it contributes.
+- The basis expansion is summed in a different order (over trial points first,
+  then the outer product with the test basis), and the curl term is added per
+  trial lane.
+
+So the two kernels agree to rounding, not bitwise.
+
+### Measured, Windows x86-64, AVX2 (Ryzen 7 5825U guest, 12 threads)
+
+Assembled matrix, new kernel against scalar, as a fraction of the largest
+entry: 6e-8 to 4e-7 in Float32 and 1e-16 to 2e-15 in Float64, where the scalar
+Float32 kernel itself is 5e-6 from the Float64 one. Through the package on a
+20-frequency sweep, radiated pressure moves by at most 4.7e-7 (2,302-triangle
+full mesh) and 7.5e-7 (584-triangle quarter mesh, `yz+xz`) relative l2 --
+the size of the change from running the scalar kernel on 1 thread instead of
+12 (5.1e-7), and fifty times smaller than single against double precision
+(2.4e-5).
+
+| warm 20-frequency sweep, 400 Hz - 16 kHz | scalar | vectorised | |
+|---|---:|---:|---|
+| 2,302 triangles, full 3D, wall | 16.5 s | 8.3 s | 1.99x |
+| -- of which assembly | 13.8 s | 5.4 s | 2.5x |
+| 584 triangles, `yz+xz`, wall | 6.1 s | 3.8 s | 1.61x |
+| 2,302 triangles, `BLAB_BEAT_FUSED_BM=0`, wall | 25.1 s | 13.6 s | 1.85x |
+| 2,302 triangles, double precision, wall | 19.2 s | 11.1 s | 1.73x |
+| 2,302 triangles, 1 thread, wall | 87.3 s | 41.6 s | 2.10x |
+| 3,328 triangles, `yz+xz` quarter, 60 frequencies 1-12 kHz | 247.8 s | 108.5 s | 2.28x |
+
+The regular pass alone is 4.1x (order 2) to 6.0x (order 4) faster at 12
+threads. The sweep gains less because the pass is no longer most of the
+assembly: at the package's default `singular_order=4` the scalar Duffy
+corrections were 23 % of assembly at regular order 2 and are now 52 %.
+
+**Not measured: anything but AVX2.** The loop is plain Julia and should
+vectorise for NEON (4 lanes in Float32) and AVX-512, but neither was run.
+`scripts/benchmark_cpu_regular_kernel.jl` prints both timings and the vector
+width LLVM chose; run it on Apple Silicon before relying on the speed there.
+The correctness gates do not depend on the width.
+
+### The precompile workload
+
+Separate from the kernel, and in the same change because it is what makes the
+worker's first solve find its code already compiled. The workload called
+`solve_request` with a `Dict{String,Any}`, while the worker passes what
+`JSON.parse` returns (`JSON.Object`), and the driver specialises on the request
+type -- so the cached native code was for a type the worker never uses. The CPU
+bundle's workload now solves both. Measured on the workload's own request:
+first call with the parsed object 1.63 s -> 0.39 s, runtime compilations
+48 -> 27. The Cuda, Rocm and Metal bundles have the same gap and are not
+changed here; they could not be run on this host.
+
+### Re-syncing with this in place
+
+`BeatEngineCpuSimd.jl` has no upstream counterpart, so a re-sync leaves it
+alone. The four hooked `src/` files and the CPU bundle are overwritten by a
+plain copy and the hooks must be re-applied; they are small on purpose (19
+changed lines across the four `src/` files). If upstream changes the regular
+pair mathematics, the local kernel must follow it --
+`tests/cpu_simd_kernel_tests.jl` fails when the two diverge.
 
 `BeatEngineDriver.jl` is deliberately absent from that list. It is upstream's
 file, produced by a three-way merge and overwhelmingly upstream's code, but it
@@ -560,6 +678,8 @@ is upstream's.
 
 The layout is a flat rename, so a future sync is mechanical:
 
+0. Read *The vectorised CPU regular kernel* above: five files carry local
+   hooks that a plain copy removes, and they must be re-applied after step 1.
 1. Copy `src/blab/solvers/julia_local/src/*.jl` over `hornlab_beat_bem/julia/src/`
    and `coupled_solver.jl`, `solver.jl`, `Project.toml`, `Manifest.toml`
    alongside; `src/blab/solvers/julia_engine/` over `hornlab_beat_bem/julia_engine/`;

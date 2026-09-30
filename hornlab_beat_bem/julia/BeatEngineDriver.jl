@@ -1703,6 +1703,10 @@ function solve_request_impl(request)
                     "p1_dof_count" => p1_space.global_dof_count,
                     "regular_quadrature_mode" => regular_quadrature_mode,
                     "regular_quadrature_order" => quadrature_selection.order,
+                    "cpu_regular_kernel" => beat_backend != :cpu ? nothing :
+                        String(assembly_payload.kind === :fused ?
+                            assembly_payload.system.regular_kernel :
+                            BeatEngineCore.beat_cpu_regular_kernel()),
                     "regular_quadrature_base_order" => base_regular_order,
                     "regular_quadrature_wavelength_mesh_stat" => quadrature_selection.mesh_stat,
                     "regular_quadrature_wavelength_mesh_area_stat_m2" => quadrature_selection.mesh_area_stat,

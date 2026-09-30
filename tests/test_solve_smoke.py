@@ -60,3 +60,54 @@ def test_cpu_solve_tetrahedron(julia):
         assert len(result.solver_log) == 2
     finally:
         beat.shutdown_workers()
+
+
+def test_cpu_regular_kernel_switch_reaches_the_worker(julia, monkeypatch):
+    """The vectorised regular kernel is the default, and the switch is real.
+
+    The tetrahedron above cannot show this: all four of its faces touch, so it
+    has no regular pair at all. The bundled sample mesh has them. The two
+    kernels differ in summation order and in the sincos they call, so they
+    agree to Float32 rounding and not bitwise -- and if they were bitwise
+    equal here, the switch would not be reaching the engine.
+    """
+
+    mesh_path = (
+        Path(beat.__file__).resolve().parent / "julia" / "test_meshes" / "sample.msh"
+    )
+
+    def solve(kernel):
+        if kernel is None:
+            monkeypatch.delenv("BLAB_BEAT_CPU_REGULAR_KERNEL", raising=False)
+        else:
+            monkeypatch.setenv("BLAB_BEAT_CPU_REGULAR_KERNEL", kernel)
+        config = beat.SolveConfig(
+            beat_backend="cpu",
+            julia_executable=julia,
+            mesh_scale=0.001,
+            velocity_sources={2: 1.0},
+            observation=beat.ObservationConfig(
+                planes=["horizontal", "vertical"],
+                distance_m=1.0,
+                angle_min_deg=0.0,
+                angle_max_deg=90.0,
+                angle_count=4,
+            ),
+        )
+        try:
+            return beat.solve_frequencies(mesh_path, [800.0, 6000.0], config)
+        finally:
+            beat.shutdown_workers()
+
+    default = solve(None)
+    scalar = solve("scalar")
+
+    def kernels(result):
+        return [entry["native_diagnostics"]["cpu_regular_kernel"] for entry in result.solver_log]
+
+    assert kernels(default) == ["simd", "simd"]
+    assert kernels(scalar) == ["scalar", "scalar"]
+    assert np.all(np.isfinite(default.pressure_complex))
+    difference = np.linalg.norm(default.pressure_complex - scalar.pressure_complex)
+    reference = np.linalg.norm(scalar.pressure_complex)
+    assert 0.0 < difference <= 1e-4 * reference

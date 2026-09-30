@@ -160,6 +160,7 @@ export BoundaryMesh,
     burton_miller_neumann_rhs,
     build_burton_miller_neumann_cpu_system,
     beat_cpu_blas_thread_count,
+    beat_cpu_regular_kernel,
     configure_beat_cpu_blas_threads!,
     solve_burton_miller_neumann_cpu_system,
     solve_burton_miller_neumann_cpu,
@@ -1244,6 +1245,7 @@ function assemble_regular_galerkin_operators(
             near_correction_cache=near_correction_cache,
             image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=symmetry_mode,
+            regular_kernel=beat_cpu_regular_kernel(),
         )
     end
 

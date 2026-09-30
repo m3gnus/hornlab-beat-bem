@@ -123,6 +123,11 @@ const WORKLOAD_MESH = """
         redirect_stdout(devnull) do
             try
                 solve_request(request)
+                # HornLab-local: the worker hands `solve_request` what
+                # `JSON.parse` returns, not a Dict, and the driver specialises
+                # on the request type. Solving the parsed form too caches the
+                # native code the worker actually calls.
+                solve_request(JSON.parse(JSON.json(request)))
             catch
                 # A workload that cannot solve still leaves everything it did
                 # reach compiled, and a build must not fail over an

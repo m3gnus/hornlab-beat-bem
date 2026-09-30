@@ -349,10 +349,12 @@ amplitude -- WG's y-only `xz` half domain, per the symmetry note above, a
 ground plane on any axis but `y`, and a ground plane combined with native
 symmetry.
 
-### The one local patch to the vendored engine
+### The local patches to the vendored engine
 
 `hornlab_beat_bem/julia/src/` is otherwise a verbatim copy of upstream, so a
-re-sync is a straight file copy. The exception is boundary-lab
+re-sync is a straight file copy. There are two exceptions. The second, the
+vectorised CPU regular kernel, is described under *Measured performance* and
+in `VENDORING.md`. The first is boundary-lab
 `feature/multiple-image-near-caches`: upstream's assembly takes a single
 image-near correction cache, which is enough for the one ground reflection it
 was written for but not for `yz+xz`, whose three mirror transforms would leave
@@ -601,6 +603,39 @@ For scale, assembly against hornlab-metal-bem (a one-operator standard
 formulation, so it does strictly less work) on the same meshes is within
 +/-20% across 1,974-20,422 dofs, BEAT ahead in the middle of the range and
 metal-bem ahead at both ends.
+
+### Vectorising the CPU regular kernel
+
+The CPU backend's assembly was one scalar `sincos` and a handful of FMAs per
+quadrature-point pair, and the regular (non-touching) element pairs were
+73-89 % of it. Since 2026-09-30 those pairs are integrated by a kernel that
+batches trial elements in a structure-of-arrays layout and leaves the
+vectorisation to LLVM (`@simd`, no SIMD package). **This is a HornLab-local
+change to the vendored engine**; `VENDORING.md` lists what differs.
+
+Windows, Ryzen 7 5825U guest (Zen 3, AVX2, 12 threads), Float32, warm
+20-frequency sweep 400 Hz - 16 kHz, wavelength-driven quadrature, the full
+observation set a Waveguide Generator solve asks for:
+
+| case | scalar | vectorised | |
+|---|---:|---:|---|
+| 2,302 triangles, full 3D | 16.5 s | 8.3 s | 1.99x |
+| 584 triangles, `yz+xz` quarter | 6.1 s | 3.8 s | 1.61x |
+| 2,302 triangles, four-operator (`BLAB_BEAT_FUSED_BM=0`) | 25.1 s | 13.6 s | 1.85x |
+| 2,302 triangles, double precision | 19.2 s | 11.1 s | 1.73x |
+| 3,328 triangles, `yz+xz` quarter, 60 frequencies 1-12 kHz | 247.8 s | 108.5 s | 2.28x |
+
+The regular pass itself is 4.1x (order 2) to 6.0x (order 4) faster. Radiated
+pressure moves by at most 7.5e-7 relative -- the two kernels differ in
+summation order and in their `sincos`, which is the size of the difference
+between a 1-thread and a 12-thread run of the scalar kernel.
+
+What is left of the full-mesh sweep is 5.4 s assembly, 1.9 s field evaluation
+and 0.75 s LU. Of the assembly, roughly half is now the singular Duffy
+corrections, which are still scalar. **Only AVX2 was measured**: on another
+architecture run `julia -t auto --project=hornlab_beat_bem/julia
+hornlab_beat_bem/julia/scripts/benchmark_cpu_regular_kernel.jl --mesh <mesh>`,
+which prints both timings and the vector width LLVM chose.
 
 ### Adaptive dense solve
 
@@ -855,6 +890,7 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_BEAT_GMRES_TOL` | `1e-5` | tolerance on the true relative residual. Exterior solves only; the coupled FEM/LEM path factorizes directly. See `VENDORING.md` |
 | `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
+| `BLAB_BEAT_CPU_REGULAR_KERNEL` | `simd` | CPU backend only. `scalar` integrates the regular element pairs with upstream's scalar kernel instead of the vectorised one: about half the sweep speed, and the reference the vectorised kernel is gated against. Each frequency's `native_diagnostics["cpu_regular_kernel"]` says which ran |
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |

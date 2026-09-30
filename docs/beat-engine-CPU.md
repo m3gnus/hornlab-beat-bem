@@ -47,6 +47,27 @@ Regular pair assembly skips adjacent/coincident pairs, which are handled afterwa
 
 Symmetry image contributions are assembled on the host by reflecting trial/source element geometry and quadrature data. Reflected image pairs that become singular across a symmetry plane use image-singular correction caches.
 
+### Vectorised regular kernel (HornLab-local)
+
+This section describes this package, not upstream Boundary Lab. The regular
+pass of both CPU assembly paths is, by default, done by
+`hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl`: for one test element the
+trial elements are processed in blocks of 256 from a structure-of-arrays copy
+of their quadrature points, normals, areas and curls, and the per-lane work is
+a plain `@simd ivdep` loop. Adjacent pairs are masked with a zero Jacobian and
+coincident points with a zero reciprocal radius, so the loop has no branch;
+`sincos` is a branch-free polynomial. Threading is unchanged: coloured test
+elements, one scratch buffer per chunk of a colour group.
+
+`BLAB_BEAT_CPU_REGULAR_KERNEL=scalar` selects the scalar pair kernel instead.
+The two agree to rounding, not bitwise; `tests/cpu_simd_kernel_tests.jl` gates
+them against each other for Float32 and Float64, regular order 2 and 4, and
+symmetry off, x, xy and ground. Singular, image-singular and near-pair
+corrections always use the scalar Duffy kernels. A direct call to
+`assemble_regular_galerkin_operators_cpu` defaults to the scalar kernel, which
+is what the Metal and ROCm host-staged paths and their validators rely on; the
+CPU backend passes the selected kernel explicitly.
+
 ## Dynamic Quadrature
 
 The CPU path defaults to wavelength-driven regular quadrature. This is a CPU-only production feature; CUDA currently remains fixed-order as the GPU solver does not meaningfully benefit from dynamic quadrature.
@@ -138,6 +159,7 @@ code is backend-independent and both the CPU and Metal fused paths call it.
 Useful scripts:
 
 - `hornlab_beat_bem/julia/scripts/benchmark_cpu.jl`: CPU timing benchmark, including fixed and wavelength regular quadrature modes.
+- `hornlab_beat_bem/julia/scripts/benchmark_cpu_regular_kernel.jl`: scalar against vectorised regular kernel on one mesh, with the vector width LLVM chose (HornLab-local).
 - `hornlab_beat_bem/julia/scripts/benchmark_cpu_blas.jl`: synthetic or real-system dense LU thread-scaling benchmark.
 - `hornlab_beat_bem/julia/scripts/compare_cpu_quadrature.jl`: fixed-reference versus candidate comparison artifact generator with operator, pressure, field, and SPL error metrics.
 
@@ -158,6 +180,7 @@ Example comparison:
 
 - `hornlab_beat_bem/julia/src/BeatEngineCpu.jl`: include hub for the CPU implementation files.
 - `hornlab_beat_bem/julia/src/BeatEngineCpuAssembly.jl`: CPU Galerkin operator assembly entry point.
+- `hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl`: vectorised regular-pair kernels and the `BLAB_BEAT_CPU_REGULAR_KERNEL` selector (HornLab-local).
 - `hornlab_beat_bem/julia/src/BeatEngineCpuField.jl`: CPU field-evaluation path.
 - `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl`: fused CPU Burton-Miller assembly for exterior solves.
 - `hornlab_beat_bem/julia/src/BeatEngineCpuSolve.jl`: CPU Burton-Miller dense solve through Julia's LAPACK/BLAS path.
