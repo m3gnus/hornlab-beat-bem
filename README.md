@@ -604,36 +604,66 @@ formulation, so it does strictly less work) on the same meshes is within
 +/-20% across 1,974-20,422 dofs, BEAT ahead in the middle of the range and
 metal-bem ahead at both ends.
 
-### Vectorising the CPU regular kernel
+### Vectorising the CPU assembly and field evaluation
 
 The CPU backend's assembly was one scalar `sincos` and a handful of FMAs per
-quadrature-point pair, and the regular (non-touching) element pairs were
-73-89 % of it. Since 2026-09-30 those pairs are integrated by a kernel that
-batches trial elements in a structure-of-arrays layout and leaves the
-vectorisation to LLVM (`@simd`, no SIMD package). **This is a HornLab-local
-change to the vendored engine**; `VENDORING.md` lists what differs.
+quadrature-point pair, and its field evaluation recomputed each source's
+density for every observation point. Since 2026-09-30 three stages are
+vectorised: the regular (non-touching) element pairs, the singular Duffy
+corrections of the fused Burton-Miller path, and field evaluation. Each is a
+kernel that lays its data out as contiguous arrays and leaves the
+vectorisation to LLVM (`@simd`, no SIMD package), and each has its own switch
+(see *Tuning knobs*). **This is a HornLab-local change to the vendored
+engine**; `VENDORING.md` lists what differs. The same change is proposed
+upstream as JWSound/BEAT_Engine pull requests 17 and 19.
 
-Windows, Ryzen 7 5825U guest (Zen 3, AVX2, 12 threads), Float32, warm
-20-frequency sweep 400 Hz - 16 kHz, wavelength-driven quadrature, the full
-observation set a Waveguide Generator solve asks for:
+Windows, Ryzen 7 5825U guest (Zen 3, AVX2, 12 threads), Float32, warm solves
+through the Waveguide Generator application (wavelength-driven quadrature, the
+full observation set it asks for), same build with the three switches set to
+`scalar` and to `simd`, and BEMPP on the Intel OpenCL CPU runtime through the
+same application for scale:
 
-| case | scalar | vectorised | |
-|---|---:|---:|---|
-| 2,302 triangles, full 3D | 16.5 s | 8.3 s | 1.99x |
-| 584 triangles, `yz+xz` quarter | 6.1 s | 3.8 s | 1.61x |
-| 2,302 triangles, four-operator (`BLAB_BEAT_FUSED_BM=0`) | 25.1 s | 13.6 s | 1.85x |
-| 2,302 triangles, double precision | 19.2 s | 11.1 s | 1.73x |
-| 3,328 triangles, `yz+xz` quarter, 60 frequencies 1-12 kHz | 247.8 s | 108.5 s | 2.28x |
+| case | all scalar | vectorised | | BEMPP OpenCL |
+|---|---:|---:|---|---:|
+| 584 triangles, `yz+xz` quarter, 20 frequencies | 6.3 s | 1.35 s | 4.6x | 2.7-3.1 s |
+| 2,302 triangles, full 3D, 20 frequencies | 16.4 s | 4.05 s | 4.0x | 7.0-7.1 s |
+| 3,328 triangles, `yz+xz` quarter, 60 frequencies | 236-247 s | 48-55 s | 4.5x | 127-144 s |
 
-The regular pass itself is 4.1x (order 2) to 6.0x (order 4) faster. Radiated
-pressure moves by at most 7.5e-7 relative -- the two kernels differ in
-summation order and in their `sincos`, which is the size of the difference
-between a 1-thread and a 12-thread run of the scalar kernel.
+First solve in a fresh application, same cases: 7.2 s, 10.4 s and 55 s, where
+BEMPP OpenCL takes 18.6 s, 32.4 s and 144 s.
 
-What is left of the full-mesh sweep is 5.4 s assembly, 1.9 s field evaluation
-and 0.75 s LU. Of the assembly, roughly half is now the singular Duffy
-corrections, which are still scalar. **Only AVX2 was measured**: on another
-architecture run `julia -t auto --project=hornlab_beat_bem/julia
+By stage: the regular pass 4-6x (plus a transposed scatter, below), the
+singular pass 6.0-6.7x in Float32 and 3.1-3.3x in Float64, field evaluation
+10-11x in Float32 and about 5x in Float64.
+
+The kernels agree with the scalar ones to rounding, not bitwise. Radiated
+pressure moves by at most 7.5e-7 relative from the regular kernel. The field
+and singular sums have thousands of terms and move Float32 results by up to
+about 1e-5; checked against Float64, the vectorised field is closer to it
+than the scalar one at every frequency tried, and the singular pass is too.
+
+Two further changes came out of profiling the result:
+
+- **Scatter.** Once the regular kernel was vectorised, writing its blocks into
+  the dense matrix was about half of the pass at quadrature order 2: a test
+  element's rows are strided in column-major storage. The pass writes the
+  transpose instead and transposes in place around it (0.073 -> 0.055 s on the
+  full mesh at order 2).
+- **Precompile workload.** The CPU bundle's workload solved only a
+  tetrahedron, which has no regular pairs, symmetry images, sphere grid or
+  order-4 rule, and it passed a `Dict` where the worker passes a
+  `JSON.Object`. It now also solves a request shaped like a real one, as the
+  worker receives it. A real first solve compiles 85 methods at run time
+  instead of 117 and starts about 1.2 s sooner.
+
+Considered and not built, with the measurement that decided it:
+multi-frequency assembly (the per-frequency `sincos` is only 10-28 % of the
+vectorised regular kernel, so there is little to share) and a low-frequency
+series for singular pairs (after vectorising, the singular pass is about
+0.014 s per frequency on the full mesh, so it could save 1-2 % of a sweep).
+
+**Only AVX2 was measured**: on another architecture run `julia -t auto
+--project=hornlab_beat_bem/julia
 hornlab_beat_bem/julia/scripts/benchmark_cpu_regular_kernel.jl --mesh <mesh>`,
 which prints both timings and the vector width LLVM chose.
 
@@ -891,6 +921,8 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
 | `BLAB_BEAT_CPU_REGULAR_KERNEL` | `simd` | CPU backend only. `scalar` integrates the regular element pairs with upstream's scalar kernel instead of the vectorised one: about half the sweep speed, and the reference the vectorised kernel is gated against. Each frequency's `native_diagnostics["cpu_regular_kernel"]` says which ran |
+| `BLAB_BEAT_CPU_SINGULAR_KERNEL` | `simd` | CPU backend, fused Burton-Miller only. `scalar` integrates touching pairs with upstream's scalar Duffy loop; reported as `cpu_singular_kernel` |
+| `BLAB_BEAT_CPU_FIELD_KERNEL` | `simd` | CPU backend only. `scalar` restores upstream's field-evaluation loop; reported as `cpu_field_kernel` |
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |

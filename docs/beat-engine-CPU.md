@@ -60,6 +60,11 @@ coincident points with a zero reciprocal radius, so the loop has no branch;
 elements, one scratch buffer per chunk of a colour group.
 
 `BLAB_BEAT_CPU_REGULAR_KERNEL=scalar` selects the scalar pair kernel instead.
+The fused path's singular corrections and CPU field evaluation are vectorised
+the same way, behind `BLAB_BEAT_CPU_SINGULAR_KERNEL` and
+`BLAB_BEAT_CPU_FIELD_KERNEL`; the regular pass writes the square operators
+transposed, with an in-place transpose around it, because a test element's
+rows are strided in column-major storage.
 The two agree to rounding, not bitwise; `tests/cpu_simd_kernel_tests.jl` gates
 them against each other for Float32 and Float64, regular order 2 and 4, and
 symmetry off, x, xy and ground. Singular, image-singular and near-pair
@@ -180,7 +185,7 @@ Example comparison:
 
 - `hornlab_beat_bem/julia/src/BeatEngineCpu.jl`: include hub for the CPU implementation files.
 - `hornlab_beat_bem/julia/src/BeatEngineCpuAssembly.jl`: CPU Galerkin operator assembly entry point.
-- `hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl`: vectorised regular-pair kernels and the `BLAB_BEAT_CPU_REGULAR_KERNEL` selector (HornLab-local).
+- `hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl`: vectorised regular-pair, singular-pair and field-evaluation kernels and their `BLAB_BEAT_CPU_*_KERNEL` selectors (HornLab-local).
 - `hornlab_beat_bem/julia/src/BeatEngineCpuField.jl`: CPU field-evaluation path.
 - `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl`: fused CPU Burton-Miller assembly for exterior solves.
 - `hornlab_beat_bem/julia/src/BeatEngineCpuSolve.jl`: CPU Burton-Miller dense solve through Julia's LAPACK/BLAS path.

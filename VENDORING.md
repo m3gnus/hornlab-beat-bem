@@ -328,8 +328,8 @@ upstream source path, so no rewrite was needed inside it.
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind --
-**except the five files named under *The vectorised CPU regular kernel* below**
-(four in `julia/src/`, and the CPU bundle), which carry local hooks since
+**except the six files named under *The vectorised CPU regular kernel* below**
+(five in `julia/src/`, and the CPU bundle), which carry local hooks since
 2026-09-30:
 
 | here | upstream |
@@ -373,13 +373,14 @@ GPL-3 section 5(a) notice for it. Nothing here exists upstream, on any branch.
 
 | file | status | change |
 |---|---|---|
-| `hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl` | **new, local** | the vectorised regular-pair kernels for the fused Burton-Miller and the four-operator CPU assembly, their structure-of-arrays trial data, a polynomial `sincos`, and the `BLAB_BEAT_CPU_REGULAR_KERNEL` selector |
+| `hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl` | **new, local** | the vectorised regular-pair kernels for the fused Burton-Miller and the four-operator CPU assembly (writing the square operators transposed, with an in-place transpose around the pass), the vectorised fused singular kernel (a Duffy rule type that dispatches `_beat_cpu_bm_pair_blocks` to it), the vectorised field evaluation, a polynomial `sincos`, and the three `BLAB_BEAT_CPU_*_KERNEL` selectors |
 | `hornlab_beat_bem/julia/src/BeatEngineCpu.jl` | modified | one added `include` of the file above |
-| `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl` | modified | `assemble_burton_miller_neumann_system_cpu` gains a `regular_kernel` keyword (**default `:scalar`**), routes the regular pass (base and symmetry images) to the new kernel when it is `:simd`, and returns the kernel name. The scalar code below the hook is byte-for-byte upstream's |
+| `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl` | modified | `assemble_burton_miller_neumann_system_cpu` gains a `regular_kernel` keyword (**default `:scalar`**), routes the regular pass (base and symmetry images) to the new kernel when it is `:simd`, and returns the kernel name. A second keyword, `singular_kernel` (default `:scalar`), converts the Duffy rules for the singular and image-singular stages so they dispatch to the vectorised pair kernel; the singular drivers themselves are not edited. The scalar code below the hook is byte-for-byte upstream's |
 | `hornlab_beat_bem/julia/src/BeatEngineCpuAssembly.jl` | modified | the same hook in `assemble_regular_galerkin_operators_cpu`, **default `:scalar`**, so a direct caller gets upstream's arithmetic |
 | `hornlab_beat_bem/julia/src/BeatEngineCore.jl` | modified | exports `beat_cpu_regular_kernel`; `assemble_regular_galerkin_operators` gains a `cpu_regular_kernel` keyword (default `:scalar`) that only its `backend == :cpu` branch reads |
-| `hornlab_beat_bem/julia_engine/BeatEngineCpuBundle/src/BeatEngineCpuBundle.jl` | modified | the precompile workload also solves the request as `JSON.parse` returns it (see below) |
-| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | modified (already local) | **the only place the kernel is selected**: reads `BLAB_BEAT_CPU_REGULAR_KERNEL` once per request, passes it to the CPU fused and four-operator assembly, and reports `cpu_regular_kernel` in each frequency's diagnostics |
+| `hornlab_beat_bem/julia/src/BeatEngineCpuField.jl` | modified | `evaluate_galerkin_field_cpu` gains a `kernel` keyword (default `:scalar`) that routes to the vectorised field evaluation |
+| `hornlab_beat_bem/julia_engine/BeatEngineCpuBundle/src/BeatEngineCpuBundle.jl` | modified | the precompile workload also solves the request as `JSON.parse` returns it, and a second, realistic request on a small quadrant mesh (see below) |
+| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | modified (already local) | **the only place the kernels are selected**: reads `BLAB_BEAT_CPU_REGULAR_KERNEL` once per request and passes it to the CPU fused and four-operator assembly, passes `BLAB_BEAT_CPU_SINGULAR_KERNEL` to the fused assembly and `BLAB_BEAT_CPU_FIELD_KERNEL` to CPU field evaluation, and reports `cpu_regular_kernel`, `cpu_singular_kernel` and `cpu_field_kernel` in each frequency's diagnostics |
 | `hornlab_beat_bem/julia/tests/cpu_simd_kernel_tests.jl` | **new, local** | gates the new kernel against the scalar one; `runtests.jl` stays verbatim and `.github/scripts/run_julia_suite.jl` runs both |
 | `hornlab_beat_bem/julia/scripts/benchmark_cpu_regular_kernel.jl` | **new, local** | times both kernels and reports whether LLVM vectorised the loop on the host |
 
@@ -465,12 +466,23 @@ first call with the parsed object 1.63 s -> 0.39 s, runtime compilations
 48 -> 27. The Cuda, Rocm and Metal bundles have the same gap and are not
 changed here; they could not be run on this host.
 
+A second gap came out of the same measurement with `--trace-compile` on a
+real Waveguide Generator request: the workload's tetrahedron has four
+mutually touching faces, so it never reaches regular pairs, symmetry images,
+image-singular pairs, the sphere grid, the diagonal cut, surface traces or the
+order-4 rule. The workload now also solves a request shaped like a real one,
+as the worker receives it, on a 3x3 plate in the x/y quadrant (`xy` symmetry,
+1 kHz and 20 kHz, `singular_order` 4). On a real two-frequency first solve,
+runtime compilations 117 -> 85, and the first solve is about 1.2 s quicker
+(quarter horn 1.68 -> 0.48 s, full horn 1.94 -> 0.76 s, against 0.19 and
+0.47 s warm). Bundle precompilation stays at about 25 s.
+
 ### Re-syncing with this in place
 
 `BeatEngineCpuSimd.jl` has no upstream counterpart, so a re-sync leaves it
 alone. The four hooked `src/` files and the CPU bundle are overwritten by a
-plain copy and the hooks must be re-applied; they are small on purpose (about twenty
-changed lines across the four `src/` files). If upstream changes the regular
+plain copy and the hooks must be re-applied; they are small on purpose (about forty
+changed lines across the five `src/` files). If upstream changes the regular
 pair mathematics, the local kernel must follow it --
 `tests/cpu_simd_kernel_tests.jl` fails when the two diverge.
 
