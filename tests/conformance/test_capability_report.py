@@ -67,6 +67,9 @@ EXPECTED_OPTIONAL_REQUEST_CONFIG_KEYS = [
     "solve_precision",
     "spherical_grid",
     "surface_traces_enabled",
+    "wavelength_kh_q1_max",
+    "wavelength_kh_q2_max",
+    "wavelength_mesh_stat",
 ]
 
 
@@ -118,7 +121,10 @@ def test_the_request_payload_shape_is_pinned_not_only_its_version_number():
         solve_precision="double",
         near_correction=True,
         surface_traces=True,
-        regular_quadrature_mode="fixed",
+        regular_quadrature_mode="wavelength",
+        wavelength_kh_q2_max=1.0,
+        wavelength_kh_q1_max=0.0,
+        wavelength_mesh_stat="p90",
         ground_plane=GroundPlane(enabled=True, axis="y"),
         observation=ObservationConfig(
             planes=["horizontal", "vertical", "diagonal"], sphere_grid=(2, 3)
@@ -351,6 +357,23 @@ def test_wavelength_quadrature_is_reported_as_a_cpu_only_mode():
         else:
             assert regular["supported_modes"] == ["fixed"]
             assert "wavelength" in regular["refused_modes"]
+
+
+def test_wavelength_overrides_are_reported_with_their_scope_and_defaults():
+    for backend in beat.BEAT_BACKENDS:
+        options = backend_capabilities(backend)["modes"]["exterior"]["quadrature"]["regular"]["wavelength_options"]
+        assert options["requires_mode"] == "wavelength"
+        assert options["default"] is None
+        assert options["engine_defaults"] == {
+            "wavelength_kh_q2_max": 2.0,
+            "wavelength_kh_q1_max": 0.0,
+            "wavelength_mesh_stat": "p90",
+        }
+        assert set(options["fields"]) == set(options["engine_defaults"])
+        assert options["mesh_stat_values"] == ["median", "p75", "p90", "max"]
+        assert options["supported"] is (backend == beat.BEAT_CPU)
+        if backend != beat.BEAT_CPU:
+            assert "CPU" in options["reason"]
 
 
 def test_the_source_contract_reports_one_unit_amplitude_tag():

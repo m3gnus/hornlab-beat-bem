@@ -10,6 +10,8 @@ persistent worker, that worker's turn) to be released by garbage collection.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -117,6 +119,84 @@ def test_complete_sweep_returns_every_requested_frequency(run, config):
     assert result.requested_frequency_count == 2
     assert result.is_partial is False
     assert session.closed == 1
+
+
+@pytest.mark.parametrize("mode", [None, "wavelength"])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"wavelength_kh_q2_max": 1.0},
+        {"wavelength_kh_q1_max": 0.0},
+        {"wavelength_mesh_stat": "max"},
+        {
+            "wavelength_kh_q2_max": 1.0,
+            "wavelength_kh_q1_max": 0.25,
+            "wavelength_mesh_stat": "p75",
+        },
+    ],
+)
+def test_wavelength_overrides_reach_the_solver_request(mode, overrides):
+    config = SolveConfig(regular_quadrature_mode=mode, **overrides)
+    solver_config = sweep._request_payload(
+        "mesh.msh", np.asarray([1000.0]), config, (0.0, 0.0, 0.0)
+    )["config"]
+    fields = {"wavelength_kh_q2_max", "wavelength_kh_q1_max", "wavelength_mesh_stat"}
+    assert {key: solver_config[key] for key in fields if key in solver_config} == overrides
+    if mode is None:
+        assert "regular_quadrature_mode" not in solver_config
+    else:
+        assert solver_config["regular_quadrature_mode"] == mode
+
+
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "rocm", "metal"])
+@pytest.mark.parametrize("mode", [None, "fixed", "wavelength"])
+def test_unset_wavelength_overrides_leave_request_unchanged(backend, mode):
+    config = SolveConfig(beat_backend=backend, regular_quadrature_mode=mode)
+    assert config.wavelength_kh_q2_max is None
+    assert config.wavelength_kh_q1_max is None
+    assert config.wavelength_mesh_stat is None
+    actual = sweep._request_payload("mesh.msh", np.asarray([1000.0]), config, (0.0, 0.0, 0.0))
+    # The pre-override payload, including key order: compare serialized bytes
+    # so adding nulls or materialising an engine default cannot pass unnoticed.
+    expected = {
+        "schema_version": 2,
+        "config": {
+            "mesh_file": "mesh.msh",
+            "scale_factor": 1.0,
+            "meshes": [{
+                "name": "mesh", "file": "mesh.msh", "scale_factor": 1.0,
+                "translation_m": [0.0, 0.0, 0.0],
+            }],
+            "distance": 2.0,
+            "axial_offset": 0.0,
+            "step_size": 5.0,
+            "min_angle": 0.0,
+            "max_angle": 180.0,
+            "freq_min": 1000.0,
+            "freq_max": 1000.0,
+            "freq_count": 1,
+            "tag_throat": 2,
+            "rho": 1.2041,
+            "sound_speed": 343.0,
+            "symmetry": "off",
+            "flat_target_normalization_enabled": False,
+            "spherical_sampling_enabled": False,
+            "source_motion": "normal",
+            "quadrature_order": 4,
+            "singular_order": 4,
+        },
+        "frequencies_hz": [1000.0],
+    }
+    if mode is not None:
+        expected["config"]["regular_quadrature_mode"] = mode
+    assert json.dumps(actual).encode() == json.dumps(expected).encode()
+    explicit_none = SolveConfig(
+        beat_backend=backend, regular_quadrature_mode=mode,
+        wavelength_kh_q2_max=None, wavelength_kh_q1_max=None, wavelength_mesh_stat=None,
+    )
+    assert sweep._request_payload(
+        "mesh.msh", np.asarray([1000.0]), explicit_none, (0.0, 0.0, 0.0)
+    ) == actual
 
 
 def test_completion_without_any_result_is_refused(run, config):

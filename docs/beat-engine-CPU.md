@@ -71,6 +71,47 @@ Default CPU thresholds:
 
 The selected order is cached per frequency order. The CPU path reuses per-order regular rules, identity/mass matrices, and field-evaluation caches. Singular quadrature remains controlled by `singular_order` and is not reduced by the wavelength selector.
 
+### Python SolveConfig overrides
+
+This package exposes `wavelength_kh_q2_max`, `wavelength_kh_q1_max` and
+`wavelength_mesh_stat` as optional `SolveConfig` fields. Each defaults to
+`None`, which omits the request key and preserves the engine default and
+request bytes. They require the CPU backend and resolved
+`regular_quadrature_mode="wavelength"` (the CPU default when the mode is
+`None`); setting any with fixed mode or another backend raises `ValueError`.
+
+The q2 cutoff must be finite and > 0, the q1 cutoff finite and >= 0, and q2
+must exceed q1 when both are set. The mesh statistic must be one of
+`"median"`, `"p75"`, `"p90"`, `"max"`. When only one cutoff is set, the
+engine uses the default for the other and still requires q2 > q1.
+
+On Windows, a CPU sweep of a 2,302-triangle horn mesh at 20 logarithmic
+frequencies from 400 to 16,000 Hz measured these differences between order 2
+and fixed order 4. Here `h = sqrt(p90 element area)` and the metric is
+relative L2 of the complex polar pressures:
+
+| `k*h` | order-2 error against fixed order 4 |
+|---|---:|
+| < 0.85 | 0.1–0.4% |
+| 0.99 | 1.3% |
+| 1.20 | 2.3% |
+| 1.46 | 6.1% |
+| 1.78 | 15.7% |
+
+Lowering the q2 threshold to about 1.0 bounds the order-2 error near 1% for
+this measurement, at the cost of running more frequencies at order 4:
+
+```python
+from hornlab_beat_bem import SolveConfig
+
+config = SolveConfig(beat_backend="cpu", wavelength_kh_q2_max=1.0)
+```
+
+These results describe this horn and band; the `sample.msh` validation below
+uses a different fixture and does not establish the same error for every mesh.
+
+### Result diagnostics
+
 Result diagnostics include the selected mode, selected order, mesh statistic, element length, and `k*h` value:
 
 - `regular_quadrature_mode`

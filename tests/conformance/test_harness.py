@@ -109,9 +109,12 @@ def test_the_second_refusal_spelling_is_collected_and_exercised():
     metrics = _check_declared_refusals()
     _assert_refusal_counts_add_up(metrics)
     assert "metal.quadrature.near_pair" in metrics["refusals_verified"]
+    assert "metal.quadrature.regular.wavelength_options" in metrics["refusals_verified"]
     assert "metal.quadrature.near_pair.refused" not in metrics["refusals_declared"]
     # Every API-absence entry is excused rather than silently unexercised.
-    for path in set(unsupported) - {"quadrature.near_pair"}:
+    for path in set(unsupported) - {
+        "quadrature.near_pair", "quadrature.regular.wavelength_options"
+    }:
         assert path in UNEXERCISABLE_REFUSALS
         assert f"metal.{path}" in metrics["refusals_excused"]
 

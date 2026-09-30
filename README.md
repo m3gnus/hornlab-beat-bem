@@ -219,6 +219,52 @@ Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
 `xy` (quarter, x >= 0 and y >= 0). A y-only `xz` half domain is not
 representable and is rejected by `reject_unsupported_native_symmetry`.
 
+### CPU wavelength quadrature
+
+`SolveConfig.regular_quadrature_mode=None` uses the engine default:
+`"wavelength"` on CPU and `"fixed"` on accelerators. Fixed mode uses
+`quadrature_order` at every frequency. Wavelength mode selects order 1 up to
+the q1 cutoff, order 2 up to the q2 cutoff, and the base `quadrature_order`
+(default 4) above it, using `k*h = (2*pi*f/sound_speed)*sqrt(area statistic)`.
+Singular-pair quadrature remains controlled by `singular_order`.
+
+Three optional `SolveConfig` fields control the CPU wavelength selector:
+
+| field | accepted values | engine default when `None` |
+|---|---|---|
+| `wavelength_kh_q2_max` | finite, > 0; greater than q1 when both are set | `2.0` |
+| `wavelength_kh_q1_max` | finite, >= 0 | `0.0` (order 1 disabled) |
+| `wavelength_mesh_stat` | `"median"`, `"p75"`, `"p90"`, `"max"` | `"p90"` |
+
+All three default to `None`, preserving the engine defaults and the request
+bytes when unset. Setting any of them on an accelerator or with resolved mode
+`"fixed"` raises `ValueError`. If only one cutoff is set, the engine uses its
+default for the other and still requires q2 > q1.
+
+Measured on Windows with the CPU backend, a 2,302-triangle horn mesh and
+20 logarithmic frequencies from 400 to 16,000 Hz, order 2 differed from fixed
+order 4 as follows. Here `h = sqrt(p90 element area)`; error is relative L2
+of the **complex polar pressures**, rather than SPL.
+
+| `k*h` | order-2 error against fixed order 4 |
+|---|---:|
+| < 0.85 | 0.1–0.4% |
+| 0.99 | 1.3% |
+| 1.20 | 2.3% |
+| 1.46 | 6.1% |
+| 1.78 | 15.7% |
+
+Lowering `wavelength_kh_q2_max` to about `1.0` bounds the order-2 error near
+1% on this measurement, at the cost of running more frequencies at order 4:
+
+```python
+config = beat.SolveConfig(beat_backend="cpu", wavelength_kh_q2_max=1.0)
+```
+
+This is a measured tradeoff for that mesh and band, not an accuracy guarantee
+for every geometry. See [CPU quadrature](docs/beat-engine-CPU.md) for the
+selector and diagnostics.
+
 ### Asking what this package supports
 
 ```python

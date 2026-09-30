@@ -483,6 +483,21 @@ def _verify_declared_refusals(
         config(regular_quadrature_mode=mode)
         supported.append(f"regular_quadrature_mode_constructs:{mode}")
 
+    options = regular["wavelength_options"]
+    for field_name in options["fields"]:
+        value = options["engine_defaults"][field_name]
+        if options["supported"]:
+            config(**{field_name: value})
+            supported.append(field_name)
+        else:
+            _assert_raises(
+                f"{backend}: {field_name}={value!r}",
+                ValueError,
+                lambda field_name=field_name, value=value: config(**{field_name: value}),
+            )
+    if not options["supported"]:
+        verified.add("quadrature.regular.wavelength_options")
+
     # -- near-singular correction, on the backends that have it
     near = exterior["quadrature"]["near_pair"]
     if near["supported"]:

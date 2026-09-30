@@ -208,6 +208,82 @@ def test_solve_precision_is_cpu_only():
         SolveConfig(solve_precision="extended")
 
 
+@pytest.mark.parametrize("mode", [None, "wavelength"])
+@pytest.mark.parametrize("stat", ["median", "p75", "p90", "max"])
+def test_wavelength_overrides_accept_cpu_default_and_explicit_mode(mode, stat):
+    config = SolveConfig(
+        regular_quadrature_mode=mode,
+        wavelength_kh_q2_max=1.0,
+        wavelength_kh_q1_max=0.0,
+        wavelength_mesh_stat=stat,
+    )
+    assert config.wavelength_kh_q2_max == 1.0
+    assert config.wavelength_kh_q1_max == 0.0
+    assert config.wavelength_mesh_stat == stat
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("wavelength_kh_q2_max", 1), ("wavelength_kh_q1_max", 0.25)],
+)
+def test_wavelength_thresholds_can_be_set_independently(field_name, value):
+    config = SolveConfig(**{field_name: value})
+    assert getattr(config, field_name) == value
+    assert isinstance(getattr(config, field_name), float)
+
+
+@pytest.mark.parametrize("field_name", ["wavelength_kh_q2_max", "wavelength_kh_q1_max"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), -float("inf"), "bad", 1j, []])
+def test_wavelength_thresholds_reject_invalid_values(field_name, value):
+    with pytest.raises(ValueError, match=f"{field_name} must be finite"):
+        SolveConfig(**{field_name: value})
+
+
+def test_wavelength_q2_threshold_must_be_positive():
+    with pytest.raises(ValueError, match="wavelength_kh_q2_max must be finite and greater than zero"):
+        SolveConfig(wavelength_kh_q2_max=0.0)
+
+
+@pytest.mark.parametrize("q1", [1.0, 1.5])
+def test_wavelength_q2_threshold_must_exceed_explicit_q1(q1):
+    with pytest.raises(ValueError, match="wavelength_kh_q2_max must be greater than wavelength_kh_q1_max"):
+        SolveConfig(wavelength_kh_q2_max=1.0, wavelength_kh_q1_max=q1)
+
+
+@pytest.mark.parametrize("stat", ["p50", "P90", "", 90, []])
+def test_wavelength_mesh_stat_rejects_unknown_values(stat):
+    with pytest.raises(ValueError, match="wavelength_mesh_stat must be"):
+        SolveConfig(wavelength_mesh_stat=stat)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("wavelength_kh_q2_max", 1.0),
+        ("wavelength_kh_q1_max", 0.0),
+        ("wavelength_mesh_stat", "p90"),
+    ],
+)
+def test_wavelength_overrides_are_rejected_in_fixed_mode(field_name, value):
+    with pytest.raises(ValueError, match=f"{field_name} requires regular_quadrature_mode='wavelength'"):
+        SolveConfig(regular_quadrature_mode="fixed", **{field_name: value})
+
+
+@pytest.mark.parametrize("backend", ["cuda", "rocm", "metal"])
+@pytest.mark.parametrize("mode", [None, "fixed", "wavelength"])
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("wavelength_kh_q2_max", 1.0),
+        ("wavelength_kh_q1_max", 0.0),
+        ("wavelength_mesh_stat", "p90"),
+    ],
+)
+def test_wavelength_overrides_are_cpu_only(backend, mode, field_name, value):
+    with pytest.raises(ValueError, match=f"{field_name} is only available on the BEAT CPU backend"):
+        SolveConfig(beat_backend=backend, regular_quadrature_mode=mode, **{field_name: value})
+
+
 def test_singular_order_above_four_requires_double_precision():
     # Measured on the ASRO quarter mesh: order 4 is converged to 0.0016 dB rms
     # in Float64, while in Float32 order 8 is 0.031 dB *worse* than its own

@@ -189,6 +189,12 @@ def _request_payload(
         }
     if config.regular_quadrature_mode is not None:
         solver_config["regular_quadrature_mode"] = config.regular_quadrature_mode
+    for field_name in (
+        "wavelength_kh_q2_max", "wavelength_kh_q1_max", "wavelength_mesh_stat"
+    ):
+        value = getattr(config, field_name)
+        if value is not None:
+            solver_config[field_name] = value
     if config.surface_traces:
         solver_config["surface_traces_enabled"] = True
     if config.solve_precision != "single":

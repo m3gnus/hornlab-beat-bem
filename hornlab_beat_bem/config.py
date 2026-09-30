@@ -387,6 +387,12 @@ class SolveConfig:
     singular_order: int = 4
     #: None = solver default ("wavelength" on cpu, "fixed" on accelerators).
     regular_quadrature_mode: Literal["fixed", "wavelength"] | None = None
+    #: CPU wavelength selector overrides. None leaves the engine default and
+    #: omits the key from the request: q2 cutoff 2.0, q1 disabled at 0.0,
+    #: and p90 element area for h = sqrt(area statistic).
+    wavelength_kh_q2_max: float | None = None
+    wavelength_kh_q1_max: float | None = None
+    wavelength_mesh_stat: Literal["median", "p75", "p90", "max"] | None = None
 
     #: Near-singular correction. Disjoint element pairs closer than
     #: ``near_correction_cutoff`` times their combined circumradius are
@@ -512,6 +518,45 @@ class SolveConfig:
             raise ValueError("singular_order must be between 1 and 12")
         if self.regular_quadrature_mode not in {None, "fixed", "wavelength"}:
             raise ValueError("regular_quadrature_mode must be None, 'fixed', or 'wavelength'")
+        for field_name in ("wavelength_kh_q2_max", "wavelength_kh_q1_max"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                value = float("nan")
+            if field_name == "wavelength_kh_q2_max":
+                valid = isfinite(value) and value > 0.0
+                bound = "greater than zero"
+            else:
+                valid = isfinite(value) and value >= 0.0
+                bound = "non-negative"
+            if not valid:
+                raise ValueError(f"{field_name} must be finite and {bound}")
+            setattr(self, field_name, value)
+        if (
+            self.wavelength_kh_q2_max is not None
+            and self.wavelength_kh_q1_max is not None
+            and self.wavelength_kh_q2_max <= self.wavelength_kh_q1_max
+        ):
+            raise ValueError(
+                "wavelength_kh_q2_max must be greater than wavelength_kh_q1_max"
+            )
+        if self.wavelength_mesh_stat not in (None, "median", "p75", "p90", "max"):
+            raise ValueError("wavelength_mesh_stat must be None, 'median', 'p75', 'p90', or 'max'")
+        mode = self.regular_quadrature_mode or (
+            "wavelength" if self.beat_backend == BEAT_CPU else "fixed"
+        )
+        for field_name in (
+            "wavelength_kh_q2_max", "wavelength_kh_q1_max", "wavelength_mesh_stat"
+        ):
+            if getattr(self, field_name) is None:
+                continue
+            if self.beat_backend != BEAT_CPU:
+                raise ValueError(f"{field_name} is only available on the BEAT CPU backend")
+            if mode != "wavelength":
+                raise ValueError(f"{field_name} requires regular_quadrature_mode='wavelength'")
         if not isinstance(self.near_correction, bool):
             raise ValueError("near_correction must be a bool")
         try:

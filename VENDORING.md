@@ -512,6 +512,13 @@ One further edit was necessary rather than cosmetic: a PowerShell example in
 replaced with a placeholder and the two backslash-style source paths in the
 same block are rewritten like the rest.
 
+The CPU page additionally carries a local "Python SolveConfig overrides"
+section (2026-09-30): this package exposes the driver's existing wavelength
+cutoffs and mesh statistic through Python, and documents the measured horn
+error against fixed order 4. A "Result diagnostics" heading separates that
+addition from the upstream diagnostics list. No Julia file changes for this
+API addition; unset options retain the engine defaults and request bytes.
+
 The prose is otherwise unchanged, so it still describes the Boundary Lab
 application in places — `blab` CLI commands, `.blab.json` projects, solver
 selection in application preferences. Those describe upstream, not this package.

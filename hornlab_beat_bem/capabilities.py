@@ -408,6 +408,24 @@ def _quadrature(backend: str) -> dict[str, Any]:
             "mode_field": "regular_quadrature_mode",
             "supported_modes": regular_modes,
             "default_mode": "wavelength" if backend == BEAT_CPU else "fixed",
+            "wavelength_options": {
+                "supported": backend == BEAT_CPU,
+                "requires_mode": "wavelength",
+                "fields": [
+                    "wavelength_kh_q2_max", "wavelength_kh_q1_max", "wavelength_mesh_stat"
+                ],
+                "default": None,
+                "engine_defaults": {
+                    "wavelength_kh_q2_max": 2.0,
+                    "wavelength_kh_q1_max": 0.0,
+                    "wavelength_mesh_stat": "p90",
+                },
+                "mesh_stat_values": ["median", "p75", "p90", "max"],
+                "threshold_constraints": (
+                    "q2 must be finite and greater than zero; q1 must be finite "
+                    "and non-negative; q2 must exceed q1 when both are set"
+                ),
+            },
         },
         "singular": {
             "field": "singular_order",
@@ -425,6 +443,10 @@ def _quadrature(backend: str) -> dict[str, Any]:
         },
     }
     if backend != BEAT_CPU:
+        entry["regular"]["wavelength_options"]["reason"] = (
+            "wavelength selector overrides are only available on the BEAT CPU "
+            "backend; SolveConfig refuses them at construction"
+        )
         entry["regular"]["refused_modes"] = {
             "wavelength": (
                 "wavelength-driven regular quadrature is implemented for the "
