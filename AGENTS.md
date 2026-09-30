@@ -28,8 +28,8 @@ kernel.** The owner decided that SIMD-vectorising the CPU assembly belongs in
 this package rather than upstream, because BEAT is not only used by Boundary
 Lab. That decision contradicts the rule above as it stood, so it is recorded
 here instead of being made silently. The kernel itself is a new local file,
-`src/BeatEngineCpuSimd.jl`; four upstream files carry small hooks that select
-it (`BeatEngineCpu.jl`, `BeatEngineCpuBurtonMiller.jl`,
+`src/BeatEngineCpuSimd.jl`; four upstream files carry small hooks that make
+it selectable (`BeatEngineCpu.jl`, `BeatEngineCpuBurtonMiller.jl`,
 `BeatEngineCpuAssembly.jl`, `BeatEngineCore.jl`), and the CPU bundle's
 precompile workload has one added call. `VENDORING.md`, *The vectorised CPU
 regular kernel*, lists every changed line's purpose. The rule still holds for

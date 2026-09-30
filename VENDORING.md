@@ -375,11 +375,11 @@ GPL-3 section 5(a) notice for it. Nothing here exists upstream, on any branch.
 |---|---|---|
 | `hornlab_beat_bem/julia/src/BeatEngineCpuSimd.jl` | **new, local** | the vectorised regular-pair kernels for the fused Burton-Miller and the four-operator CPU assembly, their structure-of-arrays trial data, a polynomial `sincos`, and the `BLAB_BEAT_CPU_REGULAR_KERNEL` selector |
 | `hornlab_beat_bem/julia/src/BeatEngineCpu.jl` | modified | one added `include` of the file above |
-| `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl` | modified | `assemble_burton_miller_neumann_system_cpu` gains a `regular_kernel` keyword (default: the selector), routes the regular pass (base and symmetry images) to the new kernel when it is `:simd`, and returns the kernel name. The scalar code below the hook is byte-for-byte upstream's |
+| `hornlab_beat_bem/julia/src/BeatEngineCpuBurtonMiller.jl` | modified | `assemble_burton_miller_neumann_system_cpu` gains a `regular_kernel` keyword (**default `:scalar`**), routes the regular pass (base and symmetry images) to the new kernel when it is `:simd`, and returns the kernel name. The scalar code below the hook is byte-for-byte upstream's |
 | `hornlab_beat_bem/julia/src/BeatEngineCpuAssembly.jl` | modified | the same hook in `assemble_regular_galerkin_operators_cpu`, **default `:scalar`**, so a direct caller gets upstream's arithmetic |
-| `hornlab_beat_bem/julia/src/BeatEngineCore.jl` | modified | exports `beat_cpu_regular_kernel`; the `backend == :cpu` branch of `assemble_regular_galerkin_operators` passes the selector |
+| `hornlab_beat_bem/julia/src/BeatEngineCore.jl` | modified | exports `beat_cpu_regular_kernel`; `assemble_regular_galerkin_operators` gains a `cpu_regular_kernel` keyword (default `:scalar`) that only its `backend == :cpu` branch reads |
 | `hornlab_beat_bem/julia_engine/BeatEngineCpuBundle/src/BeatEngineCpuBundle.jl` | modified | the precompile workload also solves the request as `JSON.parse` returns it (see below) |
-| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | modified (already local) | reports `cpu_regular_kernel` in each frequency's diagnostics |
+| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | modified (already local) | **the only place the kernel is selected**: reads `BLAB_BEAT_CPU_REGULAR_KERNEL` once per request, passes it to the CPU fused and four-operator assembly, and reports `cpu_regular_kernel` in each frequency's diagnostics |
 | `hornlab_beat_bem/julia/tests/cpu_simd_kernel_tests.jl` | **new, local** | gates the new kernel against the scalar one; `runtests.jl` stays verbatim and `.github/scripts/run_julia_suite.jl` runs both |
 | `hornlab_beat_bem/julia/scripts/benchmark_cpu_regular_kernel.jl` | **new, local** | times both kernels and reports whether LLVM vectorised the loop on the host |
 
@@ -390,10 +390,13 @@ singular, image-singular and near-pair correction, and
 too -- at which point the CPU backend's arithmetic is upstream's again. That is
 the identity check this package still offers.
 
-**What is deliberately not changed.** No GPU path: the Metal and ROCm
-host-staged assemblies call `assemble_regular_galerkin_operators_cpu` directly
-and therefore keep the scalar kernel, as does the condensed coupled fork in
-`BeatEngineCondensedAssembly.jl`, which has its own copy of the loop. The
+**What is deliberately not changed.** Every library function defaults to the
+scalar kernel and only the CPU driver opts in, so nothing else can reach the new
+code: the CUDA, ROCm and Metal paths (including the Metal and ROCm host-staged
+assemblies, which call `assemble_regular_galerkin_operators_cpu` directly), the
+CPU references the accelerator validators compare against, the coupled
+solvers, and the condensed fork in `BeatEngineCondensedAssembly.jl` are bit for
+bit what they were. The
 singular Duffy kernels stay scalar. No dependency was added: `Project.toml` and
 `Manifest.toml` are untouched in every backend project.
 
@@ -466,7 +469,7 @@ changed here; they could not be run on this host.
 
 `BeatEngineCpuSimd.jl` has no upstream counterpart, so a re-sync leaves it
 alone. The four hooked `src/` files and the CPU bundle are overwritten by a
-plain copy and the hooks must be re-applied; they are small on purpose (19
+plain copy and the hooks must be re-applied; they are small on purpose (about twenty
 changed lines across the four `src/` files). If upstream changes the regular
 pair mathematics, the local kernel must follow it --
 `tests/cpu_simd_kernel_tests.jl` fails when the two diverge.

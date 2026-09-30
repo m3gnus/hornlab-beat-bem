@@ -1227,6 +1227,8 @@ function assemble_regular_galerkin_operators(
     rocm_assembly_mode=nothing,
     metal_assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
+    # Read by the CPU branch only; no accelerator backend sees it.
+    cpu_regular_kernel::Symbol=:scalar,
 ) where {T<:AbstractFloat}
     if backend == :cpu
         return assemble_regular_galerkin_operators_cpu(
@@ -1245,7 +1247,7 @@ function assemble_regular_galerkin_operators(
             near_correction_cache=near_correction_cache,
             image_near_correction_cache=image_near_correction_cache,
             symmetry_mode=symmetry_mode,
-            regular_kernel=beat_cpu_regular_kernel(),
+            regular_kernel=cpu_regular_kernel,
         )
     end
 

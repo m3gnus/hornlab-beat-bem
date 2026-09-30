@@ -63,10 +63,10 @@ elements, one scratch buffer per chunk of a colour group.
 The two agree to rounding, not bitwise; `tests/cpu_simd_kernel_tests.jl` gates
 them against each other for Float32 and Float64, regular order 2 and 4, and
 symmetry off, x, xy and ground. Singular, image-singular and near-pair
-corrections always use the scalar Duffy kernels. A direct call to
-`assemble_regular_galerkin_operators_cpu` defaults to the scalar kernel, which
-is what the Metal and ROCm host-staged paths and their validators rely on; the
-CPU backend passes the selected kernel explicitly.
+corrections always use the scalar Duffy kernels. Every assembly function and
+the backend dispatcher default to the scalar kernel, which is what the Metal and
+ROCm host-staged paths, the accelerator validators' CPU references and the
+coupled solvers get; only the CPU driver passes the selected kernel.
 
 ## Dynamic Quadrature
 

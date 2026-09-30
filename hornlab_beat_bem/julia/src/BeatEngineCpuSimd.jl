@@ -10,10 +10,11 @@
 # phase, i.e. by about k*r*eps(T) in sin and cos -- the resolution Float32
 # phase has in either kernel, not an error of this one.
 #
-# assemble_burton_miller_neumann_system_cpu defaults to the selected kernel;
-# assemble_regular_galerkin_operators_cpu defaults to :scalar on purpose, so
-# the Metal/ROCm host-staged callers keep upstream's arithmetic, and the CPU
-# backend dispatcher passes the selection explicitly.
+# Nothing selects these kernels by default. Both CPU assembly functions and the
+# backend dispatcher default to :scalar, so every caller that does not ask --
+# the Metal and ROCm host-staged paths, the accelerator validators' CPU
+# references, the coupled solvers -- keeps upstream's arithmetic bit for bit.
+# The CPU driver opts in by passing beat_cpu_regular_kernel().
 
 const _BEAT_CPU_REGULAR_BLOCK_SIZE = 256
 

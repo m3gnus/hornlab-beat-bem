@@ -99,6 +99,12 @@ end
                         mesh, p1, dp0, q, k, rule; kwargs..., cpu_cache, regular_kernel=:simd,
                     )
                     @test simd.regular_kernel === :simd
+                    unselected = withenv("BLAB_BEAT_CPU_REGULAR_KERNEL" => "simd") do
+                        assemble_burton_miller_neumann_system_cpu(mesh, p1, dp0, q, k, rule; kwargs..., cpu_cache)
+                    end
+                    @test unselected.regular_kernel === :scalar
+                    @test unselected.matrix == scalar.matrix
+                    @test unselected.rhs == scalar.rhs
                     @test scalar.regular_kernel === :scalar
                     @test simd.drive_count == 3
                     _beat_cpu_simd_test_entrywise(simd.matrix, scalar.matrix, tol)
@@ -229,9 +235,15 @@ end
                     @test getproperty(default, name) == getproperty(scalar, name)
                     _beat_cpu_simd_test_entrywise(getproperty(simd, name), getproperty(scalar, name), tol)
                 end
+                # The environment selects nothing by itself: the dispatcher is
+                # scalar too unless a CPU entry point passes the kernel.
                 dispatched = assemble_regular_galerkin_operators(mesh, p1, dp0, k, rule; kwargs..., backend=:cpu)
+                opted_in = assemble_regular_galerkin_operators(
+                    mesh, p1, dp0, k, rule; kwargs..., backend=:cpu, cpu_regular_kernel=:simd,
+                )
                 for name in (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
-                    @test getproperty(dispatched, name) == getproperty(simd, name)
+                    @test getproperty(dispatched, name) == getproperty(scalar, name)
+                    @test getproperty(opted_in, name) == getproperty(simd, name)
                 end
             end
         end

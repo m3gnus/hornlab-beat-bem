@@ -290,7 +290,7 @@ function assemble_burton_miller_neumann_system_cpu(
     singular_cache=nothing,
     cpu_cache=nothing,
     symmetry_mode::Symbol=:off,
-    regular_kernel::Symbol=beat_cpu_regular_kernel(),
+    regular_kernel::Symbol=:scalar,
 ) where {T<:AbstractFloat}
     regular_kernel = _beat_cpu_validated_regular_kernel(regular_kernel)
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
