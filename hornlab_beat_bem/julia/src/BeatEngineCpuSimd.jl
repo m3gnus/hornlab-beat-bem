@@ -80,6 +80,8 @@ struct BeatCpuRegularSoA{T<:AbstractFloat}
     nz::Vector{T}
     area::Vector{T}
     curl::Matrix{T}
+    p1_dofs::Matrix{Int}
+    dp0_dofs::Vector{Int}
     basis::Vector{SVector{3,T}}
     weights::Vector{T}
 end
@@ -101,6 +103,8 @@ function BeatCpuRegularSoA(
     nz = zeros(T, n)
     area = zeros(T, n)
     curl = zeros(T, n, 9)
+    p1_dofs = zeros(Int, n, 3)
+    dp0_dofs = zeros(Int, n)
     for (j, element_index) in enumerate(trial_indices)
         element = elements[element_index]
         for q in 1:nq
@@ -108,11 +112,13 @@ function BeatCpuRegularSoA(
         end
         nx[j], ny[j], nz[j] = element.normal
         area[j] = element.area
+        p1_dofs[j, 1], p1_dofs[j, 2], p1_dofs[j, 3] = element.p1_dofs
+        dp0_dofs[j] = element.dp0_dof
         for col in 1:3, d in 1:3
             curl[j, 3 * (col - 1) + d] = element.curls[col][d]
         end
     end
-    return BeatCpuRegularSoA{T}(trial_indices, n, px, py, pz, nx, ny, nz, area, curl, basis, weights)
+    return BeatCpuRegularSoA{T}(trial_indices, n, px, py, pz, nx, ny, nz, area, curl, p1_dofs, dp0_dofs, basis, weights)
 end
 
 struct BeatCpuRegularScratch{T}
@@ -228,18 +234,26 @@ function _beat_cpu_bm_regular_test_simd!(
                 lim[j, idx] = muladd(cp, cr * cim[j] + ci * cre[j], lim[j, idx])
             end
         end
-        for j in 1:m
-            jac[j] == zero(T) && continue
-            trial_data = trial_elements[ssoa.indices[off + j]]
-            for row in 1:3
-                grow = test_data.p1_dofs[row]
-                coefficient = Complex{T}(rre[j, row], rim[j, row])
-                for drive in 1:drive_count
-                    rhs[grow, drive] += coefficient * q_neumann[trial_data.dp0_dof, drive]
+        # One test row at a time: its right-hand entries are a sum over the
+        # block, written once, and its matrix entries all land in one column
+        # of the transposed storage (see _beat_cpu_transpose_square!).
+        trial_p1 = ssoa.p1_dofs
+        trial_dp0 = ssoa.dp0_dofs
+        for row in 1:3
+            grow = test_data.p1_dofs[row]
+            for drive in 1:drive_count
+                total = zero(Complex{T})
+                for j in 1:m
+                    jac[j] == zero(T) && continue
+                    total += Complex{T}(rre[j, row], rim[j, row]) * q_neumann[trial_dp0[off + j], drive]
                 end
+                rhs[grow, drive] += total
+            end
+            for j in 1:m
+                jac[j] == zero(T) && continue
                 for col in 1:3
                     idx = row + 3 * (col - 1)
-                    lhs[grow, trial_data.p1_dofs[col]] += Complex{T}(lre[j, idx], lim[j, idx])
+                    lhs[trial_p1[off + j, col], grow] += Complex{T}(lre[j, idx], lim[j, idx])
                 end
             end
         end
@@ -371,23 +385,48 @@ function _beat_cpu_accumulate_regular_test_simd!(
                 hbim[j, idx] = cp * cim[j] - kn[j] * hbim[j, idx]
             end
         end
-        for j in 1:m
-            jac[j] == zero(T) && continue
-            trial_data = trial_elements[ssoa.indices[off + j]]
-            for row in 1:3
-                grow = test_data.p1_dofs[row]
-                single_layer[grow, trial_data.dp0_dof] += Complex{T}(rre[j, row], rim[j, row])
-                adjoint_double_layer[grow, trial_data.dp0_dof] += Complex{T}(adjre[j, row], adjim[j, row])
+        trial_p1 = ssoa.p1_dofs
+        trial_dp0 = ssoa.dp0_dofs
+        for row in 1:3
+            grow = test_data.p1_dofs[row]
+            for j in 1:m
+                jac[j] == zero(T) && continue
+                dp0 = trial_dp0[off + j]
+                single_layer[grow, dp0] += Complex{T}(rre[j, row], rim[j, row])
+                adjoint_double_layer[grow, dp0] += Complex{T}(adjre[j, row], adjim[j, row])
                 for col in 1:3
                     idx = row + 3 * (col - 1)
-                    gcol = trial_data.p1_dofs[col]
-                    double_layer[grow, gcol] += Complex{T}(lre[j, idx], lim[j, idx])
-                    hypersingular[grow, gcol] += Complex{T}(hbre[j, idx], hbim[j, idx])
+                    gcol = trial_p1[off + j, col]
+                    # Transposed storage; see _beat_cpu_transpose_square!.
+                    double_layer[gcol, grow] += Complex{T}(lre[j, idx], lim[j, idx])
+                    hypersingular[gcol, grow] += Complex{T}(hbre[j, idx], hbim[j, idx])
                 end
             end
         end
     end
     return nothing
+end
+
+# The regular kernels write a test element's rows. In Julia's column-major
+# storage a row is strided, so for each trial element the nine block entries
+# land in nine different cache lines of a matrix far larger than the cache.
+# Writing the transpose instead puts them in three columns, consecutive in the
+# trial element's dof order, and measured about half the regular pass's time
+# at quadrature order 2. The passes therefore transpose the square operators
+# in place, accumulate into the transposed storage, and transpose back; an
+# involution, so whatever the matrix held before is preserved.
+function _beat_cpu_transpose_square!(matrix::AbstractMatrix)
+    n = size(matrix, 1)
+    size(matrix, 2) == n || error("In-place transpose needs a square matrix.")
+    block = 64
+    @inbounds for jb in 1:block:n, ib in jb:block:n
+        for j in jb:min(jb + block - 1, n)
+            for i in max(ib, j + 1):min(ib + block - 1, n)
+                matrix[i, j], matrix[j, i] = matrix[j, i], matrix[i, j]
+            end
+        end
+    end
+    return matrix
 end
 
 # Chunks own scratch, independent of task migration or the thread pool's IDs.
@@ -441,6 +480,7 @@ function _beat_cpu_bm_regular_simd_pass!(
     groups = threaded_enabled ? color_groups : _beat_cpu_element_color_groups(mesh, indices)
     scratch = [BeatCpuRegularScratch{T}(_BEAT_CPU_REGULAR_BLOCK_SIZE)
                for _ in 1:(threaded_enabled ? Threads.nthreads() : 1)]
+    _beat_cpu_transpose_square!(lhs)
     _beat_cpu_regular_simd_pass!(
         elements, regular_quadrature, indices, groups, threaded_enabled, image_transforms, cpu_cache, scratch,
     ) do test_data, test_quad, trial_elements, soa, work, skip_adjacent
@@ -448,6 +488,7 @@ function _beat_cpu_bm_regular_simd_pass!(
             lhs, rhs, q_neumann, test_data, test_quad, trial_elements, soa, k, coupling, work, skip_adjacent,
         )
     end
+    _beat_cpu_transpose_square!(lhs)
     return nothing
 end
 
@@ -460,6 +501,8 @@ function _beat_cpu_accumulate_regular_simd_pass!(
     groups = threaded_enabled ? color_groups : _beat_cpu_element_color_groups(mesh, indices)
     scratch = [BeatCpuOperatorRegularScratch{T}(_BEAT_CPU_REGULAR_BLOCK_SIZE)
                for _ in 1:(threaded_enabled ? Threads.nthreads() : 1)]
+    _beat_cpu_transpose_square!(double_layer)
+    _beat_cpu_transpose_square!(hypersingular)
     _beat_cpu_regular_simd_pass!(
         elements, regular_quadrature, indices, groups, threaded_enabled, image_transforms, cpu_cache, scratch,
     ) do test_data, test_quad, trial_elements, soa, work, skip_adjacent
@@ -468,6 +511,8 @@ function _beat_cpu_accumulate_regular_simd_pass!(
             test_data, test_quad, trial_elements, soa, k, work, skip_adjacent,
         )
     end
+    _beat_cpu_transpose_square!(double_layer)
+    _beat_cpu_transpose_square!(hypersingular)
     return nothing
 end
 
