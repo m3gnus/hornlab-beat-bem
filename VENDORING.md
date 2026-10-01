@@ -38,6 +38,7 @@ engine is a verbatim copy of one upstream commit.
 | Singular Burton-Miller fusion (2026-09-05) | `02364b595230db5b73c225c5271a34128bcf7880` | `perf/metal-singular-bm-fusion`, on the `fix/beat-krylov-gate-tolerance` (`531d99fd`) stack and **unlanded upstream**: the singular Burton-Miller pair is combined per quadrature point rather than per pair |
 | Metal engine and bundle sync (2026-10-01) | `3ea846eed48e25b88aa339d0188b9a69699a4815` | `perf/metal-speedups-for-hornlab`: reconstruct the shipped engine baseline, cache source-entry Metal kernels, and port PR #15 exterior packed kernels |
 | CPU SIMD local differences (2026-10-01) | official engine `3d3e0a4`, `85bac13`, `4aa32e7` | Applied directly after the `3ea846e` sync; file-by-file notice below |
+| GMRES sweep reuse port (2026-10-01) | official PR #23, `3157fe0710e6b43677ab4d9c3a0485711fd4b58b` | Applied directly after the CPU SIMD port; compiled integration `458c472` reviewed for lineage applicability; file-by-file notice below |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`
@@ -462,6 +463,50 @@ reach order 2 at 1 kHz and order 4 at 20 kHz through wavelength selection, and
 explicit mesh translation. The existing 9-node plate and 37-by-72 sphere are
 retained; duplicating the PR's 16-node plate or its extra Dict solve would not
 add worker coverage. Accelerator bundle workloads are unchanged.
+
+
+## GMRES sweep reuse port, 2026-10-01
+
+[Official PR #23](https://github.com/JWSound/BEAT_Engine/pull/23),
+source commit `3157fe0710e6b43677ab4d9c3a0485711fd4b58b` on
+`e6b3037`, is applied directly after the CPU SIMD port. This is a port of
+individual changes, not a whole-tree sync. Paths below are relative to
+`hornlab_beat_bem/`.
+
+| File | Port and adaptation |
+|---|---|
+| `julia/BeatEngineDriver.jl` | Own a dense sweep state in each fused Metal request's solve consumer, pass frequency/state to the solve, and expose warm-start, budget, fallback and true-residual diagnostics. Retain this lineage's `metal_pipeline_requested` selector rather than importing the official engine's newer overlap planner; retain every package request/output decision and CPU SIMD hook. |
+| `julia/src/BeatEngineDenseSolve.jl` | Port bounded six-solution, per-drive minimum-residual history; reject unhelpful/non-finite guesses; route model-selected frequencies within a 1.5 ratio of an observed fallback to LU; retain explicit overrides and shared deadline/iteration guards. Preserve this lineage's existing routing calibration and phasor behavior. No arithmetic adaptation to the added functions. |
+| `julia/src/BeatEngineMetalBurtonMiller.jl` | Pass optional request state/frequency through the shared-host Metal solve wrapper. Preserve this lineage's packed exterior kernels and atomic singular scatter. |
+| `julia/scripts/validate_gmres_burton_miller.jl` | Port physical-drive warm-sweep/LU agreement and true-residual gates, optional Metal backend and drive-tag selection; byte-identical to the exact source commit. Default CPU physical-drive gate and numerical bounds remain unchanged. |
+| `julia/tests/runtests.jl` | Port request/drive isolation, repeated/reversed frequency, deficient/non-finite history, pipeline consumption/cancellation and fallback-backoff/override tests. Adapt the pipeline test to this lineage's single pending `Threads.@spawn`/`fetch` producer and release-on-cancellation, rather than importing the newer queue helper. Preserve all test assertions, existing SIMD gates and historical package tests. |
+| `../VENDORING.md` | Record this port and its lineage applicability. |
+
+The source commit also changes `coupled_solver.jl`. Its later direct fused
+Metal/adaptive exterior path is absent here: this package's compiled-system
+exterior path assembles four operators and factorizes with fixed LU, so it
+cannot retry GMRES or reuse a GMRES iterate. That file is unchanged. Importing
+the intervening assembly/router rewrite is not part of this port.
+
+The compiled-driver integration was reviewed separately at official benchmark
+commit `458c4729c92d64af7d0255eceece294532850ce0`. Its
+`BeatEngineCompiledDriver.jl` hooks duplicate the later `coupled_solver.jl`
+fused adaptive path, likewise absent here. This package has no file of that
+name and no separate `MetalHostPrecompile.jl` inventory. All four shipped
+bundles include `BeatEngineDriver.jl`, so the applicable source-driver change
+is also the precompiled-driver change. Their existing parsed-request workloads
+and package data remain intact. The source-entry `MetalKernelSignatures.jl`
+inventory is independently regenerated and checked for this lineage rather
+than copied from the benchmark stack's compiled bundle.
+
+Unmodified engine/bundle files retain their earlier recorded identities;
+modified files above do not claim whole-file identity with the PR commit.
+Only the validator is newly byte-identical. The port preserves the exterior
+GMRES tolerance, iteration/deadline guards, singular/reference accuracy bounds,
+CUDA dependency wiring and fixture paths. Qualification uses the package
+bundle runtime probe, Julia suite and physical-drive validator, Metal inventory
+coverage, and paired package-API agreement on the S/C fixtures; source similarity
+alone is not an accuracy claim.
 
 ## What is copied verbatim
 
