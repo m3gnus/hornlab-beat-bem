@@ -166,7 +166,7 @@ def test_the_bundle_is_what_the_worker_actually_loads():
         ' "freq_max" => 1000.0, "freq_count" => 1, "tag_throat" => 2,'
         ' "rho" => 1.2041, "sound_speed" => 343.0, "symmetry" => "off",'
         ' "source_motion" => "normal"));'
-        "redirect_stdout(devnull) do; B.solve_request(request); end;"
+        "redirect_stdout(devnull) do; B.solve_request(B.JSON.parse(B.JSON.json(request))); end;"
         'println(stderr, "PROBE_OK ", B.ENGINE_DIR)'
     )
     completed = subprocess.run(
@@ -199,3 +199,35 @@ def test_the_bundle_is_what_the_worker_actually_loads():
         f"{compilations} runtime compilations from a precompiled bundle: the "
         "workload is not reaching the solve it was written to compile"
     )
+
+
+def test_metal_bundle_pins_the_kernel_cache_stack():
+    project = _project(default_project(BEAT_METAL) / "Project.toml")
+    bundle = _project(BUNDLE_DIR / BUNDLES[BEAT_METAL] / "Project.toml")
+    manifest = _project(default_project(BEAT_METAL) / "Manifest.toml")
+    assert project["compat"]["Metal"] == "=1.11.1"
+    assert bundle["compat"]["Metal"] == "=1.11.1"
+    assert manifest["deps"]["Metal"][0]["version"] == "1.11.1"
+    assert manifest["deps"]["GPUCompiler"][0]["version"] == "2.9.0"
+    directory = BUNDLE_DIR / BUNDLES[BEAT_METAL] / "src"
+    workload = (directory / "MetalKernelPrecompile.jl").read_text()
+    assert "using Metal: MtlDeviceArray, MtlDeviceMatrix, MtlDeviceVector" in workload
+    assert "Metal.mtlfunction(f, tt)" in workload
+    assert "Sys.isapple() && Sys.ARCH === :aarch64" in workload
+    assert "clear_metal_precompile_state!()" in workload
+    assert "Metal.reset_binary_archives!()" in workload
+    inventory = (directory / "MetalKernelSignatures.jl").read_text()
+    assert "_metal_fused_pair_blocks_kernel!" in inventory
+    assert "_metal_fused_singular_packed_kernel!" in inventory
+    assert "_metal_field" in inventory
+
+
+@pytest.mark.parametrize("name", sorted(BUNDLES.values()))
+def test_bundle_workload_matches_worker_json_type_and_image_outputs(name):
+    source = (BUNDLE_DIR / name / "src" / f"{name}.jl").read_text()
+    assert "solve_request(JSON.parse(JSON.json(request)))" in source
+    assert "solve_request(JSON.parse(JSON.json(representative)))" in source
+    assert '"symmetry" => "xy"' in source
+    assert '"singular_order" => 4' in source
+    assert '"theta_count" => 37' in source
+    assert '"phi_count" => 72' in source

@@ -387,13 +387,16 @@ caches native code only for **packages**, and until `julia_engine/` existed
 none of this was in one: `solver.jl` pulled ~20,700 lines of engine in with
 `include` and carried ~1,300 lines of driver itself, so every worker process
 compiled all of it again. The engine and the driver now live in a package per
-backend, each carrying a `PrecompileTools` workload that solves one frequency
-on a four-triangle tetrahedron.
+backend, each carrying a `PrecompileTools` workload. The first request solves
+one frequency on a four-triangle tetrahedron; the second exercises symmetry
+images, image-singular pairs and sphere/diagonal outputs on a quadrant plate.
+Both use the worker's JSON-decoded request type.
 
 **Packaging alone buys almost nothing — the workload is the fix.** Upstream
 measured runtime compilations going 370-378 to 351-354 on packaging alone, and
 to 89-92 with the workload.
 
+The following measurements predate the Metal 1.11.1 kernel-cache re-sync.
 Measured here on an M1 Max against the ATH `250917asro68q` quarter export
 (1,209 P1 dofs, `xy` symmetry), arms interleaved, machine load checked at each
 sample (3-8 processes above 5% CPU):
@@ -414,11 +417,14 @@ The runtime-compilation count is the instrument that matters, because it does
 not move with machine load and a wall clock does. `--trace-compile=stderr` on
 the worker's own entry path reports it.
 
-**Metal's residual is not fixable by any cache.** GPUCompiler has no disk
-cache, so kernel compilation is paid once per process however much is
-precompiled — the 613 that remain are mostly that. Keeping one worker alive
-across solves is therefore load-bearing rather than an optimisation, which is
-what `hornlab_beat_bem.worker` does.
+Metal 1.11.1 with GPUCompiler 2.9.0 can store compiled device code in package
+images. `BeatEngineMetalBundle` now compiles production signatures during its
+workload without launching kernels, clears process-local Metal state, and
+reports counts and failures. The source-entry coverage test guards the generated
+inventory. Custom specializations, host compilation and device setup can still
+add first-request work, so keeping a persistent worker warm remains useful.
+See [the Metal backend guide](docs/beat-engine-metal.md#cached-source-entry-kernels-and-packed-exterior-evaluation)
+for cache regeneration and the packed exterior kernels.
 
 **A missing bundle is silent.** `solver.jl` falls back to including the
 sources, so an installation whose environment was never instantiated, or a

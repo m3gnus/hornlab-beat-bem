@@ -27,10 +27,11 @@ below**, and everything not listed is a byte-for-byte copy.
 | Original vendoring (2026-08-19) | `42c87812f70b9ae3ab446bcc543b3789941d0509` (2026-08-17) | upstream `dev`, now also on `main` |
 | Sync at first publish (2026-09-02) | `f536d9e6a89c348cb5e071349f788cfe0f078156` | `feat/beat-adaptive-solve` |
 | Sync at 3ebc90a (2026-09-02) | `3ebc90aa95743b56dd19cd85ececf190d2672776` | `feat/beat-adaptive-solve` |
-| Current sync (2026-09-02) | `cd50b3c64771b242d681aaf440a5b786757ba35a` | `feat/beat-cold-start-adaptive` |
+| Cold-start sync (2026-09-02) | `cd50b3c64771b242d681aaf440a5b786757ba35a` | `feat/beat-cold-start-adaptive` |
 | Cherry-pick (2026-09-03) | `1f90433` on `fix/condensed-entrywise-floor` | the :off condensed comparison becomes an entrywise absolute floor; decided by the maintainer after the AVX-512 experiment |
 | Driver sync (2026-09-03) | `724d573d596b60db521a7ba618d04557ed7727d2` | `feat/beat-metal-pipeline-size-aware`, cut from `cd50b3c`: the Metal sweep overlap becomes a per-solve decision from the dof count |
 | Singular Burton-Miller fusion (2026-09-05) | `02364b595230db5b73c225c5271a34128bcf7880` | `perf/metal-singular-bm-fusion`, on the `fix/beat-krylov-gate-tolerance` (`531d99fd`) stack and **unlanded upstream**: the singular Burton-Miller pair is combined per quadrature point rather than per pair |
+| Current engine and bundle sync (2026-10-01) | `3ea846eed48e25b88aa339d0188b9a69699a4815` | `perf/metal-speedups-for-hornlab`: reconstruct the shipped engine baseline, cache source-entry Metal kernels, and port PR #15 exterior packed kernels |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`
@@ -325,13 +326,89 @@ untouched, the two validator table rows, and the "Known issue: the fused
 Burton-Miller gate at symmetry `xy`" section. None of the added prose names an
 upstream source path, so no rewrite was needed inside it.
 
+## Metal kernel-cache and packed exterior re-sync, 2026-10-01
+
+The engine sources and all four bundles are copied byte for byte from fork
+branch `perf/metal-speedups-for-hornlab`, commit `3ea846eed48e25b88aa339d0188b9a69699a4815`: the baseline commit `e4cbae8`,
+the port `7674bd0`, and `3ea846e`, which skips the Metal kernel workload before
+Julia 1.11 (as Metal.jl does for its own). This branch starts at `02364b5`; its first change reconstructs the
+engine already shipped here before either speed-up is applied:
+
+1. Apply the `BeatEngineCore.jl` and `BeatEngineCpuAssembly.jl` hunks from
+   `ec99b75744bc48aff4ae9327d46ebc9864b6c472`, accepting one near-correction
+   cache per symmetry image. These two additions were present in this package
+   but missing from the sync inventory above; their CUDA counterparts were
+   already present in the branch's base.
+2. Copy `BeatEngineDenseSolve.jl` and `tests/runtests.jl` from
+   `4e22bc7471d0c45e7da42242bb2d553c890e85f2`.
+3. Copy `BeatEngineMetalField.jl` from `ca5597a`, retaining the shipped field
+   occupancy change.
+
+All 41 engine source files then match this package's pre-sync sources exactly.
+The new changes therefore start from the same numerical engine, rather than
+from the older singular-fusion branch alone. The new snapshot has 44 source
+files, including the three packed-kernel files.
+
+### Source-entry Metal kernel cache
+
+The compile-only workload is adapted from official BEAT Engine commit
+`430b6e0`. The Metal project and bundle pin Metal 1.11.1, with the resolved
+GPUCompiler 2.9.0 stack. `BeatEngineMetalBundle`, the bundle loaded by
+`solver.jl`, compiles production kernel signatures with `Metal.mtlfunction`
+without launching them. It gates on Apple Silicon, imports the device-array
+aliases explicitly, reports failures and counts, and clears Metal's
+process-local state before writing the package image. The entry point loads
+Metal before JSON to preserve the bundle's cached call graph.
+
+All four bundles decode their host workload through `JSON.parse(JSON.json(...))`,
+matching the worker's request type. A second request uses a quadrant plate
+with symmetry `xy`, non-adjacent pairs and image-singular pairs, singular order
+4, two frequencies, and the outputs the wrapper requests: polar cuts,
+diagonal cut, radiation impedance, surface traces and a 37 by 72 sphere grid.
+Boundary Lab's driver uses the equivalent 2,664-point spherical sampling;
+this package's retained driver honours the explicit theta-major grid.
+
+`julia/tests/metal_kernel_coverage_tests.jl` observes source-entry requests
+under GPUCompiler's scoped compilation hook, including package-image cache
+hits, and rejects signatures missing from the generated inventory. It covers
+the default Float32 exterior path, symmetry off/x/xy, regular orders 1/2/4,
+singular order 4, two frequencies, polar cuts and sphere output. Ordinary runs
+do not regenerate the inventory. The existing ground and four-operator gates
+remain separate qualification of those paths.
+
+### PR #15 exterior kernels
+
+The packed Float32 field implementation and multi-drive API, packed fused
+regular pairs with image accumulation before gathering, and grouped full-Duffy
+singular pairs are ported from the official engine's exterior-only port of
+closed PR #15. Original source commits are `7e4a39e`, `7c8491a` and the required
+helpers from `09388b9`; original author: BumelantPZA. No low-frequency singular
+split, global BLAS switch, coupled-only changes, pools or router changes are
+included.
+
+Writable pair blocks and timing dictionaries belong to each assembly. Packed
+geometry publication is locked; cached tables are read-only. This fork retains
+its existing atomic singular scatter. Its singular cache lacks the official
+engine's gather-table reference, so packed singular tables are keyed by the
+identity of its rule-weight array and released with that cache.
+`validate_metal_packed_exterior.jl` races singular-table publication and regular
+assembly scratch, checks exact repeated regular assembly, and validates the
+multi-drive field API across its eight-drive batch boundary. Existing native
+singular validators retain their tolerances.
+
+`BeatEngineDriver.jl` has no upstream change in this re-sync, so its local
+features and prior merge are retained unchanged. The CUDA project addition,
+fixture-path adjustments and local validators described below are retained.
+The older per-file sync entries above are historical provenance; the engine
+source and bundle inventory now comes from the single new fork commit.
+
 ## What is copied verbatim
 
 Byte-for-byte identical to the sync commit, with no edits of any kind:
 
 | here | upstream |
 |---|---|
-| `hornlab_beat_bem/julia/src/*.jl` (41 files) | `src/blab/solvers/julia_local/src/` |
+| `hornlab_beat_bem/julia/src/*.jl` (44 files) | `src/blab/solvers/julia_local/src/` |
 | `hornlab_beat_bem/julia/coupled_solver.jl` | `src/blab/solvers/julia_local/coupled_solver.jl` |
 | `hornlab_beat_bem/julia_engine/BeatEngine{Cpu,Cuda,Rocm,Metal}Bundle/` | `src/blab/solvers/julia_engine/` |
 | `hornlab_beat_bem/julia/{Project,Manifest}.toml` | `src/blab/solvers/julia_local/` |
@@ -340,9 +417,10 @@ Byte-for-byte identical to the sync commit, with no edits of any kind:
 | `hornlab_beat_bem/julia/test_meshes/*.msh` | `src/blab/solvers/julia_local/test_meshes/` |
 | `hornlab_beat_bem/julia/test_fixtures/*.msh` | `tests/fixtures/{femvolume,exterior_conforming}.msh` |
 | `hornlab_beat_bem/julia/tests/runtests.jl` | `src/blab/solvers/julia_local/tests/` |
-| `hornlab_beat_bem/julia/scripts/*.jl`, except the five listed below and `validate_analytic_exterior.jl`, which is new here | `src/blab/solvers/julia_local/scripts/` |
+| `hornlab_beat_bem/julia/scripts/*.jl`, except the five listed below, `validate_analytic_exterior.jl`, which is new here, and three Metal benchmark/probe scripts kept from earlier syncs that the current sync commit does not carry (`benchmark_metal_assembly_stages.jl`, `benchmark_metal_field.jl`, `probe_metal_assembly_concurrency.jl`; their provenance is in the sections above) | `src/blab/solvers/julia_local/scripts/` |
 
-Ten of those files are taken from the later branches above rather than from the
+Before the 2026-10-01 re-sync, ten of those files were taken from the later
+branches above rather than from the
 `cd50b3c` sync commit; they are verbatim copies of *those* commits. Three of the
 ten — `src/BeatEngineMetalBurtonMiller.jl`,
 `scripts/validate_metal_fused_burton_miller.jl` and the new
@@ -453,6 +531,19 @@ on 2026-09-03:
 Features that exist only in this repository and are preserved by both merges:
 diagonal observation cuts, the theta-major spherical grid for balloon/DI
 mapping, and axial source motion.
+
+Three further driver-only features, added in earlier rounds and carried
+unchanged through the 2026-10-01 re-sync, also differ from the sync commit:
+
+- **Near-correction selection** (`near_correction_selection`, and the routing
+  that passes it to assembly): opt-in `near_correction_enabled` /
+  `near_correction_cutoff` / `near_correction_order` request keys choosing a
+  per-pair correction order from the distance ratio.
+- **Double-precision CPU solves** (`solve_precision = "double"`): the CPU
+  backend may assemble and solve in Float64 as an arbiter; results stay Float32
+  on the wire, and the option is refused on accelerator backends.
+- **Surface traces**: `surface_pressure` / `surface_neumann` outputs of the
+  mixed boundary solution when requested.
 
 ### `hornlab_beat_bem/julia_cuda/{Project,Manifest}.toml`
 
