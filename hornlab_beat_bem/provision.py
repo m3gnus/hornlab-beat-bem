@@ -19,8 +19,8 @@ refused rather than resolved (see ``main``).
 Steps, each idempotent and recorded in ``<runtime_dir>/state-<backend>.json``:
 
 1. Resolve a Julia executable -- an existing install (env var/PATH/previous
-   provisioning, including this runtime directory's own record) wins; only
-   when none exists is the official portable Julia downloaded, SHA-256
+   provisioning of the current portable version) wins; only when none exists
+   is the official portable Julia downloaded, SHA-256
    verified, and unpacked under the runtime directory.
 2. ``Pkg.instantiate()`` the bundled backend project -- ``julia_cuda``,
    ``julia_rocm``, ``julia_metal``, or ``julia`` for the CPU. The CPU project
@@ -74,6 +74,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -89,7 +90,7 @@ from typing import Any
 
 from .config import BEAT_CPU, BEAT_CUDA, BEAT_METAL, BEAT_ROCM
 
-JULIA_VERSION = "1.12.6"
+JULIA_VERSION = "1.12.7"
 _JULIA_BASE = "https://julialang-s3.julialang.org/bin"
 _CHECKSUMS_URL = f"{_JULIA_BASE}/checksums/julia-{JULIA_VERSION}.sha256"
 
@@ -100,7 +101,7 @@ _JULIA_DOWNLOADS: dict[tuple[str, str], dict[str, str | None]] = {
     ("Windows", "AMD64"): {
         "filename": f"julia-{JULIA_VERSION}-win64.zip",
         "url": f"{_JULIA_BASE}/winnt/x64/1.12/julia-{JULIA_VERSION}-win64.zip",
-        "sha256": "a63d991976e6893f508c512e3dc7bca1836c1a1f6ad1f3e4aedec159b6733e89",
+        "sha256": "ff5c7eb354c2fcb48401114a5fbcfe8e60181f95d9af42b266f975265a5bad47",
     },
     ("Linux", "x86_64"): {
         "filename": f"julia-{JULIA_VERSION}-linux-x86_64.tar.gz",
@@ -320,7 +321,8 @@ def provisioned_julia(
 ) -> str | None:
     """The provisioned Julia executable, when one is recorded and real.
 
-    Any *ready* record answers this, because a Julia is not per backend: the
+    Any *ready* record with a current managed or external executable answers
+    this, because a Julia is not per backend: the
     same executable runs the CPU project and the CUDA one. ``backend`` narrows
     it to one record for a caller that wants to know whether *that* backend is
     provisioned -- but a caller only after a Julia to run should leave it out,
@@ -332,11 +334,12 @@ def provisioned_julia(
         candidates = [read_state(runtime_dir, backend=backend)]
     else:
         candidates = list(read_backend_states(runtime_dir).values())
+    directory = runtime_dir or default_runtime_dir()
     for state in candidates:
         if not state or state.get("status") != "ready":
             continue
-        executable = state.get("julia_executable")
-        if isinstance(executable, str) and executable and Path(executable).exists():
+        executable = _recorded_julia(state, directory)
+        if executable is not None:
             return executable
     return None
 
@@ -619,7 +622,11 @@ def _ensure_julia(
         status_cb(f"Using existing Julia: {existing}")
         return existing
 
-    if previous_executable and Path(previous_executable).exists():
+    if (
+        previous_executable
+        and Path(previous_executable).exists()
+        and not _outdated_portable_julia(previous_executable, runtime_dir)
+    ):
         status_cb(f"Reusing the Julia this runtime directory already holds: {previous_executable}")
         return previous_executable
 
@@ -708,11 +715,33 @@ _GPU_BACKENDS: dict[str, dict[str, Any]] = {
 }
 
 
-def _recorded_julia(previous: dict[str, Any] | None) -> str | None:
+def _outdated_portable_julia(executable: str, runtime_dir: Path) -> bool:
+    """Reject an older unpack owned by this runtime directory, not user installs.
+
+    Older state records stamped the requested version even for external Julia,
+    so ``julia_version`` alone cannot identify a managed executable. The portable
+    archive's versioned directory is stable across all supported platforms.
+    """
+
+    try:
+        relative = Path(executable).resolve().relative_to(runtime_dir.expanduser().resolve())
+    except ValueError:
+        return False
+    return bool(
+        relative.parts
+        and re.fullmatch(r"julia-\d+\.\d+\.\d+(?:-[\w.]+)?", relative.parts[0])
+        and relative.parts[0] != f"julia-{JULIA_VERSION}"
+    )
+
+
+def _recorded_julia(
+    previous: dict[str, Any] | None, runtime_dir: Path | None = None
+) -> str | None:
     """The Julia executable a previous run of *this* runtime directory recorded.
 
     Any status will do -- an interrupted or failed run still names a Julia it
-    successfully unpacked, and re-downloading it would be pure waste. What it
+    successfully unpacked. Older portable builds owned by this directory are
+    rejected so a package upgrade installs the newly selected version. What it
     must not do is make the *runtime* look ready; that is ``provisioned_julia``,
     which requires ``status == "ready"``.
     """
@@ -720,7 +749,12 @@ def _recorded_julia(previous: dict[str, Any] | None) -> str | None:
     if not previous:
         return None
     executable = previous.get("julia_executable")
-    if isinstance(executable, str) and executable and Path(executable).exists():
+    if (
+        isinstance(executable, str)
+        and executable
+        and Path(executable).exists()
+        and not _outdated_portable_julia(executable, runtime_dir or default_runtime_dir())
+    ):
         return executable
     return None
 
@@ -730,6 +764,7 @@ def _ready_for(
     backend: str,
     project: Path,
     fingerprint: str,
+    runtime_dir: Path | None = None,
 ) -> bool:
     """Whether a recorded state is a ready runtime for exactly this request.
 
@@ -760,7 +795,7 @@ def _ready_for(
         return False
     if previous.get("package_fingerprint") != fingerprint:
         return False
-    return _recorded_julia(previous) is not None
+    return _recorded_julia(previous, runtime_dir) is not None
 
 
 def backend_ready(backend: str, runtime_dir: Path | None = None) -> bool:
@@ -784,6 +819,7 @@ def backend_ready(backend: str, runtime_dir: Path | None = None) -> bool:
         backend,
         project,
         package_fingerprint(project),
+        runtime_dir,
     )
 
 
@@ -844,7 +880,7 @@ def provision_gpu(
     project = default_project(backend)
     fingerprint = package_fingerprint(project)
     previous = read_state(directory, backend=backend)
-    if not force and _ready_for(previous, backend, project, fingerprint):
+    if not force and _ready_for(previous, backend, project, fingerprint, directory):
         assert previous is not None
         status_cb(f"BEAT {facts['label']} runtime is already provisioned.")
         return previous
@@ -870,7 +906,7 @@ def provision_gpu(
         # very backend being provisioned by another process, and instantiating
         # a runtime that is already ready is pure cost.
         previous = read_state(directory, backend=backend)
-        if not force and _ready_for(previous, backend, project, fingerprint):
+        if not force and _ready_for(previous, backend, project, fingerprint, directory):
             assert previous is not None
             status_cb(f"BEAT {facts['label']} runtime is already provisioned.")
             return previous
@@ -885,7 +921,7 @@ def provision_gpu(
         _write_state(directory, state)
         try:
             julia = _ensure_julia(
-                directory, status_cb, previous_executable=_recorded_julia(previous)
+                directory, status_cb, previous_executable=_recorded_julia(previous, directory)
             )
             state.update(julia_executable=julia, step="instantiate")
             _write_state(directory, state)
@@ -1038,7 +1074,7 @@ def provision_cpu(
     project = default_project(BEAT_CPU)
     fingerprint = package_fingerprint(project)
     previous = read_state(directory, backend=BEAT_CPU)
-    if not force and _ready_for(previous, BEAT_CPU, project, fingerprint):
+    if not force and _ready_for(previous, BEAT_CPU, project, fingerprint, directory):
         assert previous is not None
         status_cb("BEAT CPU runtime is already provisioned.")
         return previous
@@ -1057,7 +1093,7 @@ def provision_cpu(
         )
     with held:
         previous = read_state(directory, backend=BEAT_CPU)
-        if not force and _ready_for(previous, BEAT_CPU, project, fingerprint):
+        if not force and _ready_for(previous, BEAT_CPU, project, fingerprint, directory):
             assert previous is not None
             status_cb("BEAT CPU runtime is already provisioned.")
             return previous
@@ -1076,7 +1112,7 @@ def provision_cpu(
                 status_cb,
                 required_bytes=_CPU_REQUIRED_FREE_BYTES,
                 purpose="CPU runtime",
-                previous_executable=_recorded_julia(previous),
+                previous_executable=_recorded_julia(previous, directory),
             )
             state.update(julia_executable=julia, step="instantiate")
             _write_state(directory, state)

@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Both manifests record julia_version 1.12.6. Resolving within 1.12 keeps the
+  # The manifests record julia_version 1.12.7. Resolving within 1.12 keeps the
   # manifests usable without pinning a patch that will go stale.
   JULIA_VERSION: "1.12"
 

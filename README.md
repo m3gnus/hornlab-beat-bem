@@ -99,11 +99,14 @@ python -m hornlab_beat_bem.provision --if-gpu
 
 is a strict no-op unless a supported GPU is present. Only then does it resolve
 Julia (an existing install always wins; otherwise the official portable Julia
-1.12.6 is downloaded, SHA-256 verified, into a per-user runtime directory —
+1.12.7 is downloaded, SHA-256 verified, into a per-user runtime directory —
 override with `HORNLAB_BEAT_RUNTIME_DIR`), instantiate the matching project,
 and force artifact resolution ending in a `functional()` check, so a recorded
 *ready* state means the first solve computes instead of downloading. Windows,
-Linux x86-64 and macOS arm64 have portable downloads configured. Progress and
+Linux x86-64 and macOS arm64 have portable downloads configured. On a package
+upgrade, an older portable Julia in that directory is replaced by the current
+version when provisioning runs; explicitly configured and external installs
+still take precedence. Progress and
 failures are recorded in `state-<backend>.json` and surface as
 `beat_engine_status()` reasons; retry with `--force`. CUDA's first run pulls
 several GB (CUDA.jl ships its own toolkit artifacts; users need only the

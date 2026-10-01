@@ -616,3 +616,95 @@ def test_metal_instantiate_does_not_promise_a_multi_gigabyte_download(runtime_di
     )
     provision.provision_gpu(runtime_dir, backend="metal", status_cb=lambda _: None)
     assert labels and not any("several GB" in label for label in labels)
+
+
+@pytest.mark.parametrize("backend", [BEAT_CPU, BEAT_METAL])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_upgrade_replaces_old_portable_julia(
+    runtime_dir, monkeypatch, julia_steps, backend, legacy
+):
+    """An old managed unpack is neither discoverable nor ready after upgrade."""
+    old = runtime_dir / "julia-1.12.6" / "bin" / "julia"
+    old.parent.mkdir(parents=True)
+    old.write_text("old runtime", encoding="utf-8")
+    project = runtime.default_project(backend)
+    previous = {
+        "status": "ready", "backend": backend, "project": str(project),
+        # Even a matching package fingerprint must not adopt the old runtime.
+        "package_fingerprint": runtime.package_fingerprint(project),
+        "julia_version": "1.12.6", "julia_executable": str(old),
+    }
+    if legacy:
+        (runtime_dir / provision.STATE_FILENAME).write_text(json.dumps(previous))
+    else:
+        provision._write_state(runtime_dir, previous)
+    monkeypatch.delenv(runtime.JULIA_ENV_VAR, raising=False)
+    monkeypatch.setattr(runtime.shutil, "which", lambda _: None)
+    monkeypatch.setattr(provision, "_gpu_hardware_present", lambda _: True)
+    assert provision.provisioned_julia(runtime_dir) is None
+    assert runtime.discover_julia() is None
+    assert not provision.backend_ready(backend, runtime_dir)
+    downloaded = []
+    monkeypatch.setattr(provision, "_official_checksum", lambda *args: "a" * 64)
+    monkeypatch.setattr(provision, "_download", lambda *args, **kwargs: downloaded.append(kwargs["expected_sha256"]))
+    current = runtime_dir / f"julia-{provision.JULIA_VERSION}" / "bin" / "julia"
+    def extract(*args):
+        current.parent.mkdir(parents=True)
+        current.write_text("new runtime", encoding="utf-8")
+        return current
+    monkeypatch.setattr(provision, "_extract_julia", extract)
+    state = (provision.provision_cpu(runtime_dir, status_cb=lambda _: None)
+             if backend == BEAT_CPU else
+             provision.provision_gpu(runtime_dir, backend=backend, status_cb=lambda _: None))
+    assert state["status"] == "ready"
+    assert state["julia_executable"] == str(current)
+    assert state["julia_version"] == provision.JULIA_VERSION
+    assert len(downloaded) == 1
+    assert len(julia_steps) == 2
+    assert runtime.discover_julia() == str(current)
+    assert provision.backend_ready(backend, runtime_dir)
+    assert old.exists()  # existing workers may still use it
+
+
+def test_current_portable_julia_is_reused_after_failed_provision(
+    runtime_dir, no_gpu, monkeypatch, julia_steps
+):
+    current = runtime_dir / f"julia-{provision.JULIA_VERSION}" / "bin" / "julia"
+    current.parent.mkdir(parents=True)
+    current.write_text("", encoding="utf-8")
+    provision._write_state(runtime_dir, {
+        "status": "failed", "backend": BEAT_CPU, "julia_executable": str(current),
+    })
+    monkeypatch.delenv(runtime.JULIA_ENV_VAR, raising=False)
+    monkeypatch.setattr(runtime.shutil, "which", lambda _: None)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("downloaded the current managed runtime again")
+    monkeypatch.setattr(provision, "_download", forbidden)
+    state = provision.provision_cpu(runtime_dir, status_cb=lambda _: None)
+    assert state["status"] == "ready"
+    assert state["julia_executable"] == str(current)
+
+
+def test_explicit_old_julia_still_wins(runtime_dir, monkeypatch):
+    old = runtime_dir / "julia-1.12.6" / "bin" / "julia"
+    old.parent.mkdir(parents=True)
+    old.write_text("", encoding="utf-8")
+    monkeypatch.setenv(runtime.JULIA_ENV_VAR, str(old))
+    assert provision._ensure_julia(runtime_dir, lambda _: None) == str(old)
+
+
+def test_portable_downloads_pin_the_current_release():
+    assert provision.JULIA_VERSION == "1.12.7"
+    windows = provision._JULIA_DOWNLOADS[("Windows", "AMD64")]
+    assert windows["filename"] == "julia-1.12.7-win64.zip"
+    assert windows["sha256"] == "ff5c7eb354c2fcb48401114a5fbcfe8e60181f95d9af42b266f975265a5bad47"
+    for entry in provision._JULIA_DOWNLOADS.values():
+        assert provision.JULIA_VERSION in entry["url"]
+        assert provision.JULIA_VERSION in entry["filename"]
+
+
+def test_unmanaged_install_inside_runtime_dir_is_preserved(runtime_dir):
+    external = runtime_dir / "julia-custom" / "bin" / "julia"
+    external.parent.mkdir(parents=True)
+    external.write_text("", encoding="utf-8")
+    assert provision._recorded_julia({"julia_executable": str(external)}, runtime_dir) == str(external)
