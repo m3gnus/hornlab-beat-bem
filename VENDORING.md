@@ -6,19 +6,24 @@ Toolkit Engine) from **Boundary Lab**, and it is not original to HornLab.
 
 | | |
 |---|---|
-| Upstream project | Boundary Lab, <https://github.com/JWSound/boundary-lab> |
+| Original project | Boundary Lab, <https://github.com/JWSound/boundary-lab> |
+| Long-term upstream | Official engine fork, <https://github.com/m3gnus/BEAT_Engine> |
 | Upstream licence | GNU General Public License v3.0 |
 | Upstream copyright | The Boundary Lab authors (JWSound) |
-| Fork the sync is taken from | <https://github.com/m3gnus/boundary-lab> |
+| Historical sync fork | <https://github.com/m3gnus/boundary-lab> |
 
 Boundary Lab ships the bare GPL-3 licence text with no per-file copyright
 headers, so this repository reproduces the same licence verbatim in `LICENSE`
 and records authorship here instead of inventing notices upstream does not
-carry. Nothing in `hornlab_beat_bem/julia/` is attributed to HornLab.
+carry. Original solver authorship is retained. The CPU SIMD improvements
+below are HornLab's own work, published as m3gnus's official engine PRs.
 
 GPL-3 §5(a) requires a modified work to carry prominent notices of what was
 changed. This file is that notice: **every difference from upstream is listed
-below**, and everything not listed is a byte-for-byte copy.
+below**. Since the 2026-10-01 sync, changes are applied directly here and
+listed individually with their official engine PR/commit. The baseline is
+retained for unchanged files; this package no longer claims that the whole
+engine is a verbatim copy of one upstream commit.
 
 ## Sync points
 
@@ -31,7 +36,8 @@ below**, and everything not listed is a byte-for-byte copy.
 | Cherry-pick (2026-09-03) | `1f90433` on `fix/condensed-entrywise-floor` | the :off condensed comparison becomes an entrywise absolute floor; decided by the maintainer after the AVX-512 experiment |
 | Driver sync (2026-09-03) | `724d573d596b60db521a7ba618d04557ed7727d2` | `feat/beat-metal-pipeline-size-aware`, cut from `cd50b3c`: the Metal sweep overlap becomes a per-solve decision from the dof count |
 | Singular Burton-Miller fusion (2026-09-05) | `02364b595230db5b73c225c5271a34128bcf7880` | `perf/metal-singular-bm-fusion`, on the `fix/beat-krylov-gate-tolerance` (`531d99fd`) stack and **unlanded upstream**: the singular Burton-Miller pair is combined per quadrature point rather than per pair |
-| Current engine and bundle sync (2026-10-01) | `3ea846eed48e25b88aa339d0188b9a69699a4815` | `perf/metal-speedups-for-hornlab`: reconstruct the shipped engine baseline, cache source-entry Metal kernels, and port PR #15 exterior packed kernels |
+| Metal engine and bundle sync (2026-10-01) | `3ea846eed48e25b88aa339d0188b9a69699a4815` | `perf/metal-speedups-for-hornlab`: reconstruct the shipped engine baseline, cache source-entry Metal kernels, and port PR #15 exterior packed kernels |
+| CPU SIMD local differences (2026-10-01) | official engine `3d3e0a4`, `85bac13`, `4aa32e7` | Applied directly after the `3ea846e` sync; file-by-file notice below |
 
 The 2026-08-19 vendoring was a verbatim copy: all 25 files of
 `src/blab/solvers/julia_local/src/` and both project files matched `42c8781`
@@ -399,16 +405,73 @@ singular validators retain their tolerances.
 `BeatEngineDriver.jl` has no upstream change in this re-sync, so its local
 features and prior merge are retained unchanged. The CUDA project addition,
 fixture-path adjustments and local validators described below are retained.
-The older per-file sync entries above are historical provenance; the engine
-source and bundle inventory now comes from the single new fork commit.
+At that sync, the engine source and bundle inventory came from the single
+new fork commit. Later direct edits are listed individually below; the older
+per-file sync entries remain historical provenance.
+
+## Local differences since the 2026-10-01 sync
+
+These changes are applied directly to this package. Boundary Lab was not
+changed for this port. Their long-term upstream is
+[m3gnus/BEAT_Engine](https://github.com/m3gnus/BEAT_Engine):
+
+- [PR #17](https://github.com/JWSound/BEAT_Engine/pull/17),
+  `3d3e0a48af711cf9ca3948d7b5d5d48c0798b27f`: CPU regular-pair SIMD.
+- [PR #19](https://github.com/JWSound/BEAT_Engine/pull/19),
+  `85bac1329832b366ddf437007cf8a6b1e883f0c2`: SIMD field evaluation,
+  fused singular corrections and transposed scatter, stacked on #17.
+- [PR #20](https://github.com/JWSound/BEAT_Engine/pull/20),
+  `4aa32e7f988a49018f850875895f42258265a07e`: representative CPU
+  precompile workload, only the coverage missing from the prior sync.
+
+Paths in the following table are relative to `hornlab_beat_bem/` unless
+prefixed with `../`.
+
+| File | Source | Local difference from the sync baseline |
+|---|---|---|
+| `julia/src/BeatEngineCpuSimd.jl` (new) | #17 + #19 | SoA regular pairs, polynomial sincos, transposed square scatter, field-density packing and fused Duffy SIMD; byte-identical to #19 |
+| `julia/src/BeatEngineCore.jl` | #17 + #19 | Export selectors; add scalar-default CPU-only dispatcher keyword |
+| `julia/src/BeatEngineCpu.jl` | #17 | Include the new SIMD implementation |
+| `julia/src/BeatEngineCpuAssembly.jl` | #17 | Add scalar-default regular-kernel selection and SIMD regular-pass hook |
+| `julia/src/BeatEngineCpuBurtonMiller.jl` | #17 + #19 | Scalar-default regular/singular selectors, SIMD regular hook, SoA Duffy rules for base and image singular pairs, selection diagnostics |
+| `julia/src/BeatEngineCpuField.jl` | #19 | Add scalar-default field-kernel selection and SIMD hook |
+| `julia/BeatEngineDriver.jl` | #17 + #19 | Opt CPU source requests into SIMD regular, field and fused singular stages and report selections; read the regular selector only for CPU requests |
+| `julia/tests/cpu_simd_kernel_tests.jl` (new) | #17 + #19 | Port entrywise, precision, symmetry, subset, threading and block-boundary gates; adapt convention API tests to signed wavenumbers |
+| `julia/tests/runtests.jl` | #17 | Include the new SIMD gates |
+| `julia/scripts/benchmark_cpu_regular_kernel.jl` (new) | #17 | Regular-stage scalar/SIMD timing, entrywise parity and LLVM vector-width probe; byte-identical to #17 |
+| `julia_engine/BeatEngineCpuBundle/src/BeatEngineCpuBundle.jl` | #20 | Select regular orders 2 and 4 by wavelength and add explicit mesh translation input to the existing representative workload |
+| `../docs/beat-engine-cpu-simd.md` (new) | #17 + #19 | Port the official CPU kernel page; rewrite package paths, describe signed-wavenumber gates, state the existing Float64-reference bound precisely and clarify which singular path remains scalar |
+| `../README.md` | #17 + #19 | Document the three CPU switches and link the kernel page |
+| `../tests/test_engine_bundles.py` | #20 | Pin the added wavelength/order and explicit mesh-input workload coverage |
+| `../AGENTS.md`, `../VENDORING.md` | Route decision, 2026-10-01 | Replace the single-commit/verbatim-only development rule with direct edits and individual official-engine provenance |
+
+Only the CPU source-request driver opts in. Library assembly and field
+functions still default to scalar, preserving accelerator host-staged paths,
+validator CPU references and compiled-system solves. The driver retains the
+package's existing request/output decisions listed below.
+
+The official engine's selectable phasor API is absent from this lineage. The
+port preserves its existing wavenumber handling: no `outgoing_wavenumber`
+conversion or convention switch is imported. The PR's convention tests compare
+scalar and SIMD at signed wavenumbers instead, with unchanged bounds.
+
+PR #20 largely overlaps the prior sync's workload: JSON-decoded worker request
+types, non-adjacent quadrant pairs, xy images and image-singular pairs, diagonal
+and sphere output, and surface traces were already present. The additions
+reach order 2 at 1 kHz and order 4 at 20 kHz through wavelength selection, and
+explicit mesh translation. The existing 9-node plate and 37-by-72 sphere are
+retained; duplicating the PR's 16-node plate or its extra Dict solve would not
+add worker coverage. Accelerator bundle workloads are unchanged.
 
 ## What is copied verbatim
 
-Byte-for-byte identical to the sync commit, with no edits of any kind:
+The following inventory describes the `3ea846e` baseline. It remains
+byte-identical except for the explicitly listed local differences above and
+the older package modifications below:
 
 | here | upstream |
 |---|---|
-| `hornlab_beat_bem/julia/src/*.jl` (44 files) | `src/blab/solvers/julia_local/src/` |
+| `hornlab_beat_bem/julia/src/*.jl` (44 baseline files; SIMD addition listed above) | `src/blab/solvers/julia_local/src/` |
 | `hornlab_beat_bem/julia/coupled_solver.jl` | `src/blab/solvers/julia_local/coupled_solver.jl` |
 | `hornlab_beat_bem/julia_engine/BeatEngine{Cpu,Cuda,Rocm,Metal}Bundle/` | `src/blab/solvers/julia_engine/` |
 | `hornlab_beat_bem/julia/{Project,Manifest}.toml` | `src/blab/solvers/julia_local/` |
@@ -427,13 +490,13 @@ ten — `src/BeatEngineMetalBurtonMiller.jl`,
 `scripts/validate_metal_singular_summation.jl` — come from `02364b5`, which is
 **unlanded upstream**; see the singular-fusion section above.
 
-Every numerical result this package produces comes from those files, and they
-are unmodified. That is deliberate: it is what lets the extraction be verified
-by identity rather than by tolerance.
+Unchanged engine files can still be verified by identity against the
+recorded baseline. The CPU SIMD files above differ from that baseline and
+require numerical qualification; whole-engine byte identity is not claimed.
 
 `BeatEngineDriver.jl` is deliberately absent from that list. It is upstream's
 file, produced by a three-way merge and overwhelmingly upstream's code, but it
-is the one place this package's local decisions live and it is not byte-for-byte
+carries the package's request/output decisions and is not byte-for-byte
 identical to any upstream commit. The section below enumerates every difference.
 
 The `julia_cuda/` project files carry one local addition, described below.
@@ -442,7 +505,7 @@ The `julia_cuda/` project files carry one local addition, described below.
 
 ### One runtime default, set from `hornlab_beat_bem/worker.py`
 
-Not a source difference — the vendored solver is unchanged — but it means this
+Not a Julia source difference, but it means this
 package's out-of-the-box behaviour is not upstream's, so it is listed here too.
 `julia_threads="auto"` resolves to the performance-core count rather than
 `os.cpu_count()`. It is `setdefault`-style: an explicit `julia_threads` wins,
@@ -647,24 +710,20 @@ README carries the measured version:
 `docs/beat-engine-*.md` still mention some of these scripts, because the prose
 is upstream's.
 
-## Re-syncing
+## Porting later official engine changes
 
-The layout is a flat rename, so a future sync is mechanical:
+Use the official engine fork `m3gnus/BEAT_Engine` as the long-term upstream.
+Its engine layout is `src/beat_engine/julia_local/` and its bundles live in
+`src/beat_engine/julia_engine/`. Apply improvements directly here, adapting
+only what this package's existing lineage and API require. Do not replace the
+whole source tree with a blind copy: this package retains earlier engine work
+and the local differences recorded above.
 
-1. Copy `src/blab/solvers/julia_local/src/*.jl` over `hornlab_beat_bem/julia/src/`
-   and `coupled_solver.jl`, `solver.jl`, `Project.toml`, `Manifest.toml`
-   alongside; `src/blab/solvers/julia_engine/` over `hornlab_beat_bem/julia_engine/`;
-   and the `{Project,Manifest}.toml` pairs for `julia_metal` and `julia_rocm`.
-   These are verbatim, so a plain copy is correct.
-2. Three-way merge `BeatEngineDriver.jl` with `git merge-file`, using the
-   previous sync commit recorded above as the base.
-3. Re-apply the six path constants in the table above, and the `julia_cuda`
-   bundle dependency.
-4. Update the sync commit in this file, and re-run the verification in
-   `README.md`.
-5. **Check that the fast path is still taken**, because losing it is silent.
-   `pytest tests/test_engine_bundles.py` covers the wiring; `pytest -m slow`
-   counts runtime compilations against a live bundle. A re-vendor that copies
-   `julia/` but not `julia_engine/`, or that leaves a backend project without
-   its bundle dependency, produces correct answers at the old cold start and
-   reports nothing.
+For each port, record the official PR and exact source commit, every affected
+file, and every adaptation in this notice. Compare unchanged files against the
+recorded baseline and identify any newly byte-identical files separately.
+Preserve the driver decisions, fixture-path changes and CUDA bundle dependency
+listed above. Keep all backend bundles in package data and qualify their actual
+runtime compilation/first-result behaviour, as `tests/test_engine_bundles.py`
+describes. Run the engine suites, numerical gates and package tests before
+claiming a qualified port.

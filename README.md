@@ -861,6 +861,9 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_BEAT_GMRES_TOL` | `1e-5` | tolerance on the true relative residual. Exterior solves only; the coupled FEM/LEM path factorizes directly. See `VENDORING.md` |
 | `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
+| `BLAB_BEAT_CPU_REGULAR_KERNEL` | `simd` | CPU source-request driver only; `scalar` restores the regular-pair arithmetic |
+| `BLAB_BEAT_CPU_SINGULAR_KERNEL` | `simd` | CPU source-request driver, fused Burton-Miller only; `scalar` restores the Duffy loop |
+| `BLAB_BEAT_CPU_FIELD_KERNEL` | `simd` | CPU source-request driver only; `scalar` restores field evaluation |
 | `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | `pair_atomic`, `pair_owned`, `entry_owned` are diagnostics |
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | trial-chunk memory budget |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | `host` does the singular corrections on the CPU, which makes assembly byte-identical run to run |
@@ -873,6 +876,11 @@ All are environment variables; the defaults are the shipped configuration.
 | `HORNLAB_BEAT_WORKER_DIR` | per-user | where the registry (key files, sockets, host logs) lives |
 | `HORNLAB_BEAT_WORKER_SPAWN_TIMEOUT_S` | `60` | how long a client waits for a host it started to become reachable |
 | `HORNLAB_BEAT_WORKER_TRANSPORT` | by platform | `unix` or `tcp`, forcing a transport that would not otherwise be chosen |
+
+The [CPU SIMD kernel page](docs/beat-engine-cpu-simd.md) explains the arithmetic
+and scalar library defaults. Accelerator host-staged assembly, validator CPU
+references and compiled-system solves retain those defaults. CPU request
+diagnostics report the selected kernels.
 
 `docs/beat-engine-metal.md` and `docs/beat-engine-core.md` list the rest.
 Those pages are Boundary Lab's, kept verbatim; `VENDORING.md` notes the

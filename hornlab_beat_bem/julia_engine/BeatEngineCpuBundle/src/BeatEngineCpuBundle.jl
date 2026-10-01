@@ -142,12 +142,19 @@ end
                 solve_request(JSON.parse(JSON.json(request)))
                 image_mesh = joinpath(directory, "workload_xy.msh")
                 write(image_mesh, workload_plate_mesh())
+                # The CPU default selects order 2 at 1 kHz and order 4 at
+                # 20 kHz on this plate. A fixed rule misses the order-2 regular
+                # path; the explicit mesh list also reaches input translation.
                 representative = deepcopy(request)
                 representative["frequencies_hz"] = [1000.0, 20000.0]
                 representative["config"] = merge(representative["config"], Dict{String,Any}(
                     "mesh_file" => image_mesh, "symmetry" => "xy", "singular_order" => 4,
+                    "meshes" => [Dict{String,Any}(
+                        "name" => "mesh", "file" => image_mesh, "scale_factor" => 1.0,
+                        "translation_m" => [0.0, 0.0, 0.0],
+                    )],
                     "surface_traces_enabled" => true,
-                    "regular_quadrature_mode" => "fixed", "diagonal_enabled" => true,
+                    "regular_quadrature_mode" => "wavelength", "diagonal_enabled" => true,
                     "step_size" => 5.0, "max_angle" => 180.0,
                     "spherical_grid" => Dict("theta_count" => 37, "phi_count" => 72,
                                              "theta_max_deg" => 180.0),

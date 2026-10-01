@@ -231,3 +231,18 @@ def test_bundle_workload_matches_worker_json_type_and_image_outputs(name):
     assert '"singular_order" => 4' in source
     assert '"theta_count" => 37' in source
     assert '"phi_count" => 72' in source
+
+
+def test_cpu_workload_covers_both_regular_orders_and_mesh_inputs():
+    """A fixed rule silently loses the low-frequency SIMD specialization."""
+    source = (BUNDLE_DIR / BUNDLES[BEAT_CPU] / "src" / "BeatEngineCpuBundle.jl").read_text()
+    assert 'representative["frequencies_hz"] = [1000.0, 20000.0]' in source
+    assert '"regular_quadrature_mode" => "wavelength"' in source
+    assert '"meshes" => [Dict{String,Any}(' in source
+    assert '"translation_m" => [0.0, 0.0, 0.0]' in source
+    # For this 0.04 m plate, sqrt(triangle area) is 0.04 / sqrt(2).
+    # Wavelength selection's kh <= 2 cutoff must choose order 2 then 4.
+    from math import pi, sqrt
+
+    kh = [2 * pi * frequency / 343 * 0.04 / sqrt(2) for frequency in (1000, 20000)]
+    assert kh[0] < 2 < kh[1]

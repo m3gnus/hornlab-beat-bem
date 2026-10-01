@@ -10,18 +10,24 @@ original work. `VENDORING.md` is authoritative for provenance: it records the
 upstream commit, what is copied byte for byte, and every difference. Keep it
 accurate — it is this package's GPL-3 §5(a) notice, not a courtesy.
 
-## The rule that matters most
+## Source changes and provenance
 
-**`hornlab_beat_bem/julia/src/*.jl` is a verbatim copy of upstream.** Do not
-edit those files here. A fix belongs upstream, in `boundary-lab`, and arrives
-here through a re-sync. Verbatim copies are what let the extraction be verified
-by identity rather than by tolerance; the moment one is patched locally, that
-proof is gone and every future sync becomes a merge.
+The long-term upstream is the official engine fork
+[`m3gnus/BEAT_Engine`](https://github.com/m3gnus/BEAT_Engine). Since the
+2026-10-01 sync, engine improvements are applied directly in this repository,
+including `hornlab_beat_bem/julia/src/*.jl`. Boundary Lab is not a development
+target for this package.
 
-`BeatEngineDriver.jl` is the one file that carries local changes, and it is a
-three-way merge on every sync. `VENDORING.md` explains the three decisions in
-it. `solver.jl` used to be that file; since the cold-start sync it is a
-verbatim entry point and the body lives in the driver.
+Record every local difference in `VENDORING.md`, naming the official engine
+PR and source commit, the affected files and any adaptation to this lineage.
+Unchanged files retain the recorded sync's byte identity; modified files must
+not be described as a verbatim copy of one upstream commit. Preserve licence
+and authorship notices. Qualify numerical changes with the engine suites and
+accuracy gates rather than inferring correctness from source similarity.
+
+`BeatEngineDriver.jl` also carries the package's request and output decisions,
+listed in `VENDORING.md`. Preserve them when porting official engine changes.
+`solver.jl` remains the entry point; the driver holds its body.
 
 ## The failure mode to watch for
 
@@ -468,8 +474,9 @@ comparison stays bitwise. The options are kept below as the decision record.
 **The original note, for the record:** The mechanism above is
 the evidence the earlier note asked for before anyone touched the assertion; it
 is not permission to touch it. `coupled_condensed_tests.jl` is vendored (see
-`VENDORING.md`), so a change lands upstream in `boundary-lab` and arrives by
-re-sync -- **do not relax the `==` in this repository.** What the finding
+`VENDORING.md`), so the decision above was implemented upstream before the
+historical re-sync. Under the current direct-edit route, preserve the recorded contract
+and document any further change in `VENDORING.md`. What the finding
 changes is which options are honest:
 
 - **Keep `==`.** It is red on every AVX-512 draw, for something that is not a
