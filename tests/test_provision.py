@@ -280,6 +280,40 @@ def test_cpu_provisioning_needs_no_gpu_at_all(runtime_dir, no_gpu, fake_julia, j
     assert all(str(call["project"]).endswith("julia") for call in julia_steps)
 
 
+def test_a_raising_status_callback_cannot_fail_provisioning(
+    runtime_dir, no_gpu, fake_julia, julia_steps, capsys
+):
+    """A console that cannot print a status line must not fail the runtime.
+
+    On a Windows cp1252 console ``print`` raises ``UnicodeEncodeError`` for
+    Pkg's check-mark lines; that used to record the run as failed.
+    """
+
+    seen = []
+
+    def cp1252_console(message):
+        seen.append(message)
+        raise UnicodeEncodeError(
+            "cp1252", "\u2713", 0, 1, "character maps to <undefined>"
+        )
+
+    state = provision.provision_cpu(runtime_dir, status_cb=cp1252_console)
+
+    assert state["status"] == "ready"
+    assert seen, "the callback was still offered every status line"
+    assert provision.read_state(runtime_dir, backend=BEAT_CPU)["status"] == "ready"
+    err = capsys.readouterr().err
+    assert err.count("status callback failed (UnicodeEncodeError)") == 1
+
+
+def test_guarded_status_passes_lines_through_and_wraps_once():
+    lines = []
+    guarded = provision._guarded_status(lines.append)
+    guarded("one")
+    assert lines == ["one"]
+    assert provision._guarded_status(guarded) is guarded
+
+
 def test_cpu_instantiate_pulls_no_gpu_artifacts(runtime_dir, no_gpu, fake_julia, julia_steps):
     """The CPU project must be the CPU project, not a GPU one with a label."""
 

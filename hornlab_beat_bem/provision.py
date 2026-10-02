@@ -156,6 +156,37 @@ _LOCK_POLL_S = 0.25
 StatusCallback = Callable[[str], None]
 
 
+def _guarded_status(status_cb: StatusCallback) -> StatusCallback:
+    """A status callback whose failures cannot fail provisioning.
+
+    Status lines are progress reports, not steps. A caller's callback that
+    raises -- for example ``print`` to a Windows cp1252 console meeting Pkg's
+    check-mark lines (``UnicodeEncodeError``) -- must not turn a working
+    provisioning run into a ``failed`` record. Report the first failure on
+    stderr, as far as stderr allows, and drop that line.
+    """
+
+    if getattr(status_cb, "_hornlab_guarded", False):
+        return status_cb
+    reported = False
+
+    def guarded(message: str) -> None:
+        nonlocal reported
+        try:
+            status_cb(message)
+        except Exception as exc:  # noqa: BLE001 -- any callback failure is the caller's
+            if not reported:
+                reported = True
+                with suppress(Exception):
+                    sys.stderr.write(
+                        f"BEAT provisioning status callback failed ({type(exc).__name__}); "
+                        "continuing without that status line.\n"
+                    )
+
+    guarded._hornlab_guarded = True  # type: ignore[attr-defined]
+    return guarded
+
+
 def default_runtime_dir() -> Path:
     """Per-user runtime root; overridable with HORNLAB_BEAT_RUNTIME_DIR."""
 
@@ -867,6 +898,7 @@ def provision_gpu(
 
     if backend not in _GPU_BACKENDS:
         raise ValueError(f"backend must be one of {sorted(_GPU_BACKENDS)}")
+    status_cb = _guarded_status(status_cb)
     facts = _GPU_BACKENDS[backend]
     directory = (runtime_dir or default_runtime_dir()).expanduser()
 
@@ -1070,6 +1102,7 @@ def provision_cpu(
 
     from .runtime import PACKAGE_DIR, default_project, package_fingerprint
 
+    status_cb = _guarded_status(status_cb)
     directory = (runtime_dir or default_runtime_dir()).expanduser()
     project = default_project(BEAT_CPU)
     fingerprint = package_fingerprint(project)
