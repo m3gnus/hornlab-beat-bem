@@ -84,6 +84,7 @@ const WORKLOAD_MESH = """
 """
 
 include("MetalKernelPrecompile.jl")
+include("MetalHostPrecompile.jl")
 
 # Shared by the compiled CPU and Metal bundles. The plate touches both symmetry
 # planes, has non-adjacent triangles, and has singular pairs with its images.
@@ -149,6 +150,10 @@ end
                 representative["frequencies_hz"] = [1000.0, 20000.0]
                 representative["config"] = merge(representative["config"], Dict{String,Any}(
                     "mesh_file" => image_mesh, "symmetry" => "xy", "singular_order" => 4,
+                    "meshes" => [Dict{String,Any}(
+                        "name" => "mesh", "file" => image_mesh, "scale_factor" => 1.0,
+                        "translation_m" => [0.0, 0.0, 0.0],
+                    )],
                     "surface_traces_enabled" => true,
                     "regular_quadrature_mode" => "fixed", "diagonal_enabled" => true,
                     "step_size" => 5.0, "max_angle" => 180.0,
@@ -174,6 +179,7 @@ end
     # through the dynamic `solve_request` call it makes.
     precompile(worker_loop, ())
     precompile(main, (Vector{String},))
+    precompile_metal_host_signatures()
     precompile_metal_kernel_signatures()
 end
 

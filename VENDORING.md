@@ -772,3 +772,35 @@ listed above. Keep all backend bundles in package data and qualify their actual
 runtime compilation/first-result behaviour, as `tests/test_engine_bundles.py`
 describes. Run the engine suites, numerical gates and package tests before
 claiming a qualified port.
+
+## Wider Metal SOURCE host precompile coverage, 2026-10-02
+
+Method source: official engine PR #22, commit
+`b87f32e37e1e314a31a661822445ebc5f5e88e29` ("Extend compiled Metal host
+precompile coverage"). This is a local adaptation, not a verbatim copy of that
+commit: this package has no compiled-system bundle and its supported Python
+API enters through SOURCE requests in `BeatEngineDriver.jl`.
+
+| Affected file | Local difference |
+|---|---|
+| `julia_engine/BeatEngineMetalBundle/src/BeatEngineMetalBundle.jl` | Exercise parsed mesh-list input in the existing CPU host workload; include and compile the additional SOURCE host inventory |
+| `julia_engine/BeatEngineMetalBundle/src/MetalHostPrecompile.jl` | New compile-only inventory selected from this package's Julia 1.12.7 first-request traces; resolve generated callable types structurally |
+| `julia_engine/BeatEngineMetalBundle/README.md` | Document SOURCE coverage and the separate host/device gates |
+| `julia/tests/metal_host_precompile_tests.jl` | Assert that every additional signature still matches a host method |
+
+The traces cover two xy-symmetric exterior meshes through `solve_frequencies`,
+a full-domain warmup mesh used by the consumer's other solvers, and the
+package's tetrahedron warmup used by the consumer's BEAT startup. Each listed signature appeared in at least two traces. Mesh loading is
+exercised with real parsed requests instead of recording its generated
+closures. Captured fields, `Base.bodyfunction` and existing device signature
+shapes identify generated callables; generated names are not used in the new
+inventory. Inventory loading and method matches are qualified on Julia 1.12.6
+and 1.12.7, with the unchanged pinned Metal stack.
+
+Only the Metal bundle workload changes. The CPU/CUDA/ROCm bundle sources and
+the existing device inventory retain their prior identity. No engine
+numerical source, request/output decision, accuracy tolerance, licence or
+authorship notice changes. The original CPU first-request compilation bound
+is retained. Fresh-worker trace counts, complete complex-output comparisons,
+interleaved cold/warm measurements and suite evidence qualify this local
+coverage rather than similarity to the official compiled-system inventory.
