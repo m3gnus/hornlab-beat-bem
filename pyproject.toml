@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hornlab-beat-bem"
-version = "0.1.0"
+version = "0.2.0"
 description = "BEAT Engine (boundary-lab) Julia BEM solver: exterior Burton-Miller and coupled FEM-BEM-LEM, on CPU, CUDA, ROCm and Apple Metal"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
