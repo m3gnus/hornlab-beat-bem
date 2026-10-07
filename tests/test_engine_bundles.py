@@ -234,10 +234,15 @@ def test_bundle_workload_matches_worker_json_type_and_image_outputs(name):
 
 
 def test_cpu_workload_covers_both_regular_orders_and_mesh_inputs():
-    """A fixed rule silently loses the low-frequency SIMD specialization."""
+    """The fixed default and explicit wavelength mode must both stay covered."""
     source = (BUNDLE_DIR / BUNDLES[BEAT_CPU] / "src" / "BeatEngineCpuBundle.jl").read_text()
     assert 'representative["frequencies_hz"] = [1000.0, 20000.0]' in source
     assert '"regular_quadrature_mode" => "wavelength"' in source
+    # The first request omits the mode and exercises the production default.
+    default_request = source.split("request = Dict{String,Any}(", 1)[1].split(
+        "representative = deepcopy(request)", 1
+    )[0]
+    assert "regular_quadrature_mode" not in default_request
     assert '"meshes" => [Dict{String,Any}(' in source
     assert '"translation_m" => [0.0, 0.0, 0.0]' in source
     # For this 0.04 m plate, sqrt(triangle area) is 0.04 / sqrt(2).

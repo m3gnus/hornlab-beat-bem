@@ -47,11 +47,18 @@ Regular pair assembly skips adjacent/coincident pairs, which are handled afterwa
 
 Symmetry image contributions are assembled on the host by reflecting trial/source element geometry and quadrature data. Reflected image pairs that become singular across a symmetry plane use image-singular correction caches.
 
-## Dynamic Quadrature
+## Regular Quadrature
 
-The CPU path defaults to wavelength-driven regular quadrature. This is a CPU-only production feature; CUDA currently remains fixed-order as the GPU solver does not meaningfully benefit from dynamic quadrature.
+The CPU default is `regular_quadrature_mode = "fixed"`, using the base
+`quadrature_order = 4` (6 triangle points), as on every accelerator backend.
+The CPU-only `"wavelength"` mode remains an explicit opt-in and is unsafe on
+graded meshes: it chooses one rule for the whole mesh from a global element-area
+statistic, so many fine elements can hide coarse elements that need the base
+rule. This can produce large high-frequency directivity errors; a global
+`k*h` cutoff is mesh-dependent and cannot guarantee accuracy on graded meshes.
 
-The goal is to reduce low-frequency regular-pair assembly cost without changing singular-pair quadrature. Regular-pair assembly dominates dense BEM workload, and low frequencies do not need the same regular quadrature density as high frequencies on typical Boundary Lab loudspeaker meshes.
+Opt-in wavelength mode reduces regular-pair assembly cost by selecting a lower
+order at low frequencies. It does not change singular-pair quadrature.
 
 The selector computes:
 
@@ -61,7 +68,7 @@ $$
 
 where \(A_{\mathrm{stat}}\) is a mesh element-area statistic. The current default statistic is `p90`, so \(h = \sqrt{A_{p90}}\).
 
-Default CPU thresholds:
+Default thresholds for explicit wavelength mode:
 
 - q1 disabled: `wavelength_kh_q1_max = 0.0`
 - q2 when `k*h <= 2.0`
@@ -84,9 +91,12 @@ Result diagnostics include the selected mode, selected order, mesh statistic, el
 
 ## Validation Notes
 
-The tuned defaults were validated against fixed q4 on `sample.msh` using output-level checks from `compare_cpu_quadrature.jl`.
+The historical wavelength thresholds were validated against fixed q4 on
+`sample.msh` using output-level checks from `compare_cpu_quadrature.jl`.
+Those results do not establish safety on graded meshes and do not qualify
+wavelength mode as a default.
 
-The strongest current candidate was:
+That wavelength candidate used:
 
 - q1 disabled
 - q2 while `k*h <= 2.0`

@@ -222,6 +222,13 @@ Symmetry: plane `yz` -> BEAT `x` (half domain, mesh in x >= 0), `yz+xz` -> BEAT
 `xy` (quarter, x >= 0 and y >= 0). A y-only `xz` half domain is not
 representable and is rejected by `reject_unsupported_native_symmetry`.
 
+Regular quadrature defaults to `"fixed"` on every backend: base order 4
+uses 6 triangle points. CPU-only `regular_quadrature_mode="wavelength"` remains
+an explicit opt-in and is unsafe on graded meshes. Its global element-area
+statistic can hide coarse elements among many fine ones, selecting too few
+points and causing large high-frequency directivity errors. A global `k*h`
+cutoff is mesh-dependent, so the default keeps the base rule at every frequency.
+
 ### Asking what this package supports
 
 ```python

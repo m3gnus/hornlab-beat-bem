@@ -407,7 +407,7 @@ def _quadrature(backend: str) -> dict[str, Any]:
             "default_order": 4,
             "mode_field": "regular_quadrature_mode",
             "supported_modes": regular_modes,
-            "default_mode": "wavelength" if backend == BEAT_CPU else "fixed",
+            "default_mode": "fixed",
         },
         "singular": {
             "field": "singular_order",

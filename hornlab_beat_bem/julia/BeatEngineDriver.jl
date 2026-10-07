@@ -180,7 +180,7 @@ function beat_backend_from_request(request)
 end
 
 function regular_quadrature_mode_from_config(config, beat_backend::Symbol)
-    default_mode = beat_backend == :cpu ? "wavelength" : "fixed"
+    default_mode = "fixed"
     mode = lowercase(strip(String(get_value(config, "regular_quadrature_mode", get_value(config, "quadrature_mode", default_mode)))))
     mode in ("fixed", "wavelength") || error("Unsupported regular quadrature mode: $(mode). Expected fixed or wavelength.")
     if beat_backend != :cpu && mode == "wavelength"

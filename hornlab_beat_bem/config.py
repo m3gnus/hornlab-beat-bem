@@ -385,7 +385,8 @@ class SolveConfig:
     #: at order 4, 0.031 dB at order 8). Raising it on the GPU path is a
     #: pessimisation, so it is refused rather than merely discouraged.
     singular_order: int = 4
-    #: None = solver default ("wavelength" on cpu, "fixed" on accelerators).
+    #: None = solver default ("fixed" on every backend, base order 4 = 6 points).
+    #: CPU-only "wavelength" is an explicit opt-in and unsafe on graded meshes.
     regular_quadrature_mode: Literal["fixed", "wavelength"] | None = None
 
     #: Near-singular correction. Disjoint element pairs closer than

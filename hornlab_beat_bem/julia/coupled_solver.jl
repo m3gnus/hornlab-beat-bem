@@ -709,7 +709,7 @@ function rows(vectors, ::Type{T}) where {T<:AbstractFloat}
 end
 
 function exterior_quadrature_selection(options, mesh::BoundaryMesh{T}, frequency_hz::T, sound_speed::T, base_order::Int, backend::Symbol) where {T<:AbstractFloat}
-    default_mode = backend == :cpu ? "wavelength" : "fixed"
+    default_mode = "fixed"
     mode = lowercase(String(get(options, "regular_quadrature_mode", default_mode)))
     mode in ("fixed", "wavelength") || error(
         "Unsupported regular quadrature mode: $mode. Expected fixed or wavelength.",

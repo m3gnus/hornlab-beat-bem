@@ -297,3 +297,14 @@ def test_the_origin_refusal_survives_mutation_after_construction():
     config.frame_override = None
     with pytest.raises(NotImplementedError, match="needs an explicit frame_override"):
         reject_unrepresentable_observation_origin(config)
+
+
+def test_regular_quadrature_default_is_delegated_and_wavelength_is_explicit():
+    default = SolveConfig()
+    assert default.quadrature_order == 4
+    assert default.regular_quadrature_mode is None
+    assert "regular_quadrature_mode" not in _request_payload_config(default)
+    for mode in ("fixed", "wavelength"):
+        assert _request_payload_config(SolveConfig(regular_quadrature_mode=mode))[
+            "regular_quadrature_mode"
+        ] == mode

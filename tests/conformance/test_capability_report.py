@@ -345,9 +345,9 @@ def test_the_reported_timings_are_the_keys_a_result_actually_carries():
 def test_wavelength_quadrature_is_reported_as_a_cpu_only_mode():
     for backend in beat.BEAT_BACKENDS:
         regular = backend_capabilities(backend)["modes"]["exterior"]["quadrature"]["regular"]
+        assert regular["default_mode"] == "fixed"
         if backend == beat.BEAT_CPU:
             assert regular["supported_modes"] == ["fixed", "wavelength"]
-            assert regular["default_mode"] == "wavelength"
         else:
             assert regular["supported_modes"] == ["fixed"]
             assert "wavelength" in regular["refused_modes"]

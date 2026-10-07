@@ -508,6 +508,35 @@ bundle runtime probe, Julia suite and physical-drive validator, Metal inventory
 coverage, and paired package-API agreement on the S/C fixtures; source similarity
 alone is not an accuracy claim.
 
+## Fixed CPU regular-quadrature default, 2026-10-07
+
+Change source: `m3gnus/BEAT_Engine`, branch
+`fix/cpu-fixed-quadrature-default`; source commit `ea86e0ea9811ae4ee188770dddfc1af95f49b138` (official-main port `668daa4be3b31f28324d9f9078322fe174ad4ae7`, upstream PR pending).
+This is a direct local implementation of that change, not a verbatim copy of
+an upstream commit. It changes numerical results for CPU requests that omit
+`regular_quadrature_mode`: they now use `"fixed"` at the base order (default
+4, 6 triangle points), matching accelerator defaults. Explicit `"wavelength"`
+remains available on CPU with its existing statistic and cutoffs. It is unsafe
+on graded meshes because a global area statistic can hide coarse elements and
+select too few regular points, causing high-frequency directivity errors.
+
+| Affected file | Change and adaptation to this lineage |
+|---|---|
+| `hornlab_beat_bem/julia/BeatEngineDriver.jl` | Default SOURCE requests to fixed; retain the legacy `quadrature_mode` alias and package request/output decisions. |
+| `hornlab_beat_bem/julia/coupled_solver.jl` | Default exterior selection to fixed; the condensed coupled path already defaults to fixed. This lineage has no `BeatEngineCompiledDriver.jl`. |
+| `hornlab_beat_bem/julia/tests/regular_quadrature_default_tests.jl` (new), `hornlab_beat_bem/julia/tests/runtests.jl` | Gate both exterior selectors on a synthetic graded mesh in Float32/Float64, with explicit wavelength controls, base-order overrides and accelerator refusals; include in the CPU suite. |
+| `hornlab_beat_bem/julia_engine/BeatEngineCpuBundle/src/BeatEngineCpuBundle.jl` | Correct the workload comment: the first request covers the fixed default, while the representative request explicitly retains wavelength mode to compile orders 2 and 4. Workload requests are unchanged. |
+| `hornlab_beat_bem/config.py`, `hornlab_beat_bem/capabilities.py` | Document the fixed default and report it for every backend; keep Python's omitted-mode delegation. |
+| `tests/test_config.py`, `tests/conformance/test_capability_report.py`, `tests/test_engine_bundles.py` | Check omitted-mode delegation, explicit opt-in, reported defaults and continued bundle coverage. |
+| `README.md`, `docs/beat-engine-CPU.md`, `VENDORING.md` | State the default, the graded-mesh failure mechanism and the opt-in warning; preserve historical wavelength measurements as fixture-specific evidence. |
+
+Modified files no longer claim byte identity with their earlier sync sources.
+No numerical baseline, tolerance, singular quadrature, licence or authorship
+notice changes. Targeted selector and Python checks qualify the default
+selection only. Full engine suites, analytic/Krylov accuracy gates, accelerator
+validators and bundle runtime-compilation probes remain required for full
+numerical and precompile qualification; they are not claimed by this entry.
+
 ## What is copied verbatim
 
 The following inventory describes the `3ea846e` baseline. It remains
@@ -711,8 +740,8 @@ One further edit was necessary rather than cosmetic: a PowerShell example in
 replaced with a placeholder and the two backslash-style source paths in the
 same block are rewritten like the rest.
 
-The prose is otherwise unchanged, so it still describes the Boundary Lab
-application in places — `blab` CLI commands, `.blab.json` projects, solver
+Except for the fixed-quadrature documentation recorded above, the prose is
+otherwise unchanged, so it still describes the Boundary Lab application in places — `blab` CLI commands, `.blab.json` projects, solver
 selection in application preferences. Those describe upstream, not this package.
 
 **Where these docs are superseded.** They are upstream's, kept verbatim rather
