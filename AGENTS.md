@@ -5,6 +5,9 @@ This file adds project rules; it cannot weaken that policy.
 
 ## What this repository is
 
+Status: superseded and dormant; Waveguide Generator now uses the official `beat-engine`
+package. See the status note at the top of `README.md` before starting work here.
+
 A packaged extraction of Boundary Lab's BEAT Engine solver (GPL-3), not
 original work. `VENDORING.md` is authoritative for provenance: it records the
 upstream commit, what is copied byte for byte, and every difference. Keep it
