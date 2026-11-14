@@ -738,7 +738,10 @@ One further edit was necessary rather than cosmetic: a PowerShell example in
 `beat-engine-CPU.md` contained a real person's Windows home directory
 (`C:\Users\<name>\AppData\...`). This repository is public, so the path is
 replaced with a placeholder and the two backslash-style source paths in the
-same block are rewritten like the rest.
+same block are rewritten like the rest. `coupled-solver.md`'s links to the
+upstream *Physical System Model* and *Inputs and Outputs* pages, which are not
+carried here, were turned into plain-text references so they no longer point at
+missing files.
 
 Except for the fixed-quadrature documentation recorded above, the prose is
 otherwise unchanged, so it still describes the Boundary Lab application in places — `blab` CLI commands, `.blab.json` projects, solver

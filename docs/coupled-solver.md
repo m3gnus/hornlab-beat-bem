@@ -10,9 +10,9 @@ The application infers this path when a physical system contains one or more
 bounded regions. A system containing only its unbounded exterior instead uses
 the established exterior-BEM solver.
 
-For the concepts used in the System window, see
-[Physical System Model](Physical%20System%20Model.md). For mesh and project-file
-details, see [Inputs and Outputs](Inputs%20and%20Outputs.md).
+For the concepts used in the System window, see Boundary Lab's *Physical System
+Model* page. For mesh and project-file details, see its *Inputs and Outputs* page.
+Neither page is carried in this repository.
 
 ## Production paths at a glance
 

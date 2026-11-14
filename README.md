@@ -1,5 +1,12 @@
 # hornlab-beat-bem
 
+> **Status: superseded and dormant (last change 7 Oct 2026).** Waveguide Generator no
+> longer uses this package. It runs every BEAT solve on the official `beat-engine`
+> package from the engine fork <https://github.com/m3gnus/BEAT_Engine>, pinned in its
+> `pins.json`; its former `hornlab-beat-bem` ("HBB") rollback has been removed. Make new
+> solver changes in that fork. This README and `docs/` describe the package as it was
+> when it was last maintained.
+
 The **BEAT Engine** Helmholtz solver, packaged so a program can depend on it
 without vendoring an application. Exterior Burton-Miller BEM and coupled
 FEM-BEM-LEM, in Julia, on CPU, NVIDIA CUDA, AMD ROCm and Apple Metal, behind a
@@ -1046,6 +1053,9 @@ which applies AGPL's network clause to the combination. No relicensing is
 needed, and none is possible.
 
 ## Consumers
+
+*Historical: Waveguide Generator has since moved to the official `beat-engine`
+package (see the status note at the top).*
 
 Waveguide Generator registers this package as its `beat` engine
 (`server/solver/beat.py`) and pins it by commit SHA. The Python API this
